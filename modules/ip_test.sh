@@ -42,12 +42,14 @@ run_remote_diagnostic() {
     if [[ ! "$answer" =~ ^[Yy]$ ]]; then
         rm -rf "$tmpdir"
         echo -e "${YELLOW}[取消]${PLAIN} 未执行第三方脚本。"
-        return 0
+        return 1
     fi
 
     log_action "[测试] 执行第三方诊断脚本：${url}"
     local rc=0
-    if ! ( cd "$tmpdir" && bash "$script" ); then
+    if ( cd "$tmpdir" && bash "$script" ); then
+        rc=0
+    else
         rc=$?
     fi
     rm -rf "$tmpdir"
@@ -56,47 +58,61 @@ run_remote_diagnostic() {
 
 run_test_ipquality() {
     clear
-    echo -e "${CYAN}================ IPQuality ================${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${CYAN}   选项 1: IPQuality 综合 IP 纯净度与欺诈评分      ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
     check_hardware_safety 120 || return 0
-    # 远程脚本仍然来自第三方，因此默认要求人工确认。
+    log_action "[测试] 运行 IPQuality 欺诈度测试"
     run_remote_diagnostic ipquality 'https://IP.Check.Place'
 }
 
 run_test_streaming_ai() {
     clear
-    echo -e "${CYAN}========== RegionRestrictionCheck ==========${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${CYAN} 选项 2: RegionRestrictionCheck 流媒体与 AI 解锁   ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
     check_hardware_safety 100 || return 0
+    log_action "[测试] 运行流媒体与 AI 解锁检测"
     run_remote_diagnostic region-restriction 'https://check.unlock.media'
 }
 
 run_test_route() {
     clear
-    echo -e "${CYAN}============== 回程路由诊断 ===============${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${CYAN}    选项 3: 三网回程路由诊断 (识别 CN2/9929/CMI)    ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
     check_hardware_safety 150 || return 0
+    log_action "[测试] 运行三网回程路由诊断"
     run_remote_diagnostic backtrace 'https://raw.githubusercontent.com/zhanghanyun/backtrace/main/install.sh'
 }
+
 
 ip_test_menu() {
     while true; do
         clear
         echo -e "${CYAN}====================================================${PLAIN}"
-        echo -e "${CYAN}              [模块 5] IP 与网络诊断              ${PLAIN}"
+        echo -e "${CYAN}         [模块 5] VPS 质量体检与 IP 纯净度检测      ${PLAIN}"
+        echo -e "  特性属性: ${GREEN}[即用即焚/仅清理本工具临时文件]${PLAIN}"
+        echo -e "  ${YELLOW}提示：第三方诊断脚本可能自行创建文件，本工具无法保证其外部残留全部可撤销。${PLAIN}"
         echo -e "${CYAN}====================================================${PLAIN}"
-        echo "1. IPQuality 欺诈/纯净度测试"
-        echo "2. 流媒体/AI 可用性测试"
-        echo "3. 三网回程路由测试"
-        echo "0. 返回"
+        echo -e "  ${GREEN}1.${PLAIN} IP 纯净度与欺诈分测定 ${BLUE}[xykt: 查原生/双ISP/风控画像]${PLAIN}"
+        echo -e "  ${GREEN}2.${PLAIN} 流媒体与 AI 解锁测试  ${BLUE}[lmc999: 测奈飞/TikTok/ChatGPT]${PLAIN}"
+        echo -e "  ${GREEN}3.${PLAIN} 三网回程路由线路识别  ${BLUE}[识别电信CN2/联通9929/移动CMI]${PLAIN}"
+        echo -e "  ----------------------------------------------------"
+        echo -e "  ${RED}0.${PLAIN} 返回主菜单"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请选择 [0-3]: " choice
-        case "$choice" in
-            1) run_test_ipquality || true; read -rp "按回车继续..." ;;
-            2) run_test_streaming_ai || true; read -rp "按回车继续..." ;;
-            3) run_test_route || true; read -rp "按回车继续..." ;;
+
+        read -rp "请输入选项 [0-3]: " test_choice
+        case "$test_choice" in
+            1) run_test_ipquality; read -rp "按回车键返回菜单..." ;;
+            2) run_test_streaming_ai; read -rp "按回车键返回菜单..." ;;
+            3) run_test_route; read -rp "按回车键返回菜单..." ;;
             0) break ;;
-            *) echo -e "${RED}[错误]${PLAIN} 无效选项。"; sleep 1 ;;
+            *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
     done
 }
+
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     ip_test_menu
