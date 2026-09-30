@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# ========================================================
+# 系统与高亮配色配置
+# ========================================================
 export LANG="${LANG:-C.UTF-8}"
 CURRENT_VERSION="2.0.0"
+# GitHub 仓库配置
 GITHUB_USER="yesok6"
 GITHUB_REPO="vps-tool"
 BRANCH="main"
+# 在线版本检查开关：设为 0 可关闭启动时的远端版本检查。
+VPS_TOOL_VERSION_CHECK="${VPS_TOOL_VERSION_CHECK:-1}"
 LOCAL_ROOT="/opt/vps-tool"
 LOCAL_MODULES="${LOCAL_ROOT}/modules"
 LOCAL_LIB="${LOCAL_ROOT}/lib"
@@ -94,6 +100,10 @@ sync_bundle() (
 
     remote_version=$(grep '^CURRENT_VERSION=' "${temp}/install.sh" | head -n1 | cut -d'"' -f2 || true)
     [[ -n "$remote_version" ]] || { echo -e "${RED}[错误]${PLAIN} 下载的主程序缺少版本号。"; return 1; }
+    [[ "$remote_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
+        echo -e "${RED}[错误]${PLAIN} 下载的主程序版本号格式异常：${remote_version}"
+        return 1
+    }
 
     mkdir -p "$LOCAL_ROOT" "$LOCAL_MODULES" "$LOCAL_LIB"
     install -m 755 "${temp}/install.sh" "${LOCAL_ROOT}/install.sh"
@@ -130,11 +140,19 @@ SH
 check_version_update() {
     local base remote
     VERSION_TIPS="${GREEN}[当前版本 v${CURRENT_VERSION}]${PLAIN}"
+    case "${VPS_TOOL_VERSION_CHECK,,}" in
+        0|false|no|off)
+            VERSION_TIPS="${GREEN}[版本检查已关闭，当前 v${CURRENT_VERSION}]${PLAIN}"
+            return 0
+            ;;
+    esac
     base=$(raw_base_url)
     remote=$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 2 --max-time 5 \
         "${base}/install.sh?t=$(date +%s%N)" 2>/dev/null | grep '^CURRENT_VERSION=' | head -n1 | cut -d'"' -f2 || true)
-    if [[ -n "$remote" && "$remote" != "$CURRENT_VERSION" ]]; then
+    if [[ -n "$remote" && "$remote" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ && "$remote" != "$CURRENT_VERSION" ]]; then
         VERSION_TIPS="${YELLOW}[发现远端版本 v${remote}，可通过 8 更新]${PLAIN}"
+    elif [[ -n "$remote" && ! "$remote" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+        log_action "[安全] 忽略格式异常的远端版本号：${remote}"
     fi
 }
 
@@ -166,69 +184,102 @@ update_tool() {
 }
 
 uninstall_everything() {
-    local answer
     clear
     echo -e "${RED}${BOLD}====================================================${PLAIN}"
-    echo -e "${RED}${BOLD}               [彻底清理与安全还原]               ${PLAIN}"
+    echo -e "${RED}${BOLD}        [系统清理与还原审计] 一键彻底卸载工具箱      ${PLAIN}"
     echo -e "${RED}${BOLD}====================================================${PLAIN}"
-    echo "只会撤销 VPS-Tool 自己记录的变更；不会删除用户原有 sing-box、swap、SSH 配置或第三方防火墙规则。"
-    read -rp "确认继续？[y/N]: " answer
-    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+    echo -e "说明: Linux 系统的软件升级与新内核属于单向变更，无法时光倒流。"
+    echo -e "本脚本将按审计记录撤销本工具可回滚的应用与优化配置，并明确告知哪些属于安全基线/不可逆变更。"
+    echo ""
+    read -rp "您确定要开始执行还原清理吗？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}[提示] 操作已取消，系统未做任何变更。${PLAIN}"
+        return 0
+    fi
 
-    # Source modules without entering their menus; each module has a direct-execution guard.
-    [[ -f "${LOCAL_LIB}/common.sh" ]] && source "${LOCAL_LIB}/common.sh"
-    if [[ -f "${LOCAL_MODULES}/protocol.sh" ]]; then source "${LOCAL_MODULES}/protocol.sh"; uninstall_protocol_environment || true; fi
-    if [[ -f "${LOCAL_MODULES}/optimize.sh" ]]; then source "${LOCAL_MODULES}/optimize.sh"; reset_all_optimizations || true; fi
+    echo -e "\n${BLUE}正在执行可撤销项的精准回滚...${PLAIN}"
+
+    # 1. 撤销网络代理服务与核心（仅清理本工具创建并记录的环境）
+    [[ -f "${LOCAL_MODULES}/protocol.sh" ]] && { source "${LOCAL_MODULES}/protocol.sh"; uninstall_protocol_environment || true; }
+
+    # 2. 撤销内核与网络调优参数（第三方内核本身不自动卸载）
+    [[ -f "${LOCAL_MODULES}/optimize.sh" ]] && { source "${LOCAL_MODULES}/optimize.sh"; reset_all_optimizations || true; }
+
     firewall_remove_owned_rules || true
 
+    # 3. 移除快捷指令并恢复安装前已存在的 vps 文件
     if [[ -f /etc/vps-tool/backups/shortcut/present && -f /etc/vps-tool/backups/shortcut/original ]]; then
         cp -a /etc/vps-tool/backups/shortcut/original "$SHORTCUT"
     else
         rm -f "$SHORTCUT"
     fi
 
+    echo -e "\n${GREEN}${BOLD}====================================================${PLAIN}"
+    echo -e "${GREEN}${BOLD}               系统清理与变更恢复报告               ${PLAIN}"
+    echo -e "${GREEN}${BOLD}====================================================${PLAIN}"
+    echo -e "\n${GREEN}【已成功清除并恢复的项目】(仅限工具有记录的变更):${PLAIN}"
+    echo -e "  ${GREEN}✔${PLAIN} 工具自己创建并记录的协议服务、配置与临时 Swap 已按状态清理（失败项会在上方提示）"
+    echo -e "  ${GREEN}✔${PLAIN} 已记录的网络优化参数、RPS/XPS、IPv4 优先与网卡队列尝试恢复为修改前状态"
+    echo -e "  ${GREEN}✔${PLAIN} 终端快捷命令 'vps' 及测试产生的工具临时缓存已清理"
+
+    echo -e "\n${YELLOW}【保留且无法/不建议恢复的项目】(底层安全基线):${PLAIN}"
+    echo -e "  ${YELLOW}* 系统软件与安全补丁${PLAIN}: 已升级的软件包属于单向不可逆更新，本工具不会自动降级"
+    echo -e "  ${YELLOW}* 已安装的 BBRv3 内核${PLAIN}: 内核属于底层不可逆变更，不通过一键卸载自动删除"
+    echo -e "  ${YELLOW}* SSH 端口与密钥登录${PLAIN}: 为防止您断联，SSH 安全配置作为部分可撤销/安全保留项不会由一键卸载强制回滚"
+    echo -e "  ${YELLOW}* UFW / firewalld 及云平台安全组${PLAIN}: 仅移除本工具明确记录的规则，不强制关闭第三方/用户已有防火墙策略"
+    echo -e "  ${YELLOW}* 已导出到其他设备的节点链接/凭据${PLAIN}: 本工具无法撤回已经离开服务器的副本"
+
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    echo -e "审计记录保存在: ${CYAN}${LOG_FILE}${PLAIN}"
+    echo -e "${GREEN}${BOLD}====================================================${PLAIN}\n"
     rm -rf "$LOCAL_ROOT"
-    echo -e "${GREEN}[完成]${PLAIN} 已撤销工具自身记录的运行时变更。"
-    echo -e "${YELLOW}[保留]${PLAIN} ${LOG_DIR} 下的备份与审计日志，便于追溯和手工恢复。"
     exit 0
 }
+
 
 main_menu() {
     while true; do
         clear
         check_version_update
         echo -e "${CYAN}====================================================${PLAIN}"
-        echo -e "${CYAN}             VPS 综合运维与网络工具箱              ${PLAIN}"
+        echo -e "${CYAN}             VPS 综合运维与网络代理工具箱           ${PLAIN}"
         echo -e "${CYAN}====================================================${PLAIN}"
-        echo -e "  版本: ${YELLOW}v${CURRENT_VERSION}${PLAIN} ${VERSION_TIPS}"
-        echo -e "  本地安装目录: ${BLUE}${LOCAL_ROOT}${PLAIN}"
+        echo -e "  当前版本: ${YELLOW}v${CURRENT_VERSION}${PLAIN} ${VERSION_TIPS}"
+        echo -e "  提示: 以后可随时在终端输入 ${GREEN}vps${PLAIN} 直接唤起此工具箱"
+        echo -e "  标注说明: ${GREEN}[可完全撤销]${PLAIN} 本机配置可完整回滚 | ${YELLOW}[部分可撤销]${PLAIN} 只能恢复工具记录的部分变更 | ${RED}[不可逆]${PLAIN} 无法由工具自动恢复"
         echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-        echo -e "  ${GREEN}1.${PLAIN} 网络安全 / SSH / 防火墙"
-        echo -e "  ${GREEN}2.${PLAIN} VLESS-Reality / Hysteria 2"
-        echo -e "  ${GREEN}3.${PLAIN} 网络优化 / BBR / RPS-XPS"
-        echo -e "  ${GREEN}4.${PLAIN} 一键部署流水线"
-        echo -e "  ${GREEN}5.${PLAIN} IP 质量与网络诊断"
+        echo -e "  ${GREEN}1.${PLAIN} 网络安全 (系统加固/SSH/防火墙)      ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
+        echo -e "  ${GREEN}2.${PLAIN} 协议搭建 (VLESS-Reality/Hy2)         ${GREEN}[本机配置可完全撤销]${PLAIN}"
+        echo -e "  ${GREEN}3.${PLAIN} 网络优化 (生产级调优/多核中断/BBR)   ${GREEN}[参数可完全撤销/内核变更不可逆]${PLAIN}"
+        echo -e "  ${GREEN}4.${PLAIN} 一键安装 (全自动综合流水线交钥匙)    ${CYAN}[混合执行]${PLAIN}"
+        echo -e "  ${GREEN}5.${PLAIN} IP 质量测试 (欺诈分/流媒体/回程路由)  ${GREEN}[即用即焚/第三方残留不保证]${PLAIN}"
         echo -e "  ----------------------------------------------------"
-        echo -e "  ${BLUE}8.${PLAIN} 安全更新本地工具包"
-        echo -e "  ${RED}9.${PLAIN} 撤销工具自己记录的变更并卸载"
-        echo -e "  ${RED}0.${PLAIN} 退出"
+        echo -e "  ${BLUE}8.${PLAIN} 检查并一键更新脚本到最新版          ${GREEN}[在线热更新]${PLAIN}"
+        echo -e "  ${RED}9.${PLAIN} 一键彻底清理与还原系统 (按记录恢复并出具报告)"
+        echo -e "  ${RED}0.${PLAIN} 退出工具箱"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请输入选项 [0-5,8,9]: " choice
+        read -rp "请输入选项 [0-5, 8, 9]: " choice
         case "$choice" in
-            1) load_module security || true; read -rp "按回车返回主菜单..." ;;
-            2) load_module protocol || true; read -rp "按回车返回主菜单..." ;;
-            3) load_module optimize || true; read -rp "按回车返回主菜单..." ;;
-            4) load_module apps || true; read -rp "按回车返回主菜单..." ;;
-            5) load_module ip_test || true; read -rp "按回车返回主菜单..." ;;
+            1) load_module security || true; read -rp "按回车键返回主菜单..." ;;
+            2) load_module protocol || true; read -rp "按回车键返回主菜单..." ;;
+            3) load_module optimize || true; read -rp "按回车键返回主菜单..." ;;
+            4) load_module apps || true; read -rp "按回车键返回主菜单..." ;;
+            5) load_module ip_test || true; read -rp "按回车键返回主菜单..." ;;
             8) update_tool || true ;;
             9) uninstall_everything ;;
-            0) echo "已退出。"; return 0 ;;
-            *) echo -e "${RED}[错误]${PLAIN} 无效选项。"; sleep 1 ;;
+            0) echo -e "${GREEN}已退出。${PLAIN}"; return 0 ;;
+            *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
     done
 }
 
+
 install_dependencies
-sync_bundle
+current_script_path=$(readlink -f -- "${BASH_SOURCE[0]}") || current_script_path="${BASH_SOURCE[0]}"
+local_install_path=$(readlink -f -- "${LOCAL_ROOT}/install.sh") || local_install_path="${LOCAL_ROOT}/install.sh"
+if [[ "$current_script_path" != "$local_install_path" ]]; then
+    # 首次通过网络脚本启动时同步完整本地工具包；已安装版本启动时不再静默更新。
+    sync_bundle
+fi
 install_shortcut
 main_menu
