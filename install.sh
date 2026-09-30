@@ -1,263 +1,234 @@
 #!/usr/bin/env bash
+set -Eeuo pipefail
 
-# ========================================================
-# 系统与高亮配色配置
-# ========================================================
-export LANG=en_US.UTF-8
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-PLAIN='\033[0m'
-
-# 当前本地版本号
-CURRENT_VERSION="1.0.1"
-
-# GitHub 仓库配置
+export LANG="${LANG:-C.UTF-8}"
+CURRENT_VERSION="2.0.0"
 GITHUB_USER="yesok6"
 GITHUB_REPO="vps-tool"
 BRANCH="main"
-
+LOCAL_ROOT="/opt/vps-tool"
+LOCAL_MODULES="${LOCAL_ROOT}/modules"
+LOCAL_LIB="${LOCAL_ROOT}/lib"
+SHORTCUT="/usr/local/bin/vps"
 LOG_DIR="/etc/vps-tool"
 LOG_FILE="${LOG_DIR}/install.log"
 
-# 检查 root 权限
-[[ $EUID -ne 0 ]] && echo -e "${RED}[错误]${PLAIN} 请使用 root 权限运行此脚本！" && exit 1
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; PLAIN='\033[0m'
 
-# 统一操作审计日志记录器
+[[ ${EUID} -eq 0 ]] || { echo -e "${RED}[错误]${PLAIN} 请使用 root 权限运行。"; exit 1; }
+
+mkdir -p "$LOG_DIR" "$LOCAL_ROOT" "$LOCAL_MODULES" "$LOCAL_LIB"
+chmod 700 "$LOG_DIR" || true
+
 log_action() {
-    local action="$1"
-    mkdir -p "${LOG_DIR}"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${action}" >> "${LOG_FILE}"
+    local action="${1:-}"
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$action" >> "$LOG_FILE"
+    chmod 600 "$LOG_FILE" 2>/dev/null || true
 }
 
-# 基础必备依赖检查与安装
-check_deps() {
-    local need_install=0
-    for cmd in curl wget ss bc jq; do
-        if ! command -v "$cmd" &>/dev/null; then
-            need_install=1
-            break
-        fi
+on_error() {
+    local code=$?
+    echo -e "${RED}[错误]${PLAIN} 操作失败（退出码 ${code}，位置 ${BASH_SOURCE[1]}:${BASH_LINENO[0]}）。"
+    echo -e "${YELLOW}[提示]${PLAIN} 详细日志：${LOG_FILE}"
+    log_action "[失败] exit=${code} source=${BASH_SOURCE[1]} line=${BASH_LINENO[0]}"
+    return "$code"
+}
+trap on_error ERR
+
+raw_base_url() {
+    printf 'https://raw.githubusercontent.com/%s/%s/%s' "$GITHUB_USER" "$GITHUB_REPO" "$BRANCH"
+}
+
+install_dependencies() {
+    local missing=()
+    local cmd
+    for cmd in curl jq bc ss openssl tar; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    ((${#missing[@]} == 0)) && return 0
+
+    echo -e "${BLUE}[准备中]${PLAIN} 安装运行依赖：${missing[*]}"
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y -q
+        apt-get install -y -q curl jq bc iproute2 openssl tar
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y curl jq bc iproute openssl tar
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y curl jq bc iproute openssl tar
+    else
+        echo -e "${RED}[错误]${PLAIN} 未识别 apt/dnf/yum，无法自动安装依赖。"
+        return 1
+    fi
+
+    for cmd in "${missing[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || { echo -e "${RED}[错误]${PLAIN} 依赖仍缺失：$cmd"; return 1; }
+    done
+}
+
+sync_bundle() (
+    set -Eeuo pipefail
+    local base temp file name remote_version
+    base=$(raw_base_url)
+    temp=$(mktemp -d /tmp/vps-tool-sync.XXXXXX)
+    trap 'rm -rf "${temp}"' EXIT
+
+    echo -e "${BLUE}[同步]${PLAIN} 下载并检查本地工具包..."
+    download_one() {
+        local relative="$1"
+        local out="${temp}/${relative}"
+        mkdir -p "$(dirname "$out")"
+        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 10 --max-time 120 \
+            -o "$out" "${base}/${relative}?t=$(date +%s%N)"
+    }
+
+    download_one "install.sh"
+    download_one "lib/common.sh"
+    for name in security protocol optimize apps ip_test; do
+        download_one "modules/${name}.sh"
     done
 
-    if [ "$need_install" -eq 1 ]; then
-        echo -e "${BLUE}[准备中]${PLAIN} 正在检查并装载核心依赖组件..."
-        if command -v apt-get &>/dev/null; then
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y -q &>/dev/null
-            apt-get install -y -q curl wget iproute2 bc jq &>/dev/null
-        elif command -v dnf &>/dev/null; then
-            dnf install -y curl wget iproute bc jq &>/dev/null
-        elif command -v yum &>/dev/null; then
-            yum install -y curl wget iproute bc jq &>/dev/null
-        fi
-    fi
-}
+    for file in "${temp}/install.sh" "${temp}/lib/common.sh" "${temp}"/modules/*.sh; do
+        bash -n "$file"
+    done
 
-# 注册本地快捷命令 (输入 vps 即可直接呼出主菜单)
+    remote_version=$(grep '^CURRENT_VERSION=' "${temp}/install.sh" | head -n1 | cut -d'"' -f2 || true)
+    [[ -n "$remote_version" ]] || { echo -e "${RED}[错误]${PLAIN} 下载的主程序缺少版本号。"; return 1; }
+
+    mkdir -p "$LOCAL_ROOT" "$LOCAL_MODULES" "$LOCAL_LIB"
+    install -m 755 "${temp}/install.sh" "${LOCAL_ROOT}/install.sh"
+    install -m 755 "${temp}/lib/common.sh" "${LOCAL_LIB}/common.sh"
+    for name in security protocol optimize apps ip_test; do
+        install -m 755 "${temp}/modules/${name}.sh" "${LOCAL_MODULES}/${name}.sh"
+    done
+    printf '%s\n' "$remote_version" > "${LOCAL_ROOT}/VERSION"
+    chmod 644 "${LOCAL_ROOT}/VERSION"
+    log_action "[安装/更新] 本地工具包同步完成，版本=${remote_version}"
+)
+
 install_shortcut() {
-    local shortcut_path="/usr/local/bin/vps"
-    cat <<EOF > "$shortcut_path"
+    local tmp
+    if [[ -e "$SHORTCUT" && ! -f "$SHORTCUT" ]]; then
+        echo -e "${RED}[错误]${PLAIN} ${SHORTCUT} 已存在且不是普通文件，拒绝覆盖。"
+        return 1
+    fi
+    if [[ -f "$SHORTCUT" ]] && ! grep -Eq '/opt/vps-tool/install.sh|yesok6/vps-tool/.*/install.sh' "$SHORTCUT"; then
+        mkdir -p /etc/vps-tool/backups/shortcut
+        [[ -f /etc/vps-tool/backups/shortcut/original ]] || cp -a "$SHORTCUT" /etc/vps-tool/backups/shortcut/original
+        touch /etc/vps-tool/backups/shortcut/present
+    fi
+
+    tmp=$(mktemp)
+    cat > "$tmp" <<'SH'
 #!/usr/bin/env bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${BRANCH}/install.sh?t=\$(date +%s)")
-EOF
-    chmod +x "$shortcut_path"
+exec /opt/vps-tool/install.sh "$@"
+SH
+    install -m 755 "$tmp" "$SHORTCUT"
+    rm -f "$tmp"
 }
 
-# 智能版本比对检查器
 check_version_update() {
-    local remote_version
-    remote_version=$(curl -s4m 1.5 "https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${BRANCH}/install.sh?t=$(date +%s)" | grep "^CURRENT_VERSION=" | head -n1 | cut -d'"' -f2)
-    
-    if [[ -n "$remote_version" && "$remote_version" != "$CURRENT_VERSION" ]]; then
-        VERSION_TIPS="${RED}${BOLD}[发现新版本 v${remote_version}！建议按 8 更新]${PLAIN}"
-    else
-        VERSION_TIPS="${GREEN}[当前已是最新版]${PLAIN}"
+    local base remote
+    VERSION_TIPS="${GREEN}[当前版本 v${CURRENT_VERSION}]${PLAIN}"
+    base=$(raw_base_url)
+    remote=$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 2 --max-time 5 \
+        "${base}/install.sh?t=$(date +%s%N)" 2>/dev/null | grep '^CURRENT_VERSION=' | head -n1 | cut -d'"' -f2 || true)
+    if [[ -n "$remote" && "$remote" != "$CURRENT_VERSION" ]]; then
+        VERSION_TIPS="${YELLOW}[发现远端版本 v${remote}，可通过 8 更新]${PLAIN}"
     fi
 }
 
-# 模块动态下载调度器
 load_module() {
-    local module_name="$1"
-    local timestamp
-    timestamp=$(date +%s)
-    local raw_url="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${BRANCH}/modules/${module_name}.sh?t=${timestamp}"
-    local mirror_url="https://ghproxy.net/https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${BRANCH}/modules/${module_name}.sh?t=${timestamp}"
-    
-    echo -e "${BLUE}[信息]${PLAIN} 正在调度 ${module_name} 模块..."
-    
-    if curl -s --connect-timeout 4 "$raw_url" | head -n1 | grep -q "bash"; then
-        bash <(curl -fsSL "$raw_url")
-    else
-        echo -e "${YELLOW}[提示]${PLAIN} 正在通过加速镜像加载模块..."
-        bash <(curl -fsSL "$mirror_url")
+    local module="$1"
+    local file="${LOCAL_MODULES}/${module}.sh"
+    [[ -f "$file" ]] || { sync_bundle || return 1; }
+    [[ -f "$file" ]] || return 1
+    if ! bash -n "$file"; then
+        echo -e "${RED}[错误]${PLAIN} 模块语法检查失败：${module}"
+        return 1
     fi
-    
-    echo ""
-    read -rp "按回车键返回主菜单..."
-    main_menu
+    bash "$file"
 }
 
-# 选项 8: 一键更新工具箱代码
 update_tool() {
     clear
     echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${CYAN}            [在线更新] 检查并更新工具箱源码         ${PLAIN}"
+    echo -e "${CYAN}                 [在线更新]                        ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "当前本地运行版本: ${YELLOW}v${CURRENT_VERSION}${PLAIN}"
-    echo -e "${BLUE}[检查中]${PLAIN} 正在连接 GitHub 仓库获取最新版本信息..."
-
-    local timestamp
-    timestamp=$(date +%s)
-    local raw_entry="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${BRANCH}/install.sh?t=${timestamp}"
-    local mirror_entry="https://ghproxy.net/https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${BRANCH}/install.sh?t=${timestamp}"
-    
-    local remote_version
-    remote_version=$(curl -fsSL --connect-timeout 5 "$raw_entry" 2>/dev/null | grep "^CURRENT_VERSION=" | head -n1 | cut -d'"' -f2)
-    
-    if [[ -z "$remote_version" ]]; then
-        remote_version=$(curl -fsSL --connect-timeout 5 "$mirror_entry" 2>/dev/null | grep "^CURRENT_VERSION=" | head -n1 | cut -d'"' -f2)
+    echo -e "当前版本：${YELLOW}v${CURRENT_VERSION}${PLAIN}"
+    if ! sync_bundle; then
+        echo -e "${RED}[错误]${PLAIN} 更新失败，当前已安装版本保持不变。"
+        return 1
     fi
-
-    if [[ -z "$remote_version" ]]; then
-        echo -e "${RED}[错误]${PLAIN} 无法连接至 GitHub 获取更新，请检查 VPS 网络！"
-        return
-    fi
-
-    echo -e "云端最新版本: ${GREEN}v${remote_version}${PLAIN}"
-
-    if [[ "$remote_version" == "$CURRENT_VERSION" ]]; then
-        echo -e "\n${GREEN}[提示] 您当前的脚本已经是最新版，无需重复更新！${PLAIN}"
-        read -rp "是否依然强制重新拉取最新代码？[y/N]: " force_update
-        [[ ! "$force_update" =~ ^[Yy]$ ]] && return
-    fi
-
-    echo -e "\n${BLUE}[更新中]${PLAIN} 正在刷新本地快捷命令并拉取最新主程序..."
-    install_shortcut
-    log_action "[更新] 成功将脚本从 v${CURRENT_VERSION} 更新至 v${remote_version}"
-    echo -e "${GREEN}[成功]${PLAIN} 脚本更新成功！正在自动热重启进入新版本..."
+    echo -e "${GREEN}[成功]${PLAIN} 更新包已完成语法检查并安装到 ${LOCAL_ROOT}。"
     sleep 1
-
-    exec bash <(curl -fsSL "$raw_entry")
+    exec "${LOCAL_ROOT}/install.sh"
 }
 
-# 选项 9: 一键彻底清理与系统还原
 uninstall_everything() {
+    local answer
     clear
     echo -e "${RED}${BOLD}====================================================${PLAIN}"
-    echo -e "${RED}${BOLD}        [系统清理与还原审计] 一键彻底卸载工具箱      ${PLAIN}"
+    echo -e "${RED}${BOLD}               [彻底清理与安全还原]               ${PLAIN}"
     echo -e "${RED}${BOLD}====================================================${PLAIN}"
-    echo -e "说明: Linux 系统的软件升级与新内核属于单向变更，无法时光倒流。"
-    echo -e "本脚本将精准撤销应用与优化配置，并明确告知哪些属于安全基线保留项。"
-    echo ""
-    read -rp "您确定要开始执行还原清理吗？[y/N]: " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}[提示] 操作已取消，系统未做任何变更。${PLAIN}"
-        return
+    echo "只会撤销 VPS-Tool 自己记录的变更；不会删除用户原有 sing-box、swap、SSH 配置或第三方防火墙规则。"
+    read -rp "确认继续？[y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+
+    # Source modules without entering their menus; each module has a direct-execution guard.
+    [[ -f "${LOCAL_LIB}/common.sh" ]] && source "${LOCAL_LIB}/common.sh"
+    if [[ -f "${LOCAL_MODULES}/protocol.sh" ]]; then source "${LOCAL_MODULES}/protocol.sh"; uninstall_protocol_environment || true; fi
+    if [[ -f "${LOCAL_MODULES}/optimize.sh" ]]; then source "${LOCAL_MODULES}/optimize.sh"; reset_all_optimizations || true; fi
+    firewall_remove_owned_rules || true
+
+    if [[ -f /etc/vps-tool/backups/shortcut/present && -f /etc/vps-tool/backups/shortcut/original ]]; then
+        cp -a /etc/vps-tool/backups/shortcut/original "$SHORTCUT"
+    else
+        rm -f "$SHORTCUT"
     fi
 
-    echo -e "\n${BLUE}正在执行可撤销项的精准回滚...${PLAIN}"
-
-    # 1. 撤销网络代理服务与核心
-    systemctl stop sing-box &>/dev/null
-    systemctl disable sing-box &>/dev/null
-    rm -f /etc/systemd/system/sing-box.service
-    rm -rf /etc/sing-box
-    rm -f /usr/local/bin/sing-box
-    systemctl daemon-reload
-
-    # 2. 撤销内核与网络调优参数
-    rm -f /etc/sysctl.d/99-vps-optimizer.conf /etc/sysctl.d/99-bbr.conf
-    rm -f /etc/security/limits.d/99-nofile.conf
-    sed -i '/precedence ::ffff:0:0\/96  100/d' /etc/gai.conf 2>/dev/null
-
-    local iface
-    iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
-    if [[ -n "$iface" ]]; then
-        ip link set dev "$iface" txqueuelen 1000 2>/dev/null
-    fi
-    sed -i '/rps_cpus/d' /etc/rc.local 2>/dev/null
-    sed -i '/xps_cpus/d' /etc/rc.local 2>/dev/null
-    sysctl --system &>/dev/null
-
-    # 3. 卸载临时创建的 Swap 虚拟内存
-    if grep -q "/swapfile" /etc/fstab 2>/dev/null; then
-        swapoff /swapfile 2>/dev/null
-        sed -i '/\/swapfile/d' /etc/fstab 2>/dev/null
-        rm -f /swapfile
-    fi
-
-    # 4. 清理测速缓存与测试残留
-    rm -rf /tmp/vps_ip_audit_* /tmp/sni_test.txt /tmp/auto_sni.txt /tmp/bbrv3_install
-    rm -f /tmp/check.sh /tmp/RegionRestrictionCheck* /tmp/backtrace*
-
-    # 5. 移除快捷指令
-    rm -f /usr/local/bin/vps
-
-    # 6. 生成审计清单
-    clear
-    echo -e "${GREEN}${BOLD}====================================================${PLAIN}"
-    echo -e "${GREEN}${BOLD}               系统清理与变更恢复报告               ${PLAIN}"
-    echo -e "${GREEN}${BOLD}====================================================${PLAIN}"
-    
-    echo -e "\n${GREEN}【已成功清除并恢复的项目】(配置已归位):${PLAIN}"
-    echo -e "  ${GREEN}✔${PLAIN} 代理服务已停用，核心程序及密钥节点配置文件已彻底抹除"
-    echo -e "  ${GREEN}✔${PLAIN} TCP 读写缓冲区、文件并发句柄已恢复为系统初始默认值"
-    echo -e "  ${GREEN}✔${PLAIN} 网卡发送队列已从 100000 恢复为标准 1000"
-    echo -e "  ${GREEN}✔${PLAIN} 临时生成的 1GB Swap 交换文件已卸载并释放磁盘空间"
-    echo -e "  ${GREEN}✔${PLAIN} 终端快捷命令 'vps' 及测试产生的临时缓存已全量删除"
-
-    echo -e "\n${YELLOW}【保留且无法/不建议恢复的项目】(底层安全基线):${PLAIN}"
-    echo -e "  ${YELLOW}* 系统软件与安全补丁${PLAIN}: 已升级的软件包属于单向不可逆更新（降级会导致系统依赖崩坏，保留补丁机器更安全）"
-    echo -e "  ${YELLOW}* 已安装的 BBRv3 内核${PLAIN}: 内核镜像文件依然保留在系统中，但相关调优参数已撤销"
-    echo -e "  ${YELLOW}* SSH 端口与密钥登录${PLAIN}: 为防止您断联被锁在外面，当前生效的 SSH 端口与密钥权限未做变动"
-    echo -e "  ${YELLOW}* UFW 本地防火墙状态${PLAIN}: 为保障基础防御，防火墙未被强制关闭，您可执行 'ufw status' 自行查看"
-
-    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    echo -e "历史操作审计记录已归档保存在: ${CYAN}${LOG_FILE}${PLAIN}"
-    echo -e "${GREEN}${BOLD}====================================================${PLAIN}\n"
+    rm -rf "$LOCAL_ROOT"
+    echo -e "${GREEN}[完成]${PLAIN} 已撤销工具自身记录的运行时变更。"
+    echo -e "${YELLOW}[保留]${PLAIN} ${LOG_DIR} 下的备份与审计日志，便于追溯和手工恢复。"
     exit 0
 }
 
-# 主菜单界面
 main_menu() {
-    clear
-    check_version_update
-    echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${CYAN}             VPS 综合运维与网络代理工具箱           ${PLAIN}"
-    echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "  当前版本: ${YELLOW}v${CURRENT_VERSION}${PLAIN} ${VERSION_TIPS}"
-    echo -e "  提示: 以后可随时在终端输入 ${GREEN}vps${PLAIN} 直接唤起此工具箱"
-    echo -e "  标注说明: ${GREEN}[可完全撤销]${PLAIN} 卸载时复原 | ${YELLOW}[底层/安全保留]${PLAIN} 卸载时保留"
-    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    echo -e "  ${GREEN}1.${PLAIN} 网络安全 (系统加固/SSH/防火墙)      ${YELLOW}[底层/安全保留]${PLAIN}"
-    echo -e "  ${GREEN}2.${PLAIN} 协议搭建 (VLESS-Reality/Hy2)         ${GREEN}[可完全撤销]${PLAIN}"
-    echo -e "  ${GREEN}3.${PLAIN} 网络优化 (生产级调优/多核中断/BBR)   ${GREEN}[参数可撤销/内核保留]${PLAIN}"
-    echo -e "  ${GREEN}4.${PLAIN} 一键安装 (全自动综合流水线交钥匙)    ${CYAN}[混合执行]${PLAIN}"
-    echo -e "  ${GREEN}5.${PLAIN} IP 质量测试 (欺诈分/流媒体/回程路由)  ${GREEN}[即用即焚/无残留]${PLAIN}"
-    echo -e "  ----------------------------------------------------"
-    echo -e "  ${BLUE}8.${PLAIN} 检查并一键更新脚本到最新版          ${GREEN}[在线热更新]${PLAIN}"
-    echo -e "  ${RED}9.${PLAIN} 一键彻底清理与还原系统 (纯净卸载并出具报告)"
-    echo -e "  ${RED}0.${PLAIN} 退出工具箱"
-    echo -e "${CYAN}====================================================${PLAIN}"
-    
-    read -rp "请输入选项 [0-5, 8, 9]: " choice
-    case "$choice" in
-        1) load_module "security" ;;
-        2) load_module "protocol" ;;
-        3) load_module "optimize" ;;
-        4) load_module "apps" ;;
-        5) load_module "ip_test" ;;
-        8) update_tool ;;
-        9) uninstall_everything ;;
-        0) echo -e "${GREEN}已退出。${PLAIN}"; exit 0 ;;
-        *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1; main_menu ;;
-    esac
+    while true; do
+        clear
+        check_version_update
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "${CYAN}             VPS 综合运维与网络工具箱              ${PLAIN}"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "  版本: ${YELLOW}v${CURRENT_VERSION}${PLAIN} ${VERSION_TIPS}"
+        echo -e "  本地安装目录: ${BLUE}${LOCAL_ROOT}${PLAIN}"
+        echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e "  ${GREEN}1.${PLAIN} 网络安全 / SSH / 防火墙"
+        echo -e "  ${GREEN}2.${PLAIN} VLESS-Reality / Hysteria 2"
+        echo -e "  ${GREEN}3.${PLAIN} 网络优化 / BBR / RPS-XPS"
+        echo -e "  ${GREEN}4.${PLAIN} 一键部署流水线"
+        echo -e "  ${GREEN}5.${PLAIN} IP 质量与网络诊断"
+        echo -e "  ----------------------------------------------------"
+        echo -e "  ${BLUE}8.${PLAIN} 安全更新本地工具包"
+        echo -e "  ${RED}9.${PLAIN} 撤销工具自己记录的变更并卸载"
+        echo -e "  ${RED}0.${PLAIN} 退出"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        read -rp "请输入选项 [0-5,8,9]: " choice
+        case "$choice" in
+            1) load_module security || true; read -rp "按回车返回主菜单..." ;;
+            2) load_module protocol || true; read -rp "按回车返回主菜单..." ;;
+            3) load_module optimize || true; read -rp "按回车返回主菜单..." ;;
+            4) load_module apps || true; read -rp "按回车返回主菜单..." ;;
+            5) load_module ip_test || true; read -rp "按回车返回主菜单..." ;;
+            8) update_tool || true ;;
+            9) uninstall_everything ;;
+            0) echo "已退出。"; return 0 ;;
+            *) echo -e "${RED}[错误]${PLAIN} 无效选项。"; sleep 1 ;;
+        esac
+    done
 }
 
-check_deps
+install_dependencies
+sync_bundle
 install_shortcut
 main_menu
