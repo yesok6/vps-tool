@@ -22,13 +22,13 @@
 ### 官方主线（推荐）
 
 ```bash
-bash <(curl -fsSL [https://raw.githubusercontent.com/yesok6/vps-tool/main/install.sh](https://raw.githubusercontent.com/yesok6/vps-tool/main/install.sh))
+bash <(curl -fsSL https://raw.githubusercontent.com/yesok6/vps-tool/main/install.sh)
 ```
 
 ### 国内 / 拥堵加速镜像
 
 ```bash
-bash <(curl -fsSL [https://ghproxy.net/https://raw.githubusercontent.com/yesok6/vps-tool/main/install.sh](https://ghproxy.net/https://raw.githubusercontent.com/yesok6/vps-tool/main/install.sh))
+bash <(curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/yesok6/vps-tool/main/install.sh)
 ```
 
 > **提示**：首次运行后，脚本会自动注册快捷指令。以后在终端任意位置直接输入 `vps` 即可秒开主菜单！
