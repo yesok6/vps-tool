@@ -44,6 +44,112 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# 当前操作系统与包管理器信息（供多个模块共用）
+OS_ID="${OS_ID:-}"
+OS_PRETTY="${OS_PRETTY:-}"
+ARCH="${ARCH:-}"
+PKG_MANAGER="${PKG_MANAGER:-}"
+SSH_SERVICE="${SSH_SERVICE:-}"
+
+check_os() {
+    [[ -r /etc/os-release ]] || { echo -e "${RED}[错误]${PLAIN} 无法识别操作系统！"; return 1; }
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_PRETTY="${PRETTY_NAME:-$OS_ID}"
+    ARCH="$(uname -m)"
+    case "${OS_ID}" in
+        debian|ubuntu)
+            PKG_MANAGER="apt"
+            SSH_SERVICE="ssh"
+            ;;
+        centos|rhel|almalinux|rocky|fedora)
+            if command_exists dnf; then PKG_MANAGER="dnf"; else PKG_MANAGER="yum"; fi
+            SSH_SERVICE="sshd"
+            ;;
+        *)
+            echo -e "${RED}[错误]${PLAIN} 暂不支持该系统: ${OS_PRETTY}"; return 1
+            ;;
+    esac
+
+    if ! systemctl cat "${SSH_SERVICE}.service" >/dev/null 2>&1; then
+        if systemctl cat ssh.service >/dev/null 2>&1; then SSH_SERVICE="ssh"
+        elif systemctl cat sshd.service >/dev/null 2>&1; then SSH_SERVICE="sshd"
+        else
+            echo -e "${RED}[错误]${PLAIN} 找不到 SSH systemd 服务。"
+            return 1
+        fi
+    fi
+}
+
+confirm_safety_prompt() {
+    local title="$1"
+    local warning="$2"
+    echo -e "${RED}${BOLD}==================== [ 风险操作警告 ] ====================${PLAIN}"
+    echo -e "操作名称: ${YELLOW}${title}${PLAIN}"
+    echo -e "警告说明: ${RED}${warning}${PLAIN}"
+    echo -e "特性提示: ${YELLOW}[请保留当前 SSH 会话，并确保云平台控制台/VNC 可用]${PLAIN}"
+    echo -e "${RED}${BOLD}==========================================================${PLAIN}"
+    local confirm
+    read -rp "您确定要继续执行此操作吗？输入 y 确认，其他键取消 [y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}[提示]${PLAIN} 操作已取消。"; return 1; }
+}
+
+sync_system_time() {
+    echo -e "${BLUE}[同步中]${PLAIN} 正在自动校准网络时间..."
+    if command_exists timedatectl; then
+        timedatectl set-ntp true >/dev/null 2>&1 || true
+    fi
+    if command_exists chronyc; then
+        chronyc -a makestep >/dev/null 2>&1 || true
+    elif systemctl cat chronyd.service >/dev/null 2>&1; then
+        systemctl restart chronyd >/dev/null 2>&1 || true
+    elif systemctl cat chrony.service >/dev/null 2>&1; then
+        systemctl restart chrony >/dev/null 2>&1 || true
+    fi
+    log_action "[可撤销] 仅执行网络时间校准，不修改系统时区"
+}
+
+sys_full_upgrade() {
+    check_os || return 1
+    echo -e "${BLUE}[信息]${PLAIN} 开始全自动系统更新..."
+    confirm_safety_prompt "执行完整系统升级" "升级属于不可逆系统变更；软件包版本可能无法由本工具恢复，请确认云平台控制台/VNC 可用。" || { echo -e "${YELLOW}[提示]${PLAIN} 已取消完整系统升级。"; return 1; }
+    case "${PKG_MANAGER}" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get -y upgrade
+            ;;
+        dnf|yum)
+            "${PKG_MANAGER}" -y upgrade
+            ;;
+    esac
+    sync_system_time
+    log_action "[不可逆] 全量更新系统软件包及依赖"
+    echo -e "${GREEN}[成功]${PLAIN} 全系统基础软件包升级完成！"
+}
+
+sys_security_upgrade() {
+    check_os || return 1
+    echo -e "${BLUE}[信息]${PLAIN} 开始自动修补安全高危漏洞..."
+    confirm_safety_prompt "执行安全补丁升级" "安全补丁属于不可逆软件包变更，请确认云平台控制台/VNC 可用。" || { echo -e "${YELLOW}[提示]${PLAIN} 已取消安全补丁升级。"; return 1; }
+    case "${PKG_MANAGER}" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get -y upgrade
+            ;;
+        dnf)
+            dnf -y upgrade --security || dnf -y upgrade
+            ;;
+        yum)
+            yum -y update --security || yum -y update
+            ;;
+    esac
+    log_action "[不可逆] 修补系统 CVE 安全高危补丁"
+    echo -e "${GREEN}[成功]${PLAIN} 安全补丁修补完毕！"
+}
+
 require_commands() {
     local missing=()
     local cmd
@@ -192,20 +298,29 @@ record_runtime_value() {
 
 restore_runtime_values() {
     local dir="${VPS_TOOL_STATE}/runtime"
-    local path id
-    [[ -d "$dir" ]] || return 0
+    local path id restore_failed=0
+    [[ -d "$dir" ]] || return 1
     for file in "$dir"/*.path; do
         [[ -f "$file" ]] || continue
         id="${file##*/}"
         id="${id%.path}"
         path=$(cat "$file")
         if [[ -f "${dir}/${id}.missing" ]]; then
-            rm -f "$path"
+            if ! rm -f "$path"; then
+                restore_failed=1
+            fi
         elif [[ -f "${dir}/${id}.value" ]]; then
-            cat "${dir}/${id}.value" > "$path" 2>/dev/null || true
+            if ! cat "${dir}/${id}.value" > "$path" 2>/dev/null; then
+                restore_failed=1
+            fi
         fi
     done
+    if (( restore_failed )); then
+        echo -e "${YELLOW}[警告]${PLAIN} 部分运行时参数恢复失败，原始记录已保留。"
+        return 1
+    fi
     rm -rf "$dir"
+    return 0
 }
 
 validate_port() {
@@ -330,31 +445,60 @@ firewall_allow() {
 }
 
 firewall_remove_owned_rule() {
-    local port="$1" proto="$2"
-    local file="${VPS_TOOL_STATE}/firewall/${proto}_${port}.rule"
-    [[ -f "$file" ]] || return 0
-    local backend
-    backend=$(sed -n '1p' "$file")
+    local backend="$1" port="$2" proto="$3"
     case "$backend" in
-        ufw) ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true ;;
-        firewalld) firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true; firewall-cmd --reload >/dev/null 2>&1 || true ;;
+        ufw)
+            if ! ufw status 2>/dev/null | grep -Eq "^[[:space:]]*${port}/${proto}([[:space:]]|$)"; then
+                return 0
+            fi
+            ufw delete allow "${port}/${proto}" >/dev/null 2>&1
+            ;;
+        firewalld)
+            if ! firewall-cmd --query-port="${port}/${proto}" --permanent >/dev/null 2>&1; then
+                return 0
+            fi
+            firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || return 1
+            firewall-cmd --reload >/dev/null 2>&1 || return 1
+            ;;
+        *)
+            return 1
+            ;;
     esac
-    rm -f "$file"
 }
 
 firewall_remove_owned_rules() {
-    local file backend port proto
-    local dir="${VPS_TOOL_STATE}/firewall"
-    [[ -d "$dir" ]] || return 0
+    local backend port proto file failed dir="${VPS_TOOL_STATE}/firewall"
+
+    # 传入端口/协议时，只删除该条由工具记录的规则；不传参数则清理全部已记录规则。
+    if [[ $# -eq 2 ]]; then
+        port="$1"
+        proto="$2"
+        validate_port "$port" || return 1
+        case "$proto" in tcp|udp) ;; *) return 1 ;; esac
+        file="${dir}/${proto}_${port}.rule"
+        [[ -f "$file" ]] || return 1
+        backend=$(sed -n '1p' "$file")
+        if firewall_remove_owned_rule "$backend" "$port" "$proto"; then
+            rm -f "$file"
+            return 0
+        fi
+        echo -e "${YELLOW}[警告]${PLAIN} 防火墙规则 ${port}/${proto} 未能删除，保留记录以便后续重试。"
+        return 1
+    fi
+
+    [[ -d "$dir" ]] || return 1
+    failed=0
     for file in "$dir"/*.rule; do
         [[ -f "$file" ]] || continue
         backend=$(sed -n '1p' "$file")
         port=$(sed -n '2p' "$file")
         proto=$(sed -n '3p' "$file")
-        case "$backend" in
-            ufw) ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true ;;
-            firewalld) firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true ; firewall-cmd --reload >/dev/null 2>&1 || true ;;
-        esac
-        rm -f "$file"
+        if firewall_remove_owned_rule "$backend" "$port" "$proto"; then
+            rm -f "$file"
+        else
+            failed=1
+            echo -e "${YELLOW}[警告]${PLAIN} 防火墙规则 ${port}/${proto} 未能删除，保留记录以便后续重试。"
+        fi
     done
+    return "$failed"
 }
