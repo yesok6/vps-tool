@@ -1,125 +1,103 @@
 #!/usr/bin/env bash
+set -Eeuo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-PLAIN='\033[0m'
-
-TEMP_WORK_DIR="/tmp/vps_ip_audit_$$"
-LOG_DIR="/etc/vps-tool"
-LOG_FILE="${LOG_DIR}/install.log"
-
-log_action() {
-    mkdir -p "${LOG_DIR}"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "${LOG_FILE}"
-}
-
-[[ $EUID -ne 0 ]] && echo -e "${RED}[错误]${PLAIN} 请使用 root 权限运行！" && exit 1
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/common.sh"
+require_root
 
 check_hardware_safety() {
     local req_mem_mb="${1:-180}"
-    local mem_avail_kb
-    mem_avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null)
-    if [[ -z "$mem_avail_kb" ]]; then
-        local mem_free_kb swap_free_kb
-        mem_free_kb=$(awk '/MemFree/ {print $2}' /proc/meminfo 2>/dev/null)
-        swap_free_kb=$(awk '/SwapFree/ {print $2}' /proc/meminfo 2>/dev/null)
-        mem_avail_kb=$((mem_free_kb + swap_free_kb))
-    fi
-    local mem_avail_mb=$((mem_avail_kb / 1024))
-    local disk_avail_mb
-    disk_avail_mb=$(df -m / | awk 'NR==2 {print $4}')
+    local mem_avail_kb disk_avail_mb mem_avail_mb answer
+    mem_avail_kb=$(awk '/MemAvailable/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
+    mem_avail_mb=$((mem_avail_kb / 1024))
+    disk_avail_mb=$(df -Pm / | awk 'NR==2 {print $4}')
 
-    echo -e "${CYAN}[硬件安全审计]${PLAIN} 可用内存: ${GREEN}${mem_avail_mb} MB${PLAIN} | 磁盘剩余: ${GREEN}${disk_avail_mb} MB${PLAIN}"
-
-    if [ "$disk_avail_mb" -lt 300 ]; then
-        echo -e "${RED}${BOLD}[严重警告] 磁盘剩余空间小于 300MB，极度危险！${PLAIN}"
-        read -rp "依然强制运行？[y/N]: " f_disk
-        [[ ! "$f_disk" =~ ^[Yy]$ ]] && return 1
+    echo -e "${CYAN}[硬件审计]${PLAIN} 可用内存 ${mem_avail_mb}MB，磁盘 ${disk_avail_mb}MB"
+    if (( disk_avail_mb < 300 )); then
+        echo -e "${RED}[警告]${PLAIN} 根分区剩余空间低于 300MB。"
+        read -rp "仍要运行？[y/N]: " answer
+        [[ "$answer" =~ ^[Yy]$ ]] || return 1
     fi
-
-    if [ "$mem_avail_mb" -lt "$req_mem_mb" ]; then
-        echo -e "${YELLOW}[预警] 可用内存偏低 (${mem_avail_mb}MB)，测试可能短暂卡顿。${PLAIN}"
-        read -rp "建议确认是否继续？[Y/n]: " proceed_mem
-        [[ "$proceed_mem" =~ ^[Nn]$ ]] && return 1
+    if (( mem_avail_mb < req_mem_mb )); then
+        echo -e "${YELLOW}[提示]${PLAIN} 可用内存较低，测试可能产生额外负载。"
+        read -rp "继续？[Y/n]: " answer
+        [[ "$answer" =~ ^[Nn]$ ]] && return 1
     fi
-    return 0
 }
 
-cleanup_environment() {
-    echo -e "${BLUE}[清理中]${PLAIN} 正在自动回收临时文件..."
-    rm -rf "$TEMP_WORK_DIR" /tmp/check.sh /tmp/RegionRestrictionCheck* /tmp/backtrace*
-    echo -e "${GREEN}[完成]${PLAIN} 系统环境已安全复原，无任何残留。"
+run_remote_diagnostic() {
+    local name="$1" url="$2"
+    local tmpdir script answer
+    tmpdir=$(make_temp_dir vps-ip-test)
+    script="${tmpdir}/${name}.sh"
+    if ! download_shell_checked "$url" "$script"; then
+        echo -e "${RED}[错误]${PLAIN} 第三方脚本下载或语法检查失败。"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    echo -e "${YELLOW}[第三方脚本]${PLAIN} 即将以 root 身份执行："
+    echo "  $url"
+    read -rp "确认执行？[y/N]: " answer
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+        rm -rf "$tmpdir"
+        echo -e "${YELLOW}[取消]${PLAIN} 未执行第三方脚本。"
+        return 0
+    fi
+
+    log_action "[测试] 执行第三方诊断脚本：${url}"
+    local rc=0
+    if ! ( cd "$tmpdir" && bash "$script" ); then
+        rc=$?
+    fi
+    rm -rf "$tmpdir"
+    return "$rc"
 }
 
 run_test_ipquality() {
     clear
-    echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${CYAN}   选项 1: IPQuality 综合 IP 纯净度与欺诈评分      ${PLAIN}"
-    echo -e "${CYAN}====================================================${PLAIN}"
-    check_hardware_safety 120 || return
-
-    mkdir -p "$TEMP_WORK_DIR" && cd "$TEMP_WORK_DIR" || return
-    log_action "[测试] 运行 IPQuality 欺诈度测试"
-    bash <(curl -Ls https://IP.Check.Place) -y
-    cd / && cleanup_environment
+    echo -e "${CYAN}================ IPQuality ================${PLAIN}"
+    check_hardware_safety 120 || return 0
+    # 远程脚本仍然来自第三方，因此默认要求人工确认。
+    run_remote_diagnostic ipquality 'https://IP.Check.Place'
 }
 
 run_test_streaming_ai() {
     clear
-    echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${CYAN} 选项 2: RegionRestrictionCheck 流媒体与 AI 解锁   ${PLAIN}"
-    echo -e "${CYAN}====================================================${PLAIN}"
-    check_hardware_safety 100 || return
-
-    mkdir -p "$TEMP_WORK_DIR" && cd "$TEMP_WORK_DIR" || return
-    log_action "[测试] 运行流媒体与 AI 解锁检测"
-    bash <(curl -L -s check.unlock.media)
-    cd / && cleanup_environment
+    echo -e "${CYAN}========== RegionRestrictionCheck ==========${PLAIN}"
+    check_hardware_safety 100 || return 0
+    run_remote_diagnostic region-restriction 'https://check.unlock.media'
 }
 
 run_test_route() {
     clear
-    echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${CYAN}    选项 3: 三网回程路由诊断 (识别 CN2/9929/CMI)    ${PLAIN}"
-    echo -e "${CYAN}====================================================${PLAIN}"
-    check_hardware_safety 150 || return
-
-    mkdir -p "$TEMP_WORK_DIR" && cd "$TEMP_WORK_DIR" || return
-    log_action "[测试] 运行三网回程路由诊断"
-    curl -fsSL https://raw.githubusercontent.com/zhanghanyun/backtrace/main/install.sh -o /tmp/backtrace.sh
-    if [[ -f /tmp/backtrace.sh ]]; then
-        bash /tmp/backtrace.sh
-    else
-        wget -qO- https://raw.githubusercontent.com/fscarmen/tools/main/backtrace.sh | bash
-    fi
-    cd / && cleanup_environment
+    echo -e "${CYAN}============== 回程路由诊断 ===============${PLAIN}"
+    check_hardware_safety 150 || return 0
+    run_remote_diagnostic backtrace 'https://raw.githubusercontent.com/zhanghanyun/backtrace/main/install.sh'
 }
 
 ip_test_menu() {
     while true; do
         clear
         echo -e "${CYAN}====================================================${PLAIN}"
-        echo -e "${CYAN}         [模块 5] VPS 质量体检与 IP 纯净度检测      ${PLAIN}"
-        echo -e "  特性属性: ${GREEN}[所有测试均为即用即焚，结束后自动清除缓存无残留]${PLAIN}"
+        echo -e "${CYAN}              [模块 5] IP 与网络诊断              ${PLAIN}"
         echo -e "${CYAN}====================================================${PLAIN}"
-        echo -e "  ${GREEN}1.${PLAIN} IP 纯净度与欺诈分测定 ${BLUE}[xykt: 查原生/双ISP/风控画像]${PLAIN}"
-        echo -e "  ${GREEN}2.${PLAIN} 流媒体与 AI 解锁测试  ${BLUE}[lmc999: 测奈飞/TikTok/ChatGPT]${PLAIN}"
-        echo -e "  ${GREEN}3.${PLAIN} 三网回程路由线路识别  ${BLUE}[识别电信CN2/联通9929/移动CMI]${PLAIN}"
-        echo -e "  ----------------------------------------------------"
-        echo -e "  ${RED}0.${PLAIN} 返回主菜单"
+        echo "1. IPQuality 欺诈/纯净度测试"
+        echo "2. 流媒体/AI 可用性测试"
+        echo "3. 三网回程路由测试"
+        echo "0. 返回"
         echo -e "${CYAN}====================================================${PLAIN}"
-
-        read -rp "请输入选项 [0-3]: " test_choice
-        case "$test_choice" in
-            1) run_test_ipquality; read -rp "按回车键返回菜单..." ;;
-            2) run_test_streaming_ai; read -rp "按回车键返回菜单..." ;;
-            3) run_test_route; read -rp "按回车键返回菜单..." ;;
+        read -rp "请选择 [0-3]: " choice
+        case "$choice" in
+            1) run_test_ipquality || true; read -rp "按回车继续..." ;;
+            2) run_test_streaming_ai || true; read -rp "按回车继续..." ;;
+            3) run_test_route || true; read -rp "按回车继续..." ;;
             0) break ;;
+            *) echo -e "${RED}[错误]${PLAIN} 无效选项。"; sleep 1 ;;
         esac
     done
 }
-ip_test_menu
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    ip_test_menu
+fi
