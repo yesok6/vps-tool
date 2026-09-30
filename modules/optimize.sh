@@ -48,13 +48,38 @@ ensure_swap_if_needed() {
 
     mkdir -p "$(dirname "$SWAP_PATH")"
     if [[ ! -e "$SWAP_PATH" ]]; then
-        fallocate -l 1G "$SWAP_PATH" 2>/dev/null || dd if=/dev/zero of="$SWAP_PATH" bs=1M count=1024 status=none
-        chmod 600 "$SWAP_PATH"
-        mkswap "$SWAP_PATH" >/dev/null
-        swapon "$SWAP_PATH"
-        grep -Fqx "$SWAP_PATH none swap sw 0 0" /etc/fstab || printf '%s\n' "$SWAP_PATH none swap sw 0 0" >> /etc/fstab
-        mark_owned "$SWAP_PATH"
-        state_set swap_created 1
+        if ! (fallocate -l 1G "$SWAP_PATH" 2>/dev/null || dd if=/dev/zero of="$SWAP_PATH" bs=1M count=1024 status=none); then
+            rm -f "$SWAP_PATH"
+            echo -e "${RED}[错误]${PLAIN} Swap 文件创建失败。"
+            return 1
+        fi
+        if ! chmod 600 "$SWAP_PATH" || ! mkswap "$SWAP_PATH" >/dev/null; then
+            rm -f "$SWAP_PATH"
+            echo -e "${RED}[错误]${PLAIN} Swap 初始化失败，已清理临时文件。"
+            return 1
+        fi
+        if ! swapon "$SWAP_PATH"; then
+            rm -f "$SWAP_PATH"
+            echo -e "${RED}[错误]${PLAIN} swapon 失败，已自动回滚 Swap 文件。"
+            return 1
+        fi
+        if ! grep -Fqx "$SWAP_PATH none swap sw 0 0" /etc/fstab; then
+            if ! printf '%s\n' "$SWAP_PATH none swap sw 0 0" >> /etc/fstab; then
+                swapoff "$SWAP_PATH" >/dev/null 2>&1 || true
+                rm -f "$SWAP_PATH"
+                echo -e "${RED}[错误]${PLAIN} 无法写入 /etc/fstab，Swap 已回滚。"
+                return 1
+            fi
+        fi
+        if ! mark_owned "$SWAP_PATH" || ! state_set swap_created 1; then
+            swapoff "$SWAP_PATH" >/dev/null 2>&1 || true
+            sed -i "\#^${SWAP_PATH}[[:space:]]#d" /etc/fstab 2>/dev/null || true
+            rm -f "$SWAP_PATH"
+            unmark_owned "$SWAP_PATH"
+            state_unset swap_created
+            echo -e "${RED}[错误]${PLAIN} Swap 状态记录失败，已回滚创建的 Swap。"
+            return 1
+        fi
         log_action "[可撤销] 创建 VPS-Tool Swap：${SWAP_PATH}"
         echo -e "${GREEN}[完成]${PLAIN} 低内存 VPS 已增加 1GB 工具专属 Swap。"
     fi
@@ -86,7 +111,7 @@ net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_mtu_probing = 1
 EOF2
     chmod 644 "$SYSCTL_CONF"
-    if ! sysctl --load "$SYSCTL_CONF" >/dev/null; then
+    if ! sysctl -p "$SYSCTL_CONF" >/dev/null; then
         restore_file_backup "$SYSCTL_CONF" sysctl_optimizer_conf || true
         sysctl --system >/dev/null 2>&1 || true
         echo -e "${RED}[错误]${PLAIN} 当前内核不接受全部优化参数，已自动恢复原配置。"
@@ -133,13 +158,81 @@ set_ipv4_priority() {
     echo -e "${GREEN}[成功]${PLAIN} IPv4 优先解析已启用。"
 }
 
+
+install_bbrv3_max() {
+    [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${CYAN}      安装 BBRv3 Max 激进内核  ${YELLOW}[底层保留/不可逆变更]${PLAIN}   ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    confirm_safety_prompt "安装 BBRv3 Max 激进内核" "内核安装属于底层变更；本工具无法把已安装的新内核完整恢复为安装前状态。请确认云平台控制台/VNC、救援模式或带外管理可用。" || return 1
+    check_os || return 1
+    if [[ "$PKG_MANAGER" != "apt" ]]; then
+        echo -e "${RED}[错误]${PLAIN} 目前该编译内核仅支持 Debian / Ubuntu 系统！"; return 1
+    fi
+    local arch releases_json max_tag tmp deb_urls url file valid=0
+    case "$(uname -m)" in
+        x86_64) arch="x86_64" ;;
+        aarch64) arch="arm64" ;;
+        *) echo -e "${RED}[错误]${PLAIN} 不支持的架构！"; return 1 ;;
+    esac
+    ensure_swap_if_needed || return 1
+    echo -e "${BLUE}[信息]${PLAIN} 正在拉取最新 BBRv3 Max 构建版本..."
+    releases_json=$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 https://api.github.com/repos/byJoey/Actions-bbr-v3/releases) || return 1
+    if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$releases_json"; then
+        echo -e "${RED}[错误]${PLAIN} GitHub Releases 返回的数据格式异常。"
+        return 1
+    fi
+    max_tag=$(jq -r --arg arch "$arch" '[.[] | select((.tag_name | contains($arch)) and (.tag_name | endswith("-max")))] | .[0].tag_name // empty' <<<"$releases_json")
+    [[ -n "$max_tag" ]] || { echo -e "${RED}[错误]${PLAIN} 匹配内核失败！"; return 1; }
+    tmp=$(make_temp_dir bbrv3_install)
+    deb_urls=$(jq -r --arg tag "$max_tag" '.[] | select(.tag_name == $tag) | .assets[]? | select((.browser_download_url | endswith(".deb")) and ((.name | contains("dbg")) | not)) | .browser_download_url' <<<"$releases_json")
+    [[ -n "$deb_urls" ]] || { rm -rf "$tmp"; echo -e "${RED}[错误]${PLAIN} 未找到可用内核安装包。"; return 1; }
+    for url in $deb_urls; do
+        file="${tmp}/$(basename "$url")"
+        if ! download_https "$url" "$file"; then rm -rf "$tmp"; return 1; fi
+        if ! dpkg-deb --info "$file" >/dev/null 2>&1; then
+            rm -rf "$tmp"
+            echo -e "${RED}[错误]${PLAIN} 下载的内核包校验失败：$(basename "$file")"
+            return 1
+        fi
+        valid=1
+    done
+    (( valid == 1 )) || { rm -rf "$tmp"; return 1; }
+    backup_file_once "/etc/sysctl.d/99-bbr.conf" bbr_sysctl_conf
+    if ! apt-get install -y "${tmp}"/*.deb; then
+        rm -rf "$tmp"
+        echo -e "${RED}[错误]${PLAIN} 内核依赖无法由 apt 自动解决，已停止安装。"
+        return 1
+    fi
+    update-grub 2>/dev/null || update-grub2 2>/dev/null || { rm -rf "$tmp"; return 1; }
+    cat > /etc/sysctl.d/99-bbr.conf <<'EOF2'
+# VPS-Tool：BBRv3 Max 内核对应的运行参数
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF2
+    sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null || true
+    rm -rf "$tmp"
+    log_action "[底层保留/不可逆变更] 安装 BBRv3 Max 极限内核版本: ${max_tag}"
+    echo -e "${GREEN}[成功]${PLAIN} BBRv3 Max 内核已安装。内核文件本身不会由“一键清理”自动卸载。"
+    read -rp "是否立即重启服务器使内核生效？[y/N]: " reboot_choice
+    if [[ "$reboot_choice" =~ ^[Yy]$ ]]; then
+        reboot
+    fi
+}
+
 apply_production_tune() {
-    clear
+    [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${CYAN}            [生产级安全网络调优]                 ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
 
-    ensure_swap_if_needed
+    local swap_state_before swap_created_now=0
+    swap_state_before=$(state_get swap_created 2>/dev/null || true)
+    if ! ensure_swap_if_needed; then
+        echo -e "${RED}[错误]${PLAIN} 当前内存/Swap 环境无法完成生产级调优，已停止后续优化。"
+        return 1
+    fi
+    [[ "$swap_state_before" == "1" || "$(state_get swap_created 2>/dev/null || true)" != "1" ]] || swap_created_now=1
     backup_file_once "$LIMITS_CONF" limits_conf
     mkdir -p "$(dirname "$LIMITS_CONF")"
     cat > "$LIMITS_CONF" <<'EOF2'
@@ -158,6 +251,16 @@ EOF2
     current_cc="${current_cc:-cubic}"
 
     if ! write_sysctl_config "$current_cc"; then
+        if (( swap_created_now )); then
+            if swapoff "$SWAP_PATH" >/dev/null 2>&1; then
+                sed -i "\#^${SWAP_PATH}[[:space:]]#d" /etc/fstab 2>/dev/null || true
+                rm -f "$SWAP_PATH"
+                unmark_owned "$SWAP_PATH"
+                state_unset swap_created
+            else
+                echo -e "${YELLOW}[警告]${PLAIN} 网络调优失败，但新建 Swap 无法自动关闭，已保留以避免破坏当前系统。"
+            fi
+        fi
         return 1
     fi
     set_ipv4_priority
@@ -166,47 +269,37 @@ EOF2
     echo -e "${GREEN}[成功]${PLAIN} 生产级调优已完成；所有配置均有原始备份。"
 }
 
-safe_bbr_current_kernel() {
-    local available
-    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
-    if ! grep -qw bbr <<< "$available"; then
-        echo -e "${YELLOW}[提示]${PLAIN} 当前内核没有 BBR，不会自动更换内核。"
-        return 1
-    fi
-    backup_file_once "$SYSCTL_CONF" sysctl_optimizer_conf
-    cat > "$SYSCTL_CONF" <<'EOF2'
-# Managed by VPS-Tool.
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF2
-    if ! sysctl --load "$SYSCTL_CONF" >/dev/null; then
-        restore_file_backup "$SYSCTL_CONF" sysctl_optimizer_conf || true
-        sysctl --system >/dev/null 2>&1 || true
-        return 1
-    fi
-    log_action "[可撤销] 启用当前内核自带 BBR；未更换内核"
-    echo -e "${GREEN}[成功]${PLAIN} 已启用当前内核支持的 BBR；没有安装第三方内核。"
+restore_nic_txqueuelen() {
+    local iface="$1" qlen="$2"
+    [[ -n "$iface" && -n "$qlen" ]] || return 1
+    ip link set dev "$iface" txqueuelen "$qlen" >/dev/null 2>&1
 }
 
 aggressive_speed_mode() {
-    clear
+    [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
     echo -e "${RED}${BOLD}====================================================${PLAIN}"
-    echo -e "${RED}${BOLD}             [高强度队列/缓存模式]               ${PLAIN}"
+    echo -e "${RED}${BOLD}   BBR 暴躁/疯批模式  ${GREEN}[参数可完全撤销]${PLAIN}                  ${PLAIN}"
     echo -e "${RED}${BOLD}====================================================${PLAIN}"
-    confirm_safety_prompt "高强度网络参数" "此模式会显著提高缓冲区与网卡队列，适合有明确测试目标的机器。" || return 0
+    confirm_safety_prompt "高强度网络参数" "此模式会显著提高缓冲区与网卡队列；参数本身可回滚，但实际网络效果依赖当前内核与云厂商，请确认有控制台/VNC。" || return 1
 
-    local iface qlen
+    local iface qlen nic_changed=0
     iface=$(get_default_interface)
     if [[ -n "$iface" ]]; then
         qlen=$(ip -o link show dev "$iface" | sed -n 's/.* qlen \([0-9]\+\).*/\1/p')
-        [[ -n "$qlen" ]] && state_set "nic_qlen_${iface}" "$qlen"
-        ip link set dev "$iface" txqueuelen 100000
+        [[ -n "$qlen" ]] || { echo -e "${RED}[错误]${PLAIN} 无法读取网卡发送队列长度。"; return 1; }
+        state_set "nic_qlen_${iface}" "$qlen"
+        if ! ip link set dev "$iface" txqueuelen 100000 >/dev/null 2>&1; then
+            state_unset "nic_qlen_${iface}"
+            echo -e "${RED}[错误]${PLAIN} 网卡发送队列修改失败，未继续写入高强度参数。"
+            return 1
+        fi
+        nic_changed=1
         state_set aggressive_nic "${iface}"
     fi
 
     backup_file_once "$SYSCTL_CONF" sysctl_optimizer_conf
     cat > "$SYSCTL_CONF" <<'EOF2'
-# Managed by VPS-Tool.
+# VPS-Tool：BBR 暴躁/疯批模式参数
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = 67108864
@@ -223,25 +316,32 @@ net.ipv4.tcp_notsent_lowat = 16384
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_moderate_rcvbuf = 1
 EOF2
-    if ! sysctl --load "$SYSCTL_CONF" >/dev/null; then
+    if ! sysctl -p "$SYSCTL_CONF" >/dev/null; then
         restore_file_backup "$SYSCTL_CONF" sysctl_optimizer_conf || true
-        sysctl --system >/dev/null 2>&1 || true
-        if [[ -n "$iface" && -n "$qlen" ]]; then ip link set dev "$iface" txqueuelen "$qlen" >/dev/null 2>&1 || true; fi
+        if [[ -f "$SYSCTL_CONF" ]]; then sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true; else sysctl --system >/dev/null 2>&1 || true; fi
+        if (( nic_changed )); then
+            if ! restore_nic_txqueuelen "$iface" "$qlen"; then
+                echo -e "${RED}[严重警告]${PLAIN} 网卡队列回滚失败，请手工恢复：${iface} qlen ${qlen}。"
+                return 1
+            fi
+        fi
         state_unset aggressive_nic
         [[ -n "$iface" ]] && state_unset "nic_qlen_${iface}"
         echo -e "${RED}[错误]${PLAIN} 高强度参数被当前内核拒绝，已恢复。"
         return 1
     fi
-    log_action "[可撤销] 开启高强度队列/缓存模式"
-    echo -e "${GREEN}[成功]${PLAIN} 高强度模式已启用。"
+    log_action "[可撤销] 开启 BBR 暴躁极限模式 (网卡队列100000+全满缓存)"
+    echo -e "${GREEN}[成功]${PLAIN} BBR 暴躁/疯批模式已启用。"
 }
 
+
 reset_all_optimizations() {
+    local restore_failed=0 iface qlen
     echo -e "${BLUE}[恢复]${PLAIN} 仅恢复 VPS-Tool 自己修改并记录过的项目。"
     restore_file_backup "$SYSCTL_CONF" sysctl_optimizer_conf || true
     restore_file_backup "$LIMITS_CONF" limits_conf || true
     if [[ "$(state_get gai_added_by_tool 2>/dev/null || true)" == "1" ]]; then
-        sed -i '/^precedence ::ffff:0:0\/96[[:space:]]\+100$/d' "$GAI_CONF" 2>/dev/null || true
+        sed -i '\#^precedence ::ffff:0:0\/96[[:space:]]\+100$#d' "$GAI_CONF" 2>/dev/null || restore_failed=1
     fi
     if [[ "$(state_get gai_original_exists 2>/dev/null || true)" == "0" && -f "$GAI_CONF" ]]; then
         [[ ! -s "$GAI_CONF" ]] && rm -f "$GAI_CONF"
@@ -250,27 +350,39 @@ reset_all_optimizations() {
     state_unset gai_original_exists
 
     if [[ "$(state_get swap_created 2>/dev/null || true)" == "1" ]] && is_owned "$SWAP_PATH"; then
-        swapoff "$SWAP_PATH" >/dev/null 2>&1 || true
-        rm -f "$SWAP_PATH"
-        sed -i \#"^${SWAP_PATH}[[:space:]]"#d /etc/fstab 2>/dev/null || true
-        unmark_owned "$SWAP_PATH"
+        if swapoff "$SWAP_PATH" >/dev/null 2>&1; then
+            rm -f "$SWAP_PATH"
+            sed -i "\#^${SWAP_PATH}[[:space:]]#d" /etc/fstab 2>/dev/null || restore_failed=1
+            unmark_owned "$SWAP_PATH"
+        else
+            echo -e "${YELLOW}[警告]${PLAIN} 无法关闭工具创建的 Swap，保留文件以避免破坏当前系统。"
+            restore_failed=1
+        fi
     fi
     state_unset swap_created
 
-    restore_runtime_values
-    local iface qlen
+    restore_runtime_values || true
     iface=$(state_get aggressive_nic 2>/dev/null || true)
     if [[ -n "$iface" ]]; then
         qlen=$(state_get "nic_qlen_${iface}" 2>/dev/null || true)
-        if [[ -n "$qlen" ]]; then ip link set dev "$iface" txqueuelen "$qlen" >/dev/null 2>&1 || true; fi
+        if ! restore_nic_txqueuelen "$iface" "$qlen"; then
+            echo -e "${RED}[严重警告]${PLAIN} 网卡发送队列恢复失败，请手工执行：ip link set dev ${iface} txqueuelen ${qlen}"
+            restore_failed=1
+        fi
         state_unset aggressive_nic
         state_unset "nic_qlen_${iface}"
     fi
 
-    sysctl --system >/dev/null 2>&1 || true
-    log_action "[已撤销] 恢复 VPS-Tool 记录的网络优化配置"
-    echo -e "${GREEN}[完成]${PLAIN} 已恢复本工具记录过的原始配置。未被本工具备份的用户自定义配置不会被删除。"
+    if [[ -f "$SYSCTL_CONF" ]]; then sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || restore_failed=1; else sysctl --system >/dev/null 2>&1 || restore_failed=1; fi
+    if (( restore_failed )); then
+        log_action "[部分撤销] 网络优化恢复存在未能自动完成的项目"
+        echo -e "${YELLOW}[警告]${PLAIN} 部分变更未能自动恢复，请查看终端提示与审计日志。"
+        return 1
+    fi
+    log_action "[已撤销] 清除网络优化参数，复原工具修改前状态"
+    echo -e "${GREEN}[成功]${PLAIN} 本工具记录的网络优化参数已恢复。"
 }
+
 
 show_dashboard() {
     local cur_kernel cc qdisc avail iface
@@ -292,31 +404,36 @@ optimize_menu() {
     while true; do
         clear
         echo -e "${CYAN}====================================================${PLAIN}"
-        echo -e "${CYAN}              [模块 3] 网络深度优化              ${PLAIN}"
+        echo -e "${CYAN}              [模块 3] 网络深度优化                 ${PLAIN}"
         echo -e "${CYAN}====================================================${PLAIN}"
         show_dashboard
-        echo "  1. 生产级综合调优（带备份/失败恢复）"
-        echo "  2. 启用当前内核 BBR（不更换第三方内核）"
-        echo "  3. 高强度队列/缓存模式（可恢复）"
-        echo "  4. IPv4 优先解析"
-        echo "  5. RPS/XPS 多核均衡"
-        echo "  6. 恢复本工具记录过的优化"
-        echo "  0. 返回"
+        echo -e "  ${GREEN}1.${PLAIN} 生产级综合调优 ${GREEN}[参数可完全撤销]${PLAIN}"
+        echo -e "  ${GREEN}2.${PLAIN} 安装 BBRv3 Max 激进内核 ${YELLOW}[底层变更/不可逆]${PLAIN}"
+        echo -e "  ${GREEN}3.${PLAIN} 开启 BBR 暴躁/疯批模式 ${GREEN}[参数可完全撤销]${PLAIN}"
+        echo -e "  ${GREEN}4.${PLAIN} 独立切换: IPv4 优先解析 ${GREEN}[参数可撤销]${PLAIN}"
+        echo -e "  ${GREEN}5.${PLAIN} 独立开启: 网卡软中断多核均衡 ${GREEN}[参数可撤销]${PLAIN}"
+        echo -e "  ${YELLOW}6.${PLAIN} 一键清除所有优化，还原本工具记录的原始配置"
+        echo -e "  ${RED}0.${PLAIN} 返回主菜单"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请选择 [0-6]: " choice
+        read -rp "请输入选项 [0-6]: " choice
         case "$choice" in
             1) apply_production_tune; read -rp "按回车继续..." ;;
-            2) safe_bbr_current_kernel; read -rp "按回车继续..." ;;
+            2) install_bbrv3_max; read -rp "按回车继续..." ;;
             3) aggressive_speed_mode; read -rp "按回车继续..." ;;
             4) set_ipv4_priority; read -rp "按回车继续..." ;;
             5) enable_nic_multiqueue; read -rp "按回车继续..." ;;
             6) reset_all_optimizations; read -rp "按回车继续..." ;;
             0) break ;;
-            *) echo -e "${RED}[错误]${PLAIN} 无效选项。"; sleep 1 ;;
+            *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
     done
 }
 
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    optimize_menu
+    case "${1:-}" in
+        --pipeline-network) apply_production_tune ;;
+        --bbrv3-max) install_bbrv3_max ;;
+        *) optimize_menu ;;
+    esac
 fi
