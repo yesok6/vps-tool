@@ -46,9 +46,9 @@ fetch_checksums_file() {
 
 install_singbox() {
     if resolve_singbox; then
-        echo -e "${GREEN}[环境]${PLAIN} 使用系统已有 sing-box：${SINGBOX_BIN}"
+        echo -e "${GREEN}[环境]${PLAIN} 检测到现有 sing-box，将复用当前程序：${SINGBOX_BIN}"
     else
-        local version arch asset_url asset checksum_file tmp
+        local version arch asset_url asset checksum tmp
         case "$(uname -m)" in
             x86_64) arch=amd64 ;;
             aarch64) arch=arm64 ;;
@@ -59,31 +59,53 @@ install_singbox() {
         asset="sing-box-${version}-linux-${arch}.tar.gz"
         asset_url="https://github.com/SagerNet/sing-box/releases/download/v${version}/${asset}"
         tmp=$(make_temp_dir singbox-install)
-        trap 'rm -rf "${tmp}"' EXIT
 
         echo -e "${BLUE}[环境]${PLAIN} 下载 sing-box v${version} 并校验 SHA-256..."
-        download_https "$asset_url" "${tmp}/${asset}"
-        fetch_checksums_file "$version" "${tmp}/checksums.txt" || {
+        if ! download_https "$asset_url" "${tmp}/${asset}"; then
+            rm -rf "$tmp"
+            return 1
+        fi
+        if ! fetch_checksums_file "$version" "${tmp}/checksums.txt"; then
+            rm -rf "$tmp"
             echo -e "${RED}[错误]${PLAIN} 无法取得官方校验文件，拒绝安装未经校验的二进制。"
             return 1
-        }
-        checksum=$(grep -E "[[:space:]]${asset}$" "${tmp}/checksums.txt" | awk '{print $1}' | head -n1)
-        [[ "$checksum" =~ ^[A-Fa-f0-9]{64}$ ]] || {
+        fi
+        checksum=$(grep -F -- "$asset" "${tmp}/checksums.txt" | awk '{print $1}' | head -n1)
+        if [[ ! "$checksum" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+            rm -rf "$tmp"
             echo -e "${RED}[错误]${PLAIN} 校验文件中找不到 ${asset} 的 SHA-256。"
             return 1
-        }
-        echo "${checksum}  ${tmp}/${asset}" | sha256sum -c - >/dev/null
+        fi
+        if ! echo "${checksum}  ${tmp}/${asset}" | sha256sum -c - >/dev/null; then
+            rm -rf "$tmp"
+            echo -e "${RED}[错误]${PLAIN} sing-box SHA-256 校验失败，已拒绝安装。"
+            return 1
+        fi
 
-        mkdir -p "${VPS_TOOL_ROOT}/bin"
-        tar -xzf "${tmp}/${asset}" -C "$tmp"
+        if ! mkdir -p "${VPS_TOOL_ROOT}/bin"; then
+            rm -rf "$tmp"
+            echo -e "${RED}[错误]${PLAIN} 无法创建本地二进制目录。"
+            return 1
+        fi
+        if ! tar -xzf "${tmp}/${asset}" -C "$tmp"; then
+            rm -rf "$tmp"
+            echo -e "${RED}[错误]${PLAIN} sing-box 压缩包解压失败。"
+            return 1
+        fi
         local extracted
         extracted=$(find "$tmp" -type f -name sing-box -perm -u=x | head -n1)
-        [[ -n "$extracted" ]] || { echo -e "${RED}[错误]${PLAIN} 压缩包中没有找到 sing-box。"; return 1; }
-        install -m 0755 "$extracted" "${VPS_TOOL_ROOT}/bin/sing-box"
+        if [[ -z "$extracted" ]]; then
+            rm -rf "$tmp"
+            echo -e "${RED}[错误]${PLAIN} 压缩包中没有找到 sing-box。"
+            return 1
+        fi
+        if ! install -m 0755 "$extracted" "${VPS_TOOL_ROOT}/bin/sing-box"; then
+            rm -rf "$tmp"
+            return 1
+        fi
         mark_owned "${VPS_TOOL_ROOT}/bin/sing-box"
         SINGBOX_BIN="${VPS_TOOL_ROOT}/bin/sing-box"
         rm -rf "$tmp"
-        trap - EXIT
         log_action "[可撤销] 安装经 SHA-256 校验的 sing-box v${version}"
     fi
 
@@ -133,7 +155,6 @@ EOF2
 chmod 0644 "$SERVICE_FILE"
 mark_owned "$SERVICE_FILE"
 
-after_service_install=1
 systemctl daemon-reload
 systemctl enable "$SERVICE_UNIT" >/dev/null
 }
@@ -188,6 +209,7 @@ ensure_conf_permissions() {
     chmod 0750 "$CONF_DIR"
     [[ -f "$CONF_FILE" ]] && { chown root:vps-tool "$CONF_FILE"; chmod 0640 "$CONF_FILE"; }
     [[ -f "$NODE_INFO_FILE" ]] && { chown root:root "$NODE_INFO_FILE"; chmod 0600 "$NODE_INFO_FILE"; }
+    # Hysteria 2 证书/私钥由生成步骤单独设置权限；这里不覆盖其专用权限。
 }
 
 service_was_running() {
@@ -223,15 +245,21 @@ firewall_note() {
 }
 
 deploy_vless_reality() {
-    clear
+    [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${CYAN}              [VLESS + Reality]                    ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
 
     local default_port input_port port sni uuid key_pair private_key public_key short_id server_ip
+    local pipeline_mode="${1:-}"
     default_port=$(get_random_protocol_port tcp) || { echo -e "${RED}[错误]${PLAIN} 无法找到空闲 TCP 端口。"; return 1; }
-    read -rp "端口 [回车使用 ${default_port}，范围 1024-65535]: " input_port
-    port="${input_port:-$default_port}"
+    if [[ "$pipeline_mode" == "pipeline" ]]; then
+        port="$default_port"
+        echo -e "${BLUE}[流水线]${PLAIN} 自动选择空闲 TCP 端口：${port}（无需手动输入）"
+    else
+        read -rp "端口 [回车使用 ${default_port}，范围 1024-65535]: " input_port
+        port="${input_port:-$default_port}"
+    fi
     validate_user_port "$port" || { echo -e "${RED}[错误]${PLAIN} 端口无效。"; return 1; }
     port_in_use "$port" tcp && { echo -e "${RED}[错误]${PLAIN} TCP 端口已被占用。"; return 1; }
 
@@ -289,13 +317,13 @@ ShortId: ${short_id}
 ${vless_link}
 ========================================================"
     log_action "[可撤销] VLESS-Reality 端口=${port} SNI=${sni}"
-    clear
+    [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
     cat "$NODE_INFO_FILE"
     echo -e "\n${GREEN}[成功]${PLAIN} 部署完成。敏感节点信息已限制为 root 可读。"
 }
 
 deploy_hysteria2() {
-    clear
+    [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${CYAN}                [Hysteria 2]                       ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
@@ -320,6 +348,8 @@ deploy_hysteria2() {
     chmod 0640 "$key_file"
     chmod 0644 "$cert_file"
     chown root:vps-tool "$key_file" "$cert_file"
+    mark_owned "$cert_file"
+    mark_owned "$key_file"
 
     server_ip=$(get_sys_ip || true)
     if [[ -z "$server_ip" ]]; then read -rp "无法自动识别公网 IP，请手动输入服务器地址：" server_ip; fi
@@ -358,7 +388,7 @@ SNI: ${sni}
 ${hy2_link}
 ========================================================"
     log_action "[可撤销] Hysteria2 UDP=${port}"
-    clear
+    [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
     cat "$NODE_INFO_FILE"
     echo -e "\n${GREEN}[成功]${PLAIN} 部署完成。"
 }
@@ -418,5 +448,8 @@ protocol_menu() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    protocol_menu
+    case "${1:-}" in
+        --pipeline-reality) deploy_vless_reality pipeline ;;
+        *) protocol_menu ;;
+    esac
 fi
