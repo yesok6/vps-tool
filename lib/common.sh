@@ -430,12 +430,23 @@ firewall_allow() {
             fi
             ;;
         firewalld)
-            if ! firewall-cmd --query-port="${port}/${proto}" --permanent >/dev/null 2>&1; then
-                firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null
-                firewall-cmd --reload >/dev/null
-                mkdir -p "${VPS_TOOL_STATE}/firewall"
-                printf 'firewalld\n%s\n%s\n' "$port" "$proto" > "${VPS_TOOL_STATE}/firewall/${proto}_${port}.rule"
+            if firewall-cmd --query-port="${port}/${proto}" --permanent >/dev/null 2>&1; then
+                return 0
             fi
+            # [安全保留] 常见 HTTP/HTTPS/SSH service 已经放行时，不重复创建同端口规则；这些现有 service 不属于本工具所有。
+            if [[ "$proto" == "tcp" && "$port" == "80" ]] && firewall-cmd --query-service=http --permanent >/dev/null 2>&1; then
+                return 0
+            fi
+            if [[ "$proto" == "tcp" && "$port" == "443" ]] && firewall-cmd --query-service=https --permanent >/dev/null 2>&1; then
+                return 0
+            fi
+            if [[ "$proto" == "tcp" && "$port" == "22" ]] && firewall-cmd --query-service=ssh --permanent >/dev/null 2>&1; then
+                return 0
+            fi
+            firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null || return 1
+            firewall-cmd --reload >/dev/null || return 1
+            mkdir -p "${VPS_TOOL_STATE}/firewall"
+            printf 'firewalld\n%s\n%s\n' "$port" "$proto" > "${VPS_TOOL_STATE}/firewall/${proto}_${port}.rule"
             ;;
         none)
             echo -e "${YELLOW}[提示]${PLAIN} 当前未检测到已启用的 UFW/firewalld，未自动开启防火墙。"
