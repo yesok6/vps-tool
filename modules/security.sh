@@ -26,6 +26,12 @@ ssh_port_listening() {
     ss -H -ltn 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit found ? 0 : 1}'
 }
 
+validate_ssh_port() {
+    local port="${1:-}"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
 active_ssh_socket() {
     local unit
     for unit in ssh.socket sshd.socket; do
@@ -110,9 +116,312 @@ restart_or_reload_ssh() {
     systemctl restart "${SSH_SERVICE}"
 }
 
+current_ssh_session_port() {
+    local remote_ip remote_port local_ip local_port
+    if [[ -z "${SSH_CONNECTION:-}" ]]; then
+        return 1
+    fi
+    read -r remote_ip remote_port local_ip local_port _ <<< "${SSH_CONNECTION}"
+    [[ "$local_port" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$local_port"
+}
+
+current_ssh_session_uses_port() {
+    local expected="$1"
+    local current_port
+    current_port=$(current_ssh_session_port 2>/dev/null) || return 1
+    [[ "$current_port" == "$expected" ]]
+}
+
+ssh_current_source_ip() {
+    local remote_ip
+    [[ -n "${SSH_CONNECTION:-}" ]] || return 1
+    read -r remote_ip _ _ _ _ <<< "${SSH_CONNECTION}"
+    [[ -n "$remote_ip" ]] || return 1
+    printf '%s\n' "$remote_ip"
+}
+
+ssh_endpoint_port() {
+    local endpoint="$1"
+    if [[ "$endpoint" =~ :([0-9]+)$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+ssh_endpoint_host() {
+    local endpoint="$1"
+    # IPv6 推荐使用 [addr]:port；对 ss 极端输出的未加方括号 IPv6，仍按“最后一个冒号后的数字”为端口处理。
+    if [[ "$endpoint" =~ ^\[([^]]+)\]:[0-9]+$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$endpoint" =~ ^(.+):[0-9]+$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+ssh_new_session_detected() {
+    local expected_port="$1"
+    local remote_ip remote_port current_local_ip current_local_port
+    local local_endpoint peer_endpoint local_port_now peer_host peer_port
+
+    # [可完全撤销] 本函数只读取现有 SSH 会话状态，不修改 sshd/firewall。
+    # 安全条件：必须看到“当前脚本会话之外”的、来自同一来源地址的新 SSH established 连接。
+    remote_ip=$(ssh_current_source_ip 2>/dev/null) || return 1
+    [[ -n "$remote_ip" ]] || return 1
+    read -r _ remote_port _ current_local_port _ <<< "${SSH_CONNECTION:-}"
+    [[ "$remote_port" =~ ^[0-9]+$ && "$current_local_port" =~ ^[0-9]+$ ]] || return 1
+
+    while read -r _ _ _ local_endpoint peer_endpoint _; do
+        [[ -n "$local_endpoint" && -n "$peer_endpoint" ]] || continue
+        local_port_now=$(ssh_endpoint_port "$local_endpoint" 2>/dev/null || true)
+        peer_host=$(ssh_endpoint_host "$peer_endpoint" 2>/dev/null || true)
+        peer_port=$(ssh_endpoint_port "$peer_endpoint" 2>/dev/null || true)
+        [[ "$local_port_now" == "$expected_port" ]] || continue
+        [[ "$peer_host" == "$remote_ip" ]] || continue
+
+        # 不再仅凭“当前会话端口等于新端口”排除连接；而是精确排除 SSH_CONNECTION 对应的同一条 TCP 会话。
+        # 这样自动模式只有在确实存在独立的新连接时才算验证成功。
+        if [[ "$peer_host" == "$remote_ip" && "$peer_port" == "$remote_port" && "$local_port_now" == "$current_local_port" ]]; then
+            continue
+        fi
+        return 0
+    done < <(ss -Htn state established 2>/dev/null || true)
+
+    return 1
+}
+
+confirm_new_ssh_session() {
+    local expected_port="$1"
+    local timeout_seconds="${2:-10}"
+    local elapsed=0
+    while (( elapsed < timeout_seconds )); do
+        if ssh_new_session_detected "$expected_port"; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 1
+}
+
+wait_for_new_ssh_session() {
+    local new_port="$1"
+    local timeout_seconds="${2:-300}"
+    local elapsed=0
+
+    if ! current_ssh_session_port >/dev/null 2>&1; then
+        echo -e "${RED}[无法自动确认]${PLAIN} 当前不是可识别的 SSH 会话。"
+        echo -e "${YELLOW}[提示]${PLAIN} 自动删除旧端口模式需要当前终端通过 SSH 进入 VPS，才能安全确认后续新连接。"
+        return 1
+    fi
+
+    local current_port source_ip
+    current_port=$(current_ssh_session_port 2>/dev/null || true)
+    source_ip=$(ssh_current_source_ip 2>/dev/null || true)
+    if [[ -z "$source_ip" ]]; then
+        echo -e "${RED}[无法自动确认]${PLAIN} 无法从当前 SSH 会话获取可靠的来源 IP。"
+        echo -e "${YELLOW}[安全处理]${PLAIN} 自动删除模式已停止，旧端口将继续保留；请使用选项 3，在新端口会话中手动删除。"
+        return 1
+    fi
+    echo -e "${YELLOW}[重要警告]${PLAIN} 当前工具会保持旧端口 ${current_port} 与新端口 ${new_port} 同时监听。"
+    echo -e "${YELLOW}[操作要求]${PLAIN} 请保持当前终端不要关闭，并立即用同一台客户端通过新端口 ${new_port} 新开一个 SSH 会话。"
+    echo -e "${YELLOW}[安全条件]${PLAIN} 自动验证要求新会话来自当前连接的来源 IP ${source_ip}，并且确实已经建立 SSH 连接；仅仅端口监听不会触发删除。"
+    echo -e "${YELLOW}[提示]${PLAIN} 如果你使用跳板机、NAT、代理或 IPv6 隐私地址，来源 IP 可能无法稳定匹配，此时请使用选项 3 手动删除。"
+    echo -e "${YELLOW}[超时处理]${PLAIN} ${timeout_seconds} 秒内没有检测到新会话，旧端口将继续保留，不会自动删除。"
+
+    while (( elapsed < timeout_seconds )); do
+        if ssh_new_session_detected "$new_port"; then
+            echo -e "${GREEN}[确认成功]${PLAIN} 已检测到新端口 ${new_port} 的实际 SSH 连接。"
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+        printf '\r%s[等待中]%s 已等待 %s/%s 秒，旧端口仍保持监听。' "${CYAN}" "${PLAIN}" "$elapsed" "$timeout_seconds"
+    done
+    printf '\n'
+    echo -e "${YELLOW}[超时]${PLAIN} 未检测到新端口 ${new_port} 的实际 SSH 新会话，旧端口保持不变。"
+    return 1
+}
+
+set_sshd_ports_global() {
+    local old_port="$1" new_port="$2"
+    local tmp out existing_port
+    local -a existing_ports=()
+    tmp=$(mktemp) || return 1
+    out="${tmp}.out"
+
+    mapfile -t existing_ports < <(
+        awk '
+            BEGIN { in_match=0 }
+            /^[[:space:]]*Match([[:space:]]|$)/ { in_match=1 }
+            !in_match && $0 !~ /^[[:space:]]*#/ && $1 ~ /^Port(=|[[:space:]]|$)/ {
+                value=$0
+                sub(/^[[:space:]]*Port/, "", value)
+                sub(/^[[:space:]]*=[[:space:]]*/, "", value)
+                sub(/^[[:space:]]+/, "", value)
+                if (value != "") print value
+            }
+        ' "$SSHD_CONFIG"
+    )
+
+    if ! awk '
+        BEGIN { in_match=0 }
+        /^[[:space:]]*Match([[:space:]]|$)/ { in_match=1 }
+        !in_match && $0 !~ /^[[:space:]]*#/ && $1 ~ /^Port(=|[[:space:]]|$)/ { next }
+        { print }
+    ' "$SSHD_CONFIG" > "$tmp"; then
+        rm -f "$tmp" "$out"
+        return 1
+    fi
+
+    {
+        printf '%s\n' '# Managed by VPS-Tool' "Port ${old_port}" "Port ${new_port}"
+        for existing_port in "${existing_ports[@]}"; do
+            [[ "$existing_port" == "$old_port" || "$existing_port" == "$new_port" ]] && continue
+            printf 'Port %s\n' "$existing_port"
+        done
+        cat "$tmp"
+    } > "$out" || { rm -f "$tmp" "$out"; return 1; }
+
+    chmod 600 "$out" || { rm -f "$tmp" "$out"; return 1; }
+    cat "$out" > "$SSHD_CONFIG" || { rm -f "$tmp" "$out"; return 1; }
+    rm -f "$tmp" "$out"
+}
+
+remove_sshd_port_global() {
+    local remove_port="$1"
+    local tmp
+    tmp=$(mktemp) || return 1
+    if ! awk -v remove_port="$remove_port" '
+        BEGIN { in_match=0 }
+        /^[[:space:]]*Match([[:space:]]|$)/ { in_match=1 }
+        !in_match && $0 !~ /^[[:space:]]*#/ && $1 ~ /^Port(=|[[:space:]]|$)/ {
+            value=$0
+            sub(/^[[:space:]]*Port/, "", value)
+            sub(/^[[:space:]]*=[[:space:]]*/, "", value)
+            sub(/^[[:space:]]+/, "", value)
+            if (value == remove_port) next
+        }
+        { print }
+    ' "$SSHD_CONFIG" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    if ! cat "$tmp" > "$SSHD_CONFIG"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+}
+
+sshd_has_port() {
+    local port="$1" output
+    if ! output=$(sshd -T 2>&1); then
+        echo -e "${RED}[错误]${PLAIN} sshd 无法展开当前配置，无法可靠判断 SSH 端口 ${port} 的状态。"
+        echo -e "${YELLOW}[提示]${PLAIN} 请先检查 sshd 配置语法，再进行端口迁移。"
+        return 1
+    fi
+    awk -v p="$port" '$1 == "port" && $2 == p {found=1} END {exit found ? 0 : 1}' <<< "$output"
+}
+
+remove_old_ssh_port() {
+    local auto_confirm="${3:-0}"
+    local old_port new_port action_dir backend
+    old_port="${1:-$(state_get ssh_migration_old_port 2>/dev/null || true)}"
+    new_port="${2:-$(state_get ssh_migration_new_port 2>/dev/null || true)}"
+
+    validate_ssh_port "$old_port" || { echo -e "${RED}[错误]${PLAIN} 未找到有效的旧 SSH 端口记录。"; return 1; }
+    validate_ssh_port "$new_port" || { echo -e "${RED}[错误]${PLAIN} 未找到有效的新 SSH 端口记录。"; return 1; }
+    [[ "$old_port" != "$new_port" ]] || { echo -e "${RED}[错误]${PLAIN} 新旧 SSH 端口不能相同。"; return 1; }
+
+    if [[ "$auto_confirm" == "1" ]]; then
+        if ! confirm_new_ssh_session "$new_port" 10; then
+            echo -e "${RED}[禁止自动删除]${PLAIN} 已触发自动删除流程，但二次确认时未能再次确认新端口 ${new_port} 的真实 SSH 会话。"
+            echo -e "${YELLOW}[安全处理]${PLAIN} 旧端口继续保留，请确认新端口会话仍在线后，再从选项 3 手动处理。"
+            return 1
+        fi
+    elif ! current_ssh_session_uses_port "$new_port"; then
+        echo -e "${RED}[禁止删除]${PLAIN} 当前这次 SSH 会话不是通过新端口 ${new_port} 登录的。"
+        echo -e "${YELLOW}[安全条件]${PLAIN} 必须先用新端口建立一个全新的 SSH 会话，再从那个新会话进入此工具删除旧端口。"
+        return 1
+    fi
+
+    if ! sshd_has_port "$old_port" || ! sshd_has_port "$new_port"; then
+        echo -e "${RED}[禁止删除]${PLAIN} 当前 sshd 配置未同时检测到旧端口 ${old_port} 和新端口 ${new_port}。"
+        return 1
+    fi
+    if ! ssh_port_listening "$old_port" || ! ssh_port_listening "$new_port"; then
+        echo -e "${RED}[禁止删除]${PLAIN} 当前系统未同时监听旧端口 ${old_port} 和新端口 ${new_port}。"
+        return 1
+    fi
+
+    echo -e "${RED}${BOLD}[高风险操作]${PLAIN} 即将删除旧 SSH 端口 ${old_port}。"
+    echo -e "${YELLOW}[警告]${PLAIN} 删除后 SSH 将不再监听 ${old_port}；当前会话已确认通过新端口 ${new_port} 登录。"
+    echo -e "${YELLOW}[警告]${PLAIN} 请再次确认云安全组/外部防火墙已经允许新端口 ${new_port}。"
+    if [[ "$auto_confirm" != "1" ]]; then
+        confirm_safety_prompt "删除旧 SSH 端口 ${old_port}" "必须确认当前会话已通过新端口 ${new_port} 登录，且旧/新两个端口当前都在监听。" || return 1
+    else
+        echo -e "${YELLOW}[自动执行]${PLAIN} 已满足新端口真实登录条件，现自动删除旧端口 ${old_port}。"
+    fi
+
+    action_dir=$(make_temp_dir ssh-remove-old)
+    if ! backup_current_ssh_files "$action_dir"; then
+        rm -rf "$action_dir"
+        echo -e "${RED}[错误]${PLAIN} 无法备份当前 SSH 配置，删除操作已取消。"
+        return 1
+    fi
+
+    if ! remove_sshd_port_global "$old_port" || ! validate_sshd_config; then
+        restore_action_ssh_files "$action_dir" || true
+        rm -rf "$action_dir"
+        echo -e "${RED}[错误]${PLAIN} 删除旧端口后的 sshd 配置检查失败，已恢复。"
+        return 1
+    fi
+
+    if ! restart_or_reload_ssh; then
+        restore_action_ssh_files "$action_dir" || true
+        restart_or_reload_ssh >/dev/null 2>&1 || true
+        rm -rf "$action_dir"
+        echo -e "${RED}[错误]${PLAIN} SSH 重载/重启失败，已恢复。"
+        return 1
+    fi
+
+    if ssh_port_listening "$old_port" || ! ssh_port_listening "$new_port"; then
+        restore_action_ssh_files "$action_dir" || true
+        restart_or_reload_ssh >/dev/null 2>&1 || true
+        rm -rf "$action_dir"
+        echo -e "${RED}[错误]${PLAIN} 删除旧端口后的监听状态异常，已恢复。"
+        return 1
+    fi
+
+    if [[ "$(firewall_backend)" == "ufw" || "$(firewall_backend)" == "firewalld" ]]; then
+        backend=$(firewall_backend)
+        if firewall_remove_owned_rules "$old_port" tcp; then
+            echo -e "${GREEN}[完成]${PLAIN} 工具自己创建的旧端口 ${old_port}/tcp 防火墙规则已清理。"
+        else
+            echo -e "${YELLOW}[提示]${PLAIN} SSH 已停止监听旧端口 ${old_port}，但旧端口的防火墙规则未由工具强制删除，以免误删其他服务正在使用的规则。"
+        fi
+    fi
+
+    state_unset ssh_migration_old_port
+    state_unset ssh_migration_new_port
+    state_unset ssh_migration_mode
+    rm -rf "${VPS_TOOL_BACKUPS}/ssh_migration_sshd_config"
+    log_action "[安全保留] SSH 旧端口 ${old_port} 已在确认当前会话通过新端口 ${new_port} 登录后完成删除。"
+    rm -rf "$action_dir"
+    echo -e "${GREEN}[成功]${PLAIN} 旧 SSH 端口 ${old_port} 已删除，新端口 ${new_port} 仍在监听。"
+}
+
 change_ssh_port() {
+    local mode="${1:-1}"
     local cur_port new_port action_dir socket_unit
-    check_os || return
+    check_os || return 1
     cur_port=$(get_current_ssh_port)
 
     if socket_unit=$(active_ssh_socket 2>/dev/null); then
@@ -122,7 +431,30 @@ change_ssh_port() {
         return 1
     fi
 
-    confirm_safety_prompt "修改 SSH 端口" "必须同时修改云平台安全组/防火墙；旧端口不会由本工具主动删除。" || return 1
+    if state_exists ssh_migration_old_port; then
+        echo -e "${YELLOW}[提示]${PLAIN} 已存在待处理的 SSH 端口迁移：旧端口 $(state_get ssh_migration_old_port) → 新端口 $(state_get ssh_migration_new_port)。"
+        echo -e "请先通过选项 3 完成旧端口处理，再开始新的迁移。"
+        return 1
+    fi
+
+    case "$mode" in
+        1)
+            confirm_safety_prompt "修改 SSH 端口（保留旧端口）" "旧端口会与新端口同时保留；你必须新开终端通过新端口登录成功。之后请再次进入本选项并选择 3，才会删除旧端口。" || return 1
+            ;;
+        2)
+            if ! current_ssh_session_port >/dev/null 2>&1; then
+                echo -e "${RED}[错误]${PLAIN} 自动删除模式必须从当前 SSH 会话启动。"
+                echo -e "${YELLOW}[提示]${PLAIN} 请改用选项 1，或从可识别的 SSH 会话重新进入工具。"
+                return 1
+            fi
+            confirm_safety_prompt "修改 SSH 端口（新会话验证后自动删除旧端口）" "旧端口会暂时保留；只有检测到当前客户端通过新端口建立真实的新 SSH 会话后，工具才会自动删除旧端口。仅仅看到新端口监听绝不算验证成功。" || return 1
+            ;;
+        *)
+            echo -e "${RED}[错误]${PLAIN} 无效的 SSH 端口迁移模式。" 
+            return 1
+            ;;
+    esac
+
     read -rp "当前 SSH 端口 ${cur_port}，请输入新端口 [1024-65535]: " new_port
     validate_port "$new_port" || { echo -e "${RED}[错误]${PLAIN} 端口必须在 1024-65535。"; return 1; }
     [[ "$new_port" != "$cur_port" ]] || { echo -e "${YELLOW}[提示]${PLAIN} 新旧端口相同。"; return 0; }
@@ -132,25 +464,26 @@ change_ssh_port() {
     fi
 
     action_dir=$(make_temp_dir ssh-change)
+    rm -rf "${VPS_TOOL_BACKUPS}/ssh_migration_sshd_config"
     if ! backup_current_ssh_files "$action_dir"; then
         rm -rf "$action_dir"
         echo -e "${RED}[错误]${PLAIN} 无法备份当前 SSH 配置，操作已取消。"
         return 1
     fi
-    if ! backup_file_once "$SSHD_CONFIG" ssh_sshd_config; then
+    if ! backup_file_once "$SSHD_CONFIG" ssh_migration_sshd_config; then
         rm -rf "$action_dir"
-        echo -e "${RED}[错误]${PLAIN} 无法保存 SSH 配置备份，操作已取消。"
+        echo -e "${RED}[错误]${PLAIN} 无法保存本次 SSH 迁移的原始配置，操作已取消。"
         return 1
     fi
 
-    if ! set_sshd_option_global Port "$new_port"; then
+    if ! set_sshd_ports_global "$cur_port" "$new_port"; then
         restore_action_ssh_files "$action_dir" || true
         rm -rf "$action_dir"
-        echo -e "${RED}[错误]${PLAIN} 无法写入 SSH 端口配置，已恢复。"
+        echo -e "${RED}[错误]${PLAIN} 无法写入 SSH 双端口配置，已恢复。"
         return 1
     fi
     if ! validate_sshd_config; then
-        restore_action_ssh_files "$action_dir"
+        restore_action_ssh_files "$action_dir" || true
         rm -rf "$action_dir"
         echo -e "${RED}[错误]${PLAIN} sshd 配置检查失败，已恢复。"
         return 1
@@ -158,7 +491,7 @@ change_ssh_port() {
 
     firewall_allow "$new_port" tcp || true
     if ! restart_or_reload_ssh; then
-        restore_action_ssh_files "$action_dir"
+        restore_action_ssh_files "$action_dir" || true
         restart_or_reload_ssh >/dev/null 2>&1 || true
         firewall_remove_owned_rules "$new_port" tcp || true
         rm -rf "$action_dir"
@@ -166,71 +499,307 @@ change_ssh_port() {
         return 1
     fi
 
-    if ! ssh_port_listening "$new_port"; then
-        restore_action_ssh_files "$action_dir"
+    if ! ssh_port_listening "$cur_port" || ! ssh_port_listening "$new_port"; then
+        restore_action_ssh_files "$action_dir" || true
         restart_or_reload_ssh >/dev/null 2>&1 || true
         firewall_remove_owned_rules "$new_port" tcp || true
         rm -rf "$action_dir"
-        echo -e "${RED}[错误]${PLAIN} 新端口未监听，已恢复原配置。"
+        echo -e "${RED}[错误]${PLAIN} 双端口监听状态不符合预期，已恢复原配置。"
         return 1
     fi
 
-    log_action "[安全保留] SSH 端口由 ${cur_port} 修改为 ${new_port}；原始配置已备份。"
-    echo -e "${GREEN}[成功]${PLAIN} SSH 已监听新端口 ${new_port}。"
-    echo -e "${YELLOW}[重要]${PLAIN} 请新开一个终端实际测试新端口登录，确认成功后再断开当前连接。"
-    echo -e "${YELLOW}[提示]${PLAIN} 旧端口不会自动删除，以避免在云安全组未同步时把自己锁在外面。"
+    state_set ssh_migration_old_port "$cur_port"
+    state_set ssh_migration_new_port "$new_port"
+    state_set ssh_migration_mode "$mode"
+    log_action "[安全保留] SSH 端口由 ${cur_port} 切换为双端口 ${cur_port},${new_port}；等待新端口真实登录验证。"
     rm -rf "$action_dir"
+
+    echo -e "${GREEN}[成功]${PLAIN} SSH 现在同时监听旧端口 ${cur_port} 和新端口 ${new_port}。"
+    echo -e "${YELLOW}[重要警告]${PLAIN} 当前连接不要关闭；请新开一个终端，通过 ${new_port} 实际登录 VPS。"
+
+    case "$mode" in
+        1)
+            echo -e "${YELLOW}[必须操作]${PLAIN} 新端口登录成功后，再回到模块 1 → 3 → 选项 3 删除旧端口 ${cur_port}。"
+            echo -e "${YELLOW}[安全说明]${PLAIN} 旧端口现在不会自动删除。"
+            ;;
+        2)
+            if wait_for_new_ssh_session "$new_port" 300; then
+                if ! remove_old_ssh_port "$cur_port" "$new_port" 1; then
+                    echo -e "${YELLOW}[提示]${PLAIN} 已确认新端口真实登录，但旧端口自动删除失败。旧端口会继续保留，请从新端口会话进入选项 3 重试。"
+                    return 1
+                fi
+            else
+                echo -e "${YELLOW}[提示]${PLAIN} 未完成新端口登录验证，旧端口 ${cur_port} 继续保留。"
+                return 1
+            fi
+            ;;
+    esac
+}
+
+
+cancel_ssh_port_migration() {
+    local old_port new_port current_port backup_dir action_dir
+    old_port="$(state_get ssh_migration_old_port 2>/dev/null || true)"
+    new_port="$(state_get ssh_migration_new_port 2>/dev/null || true)"
+    validate_ssh_port "$old_port" || { echo -e "${RED}[错误]${PLAIN} 未找到有效的迁移旧端口记录。"; return 1; }
+    validate_ssh_port "$new_port" || { echo -e "${RED}[错误]${PLAIN} 未找到有效的迁移新端口记录。"; return 1; }
+    backup_dir="${VPS_TOOL_BACKUPS}/ssh_migration_sshd_config"
+    [[ -f "${backup_dir}/present" && ( -e "${backup_dir}/original" || -L "${backup_dir}/original" ) ]] || {
+        echo -e "${RED}[错误]${PLAIN} 找不到本次迁移的原始 SSH 配置备份，无法安全回退。"
+        echo -e "${YELLOW}[回退指引]${PLAIN} 请保留当前新旧双端口状态，不要手动删除旧端口，并保留云控制台/VNC 访问方式。"
+        return 1
+    }
+
+    current_port=$(current_ssh_session_port 2>/dev/null || true)
+    echo -e "${RED}${BOLD}[放弃迁移]${PLAIN} 将把 SSH 恢复到原来的单端口 ${old_port}，并取消本次迁移 ${old_port} → ${new_port}。"
+    echo -e "${YELLOW}[警告]${PLAIN} 新端口 ${new_port} 将停止监听。"
+    if [[ "$current_port" == "$new_port" ]]; then
+        echo -e "${RED}[特别警告]${PLAIN} 当前 SSH 会话正通过新端口 ${new_port} 连接。回退后当前会话很可能立即断开，请确保你能从旧端口 ${old_port} 重新连接。"
+    elif [[ "$current_port" == "$old_port" ]]; then
+        echo -e "${GREEN}[安全提示]${PLAIN} 当前 SSH 会话仍通过旧端口 ${old_port} 连接，可以安全回退。"
+    else
+        echo -e "${YELLOW}[提示]${PLAIN} 当前会话不是可识别的旧/新 SSH 端口，将要求你确认是否继续回退。"
+    fi
+    confirm_safety_prompt "放弃 SSH 端口迁移并恢复原端口" "回退会停止新端口 ${new_port}；如果当前会话来自新端口，当前连接可能会被立即断开。" || return 1
+
+    action_dir=$(make_temp_dir ssh-cancel-migration)
+    if ! backup_current_ssh_files "$action_dir"; then
+        rm -rf "$action_dir"
+        echo -e "${RED}[错误]${PLAIN} 无法创建回退前备份，未执行回退。"
+        return 1
+    fi
+    if ! restore_file_backup "$SSHD_CONFIG" ssh_migration_sshd_config || ! validate_sshd_config; then
+        restore_action_ssh_files "$action_dir" || true
+        rm -rf "$action_dir"
+        echo -e "${RED}[错误]${PLAIN} 原始 SSH 配置恢复失败，已尽量保持当前可用状态。"
+        return 1
+    fi
+    if ! restart_or_reload_ssh; then
+        restore_action_ssh_files "$action_dir" || true
+        restart_or_reload_ssh >/dev/null 2>&1 || true
+        rm -rf "$action_dir"
+        echo -e "${RED}[错误]${PLAIN} 回退后的 SSH 重载/重启失败，已恢复回退前配置。"
+        return 1
+    fi
+    # [部分可撤销/安全保留] SSH 本机配置可以完整回退；防火墙只删除本工具记录的规则。
+    # 如果防火墙清理失败，必须保留迁移 state，避免用户以为已经“完全回退”而失去后续重试入口。
+    if ! firewall_remove_owned_rules "$new_port" tcp; then
+        rm -rf "$action_dir"
+        echo -e "${YELLOW}[警告]${PLAIN} SSH 配置已经恢复为原端口 ${old_port}，但新端口 ${new_port}/tcp 的工具防火墙规则未能清理。"
+        echo -e "${YELLOW}[状态保留]${PLAIN} 本次迁移 state 将保留，方便下次继续清理；请确认防火墙状态后再处理。"
+        return 1
+    fi
+
+    state_unset ssh_migration_old_port
+    state_unset ssh_migration_new_port
+    state_unset ssh_migration_mode
+    rm -rf "$action_dir" "$backup_dir"
+    log_action "[安全保留] 已放弃 SSH 端口迁移，恢复原端口 ${old_port}。"
+    echo -e "${GREEN}[成功]${PLAIN} SSH 端口迁移已取消，当前恢复为原端口 ${old_port}。"
+    echo -e "${YELLOW}[提示]${PLAIN} 如需再次迁移，请重新进入模块 1 → 3。"
+}
+
+ssh_port_menu() {
+    while true; do
+        clear
+        local old_port new_port
+        old_port="$(state_get ssh_migration_old_port 2>/dev/null || true)"
+        new_port="$(state_get ssh_migration_new_port 2>/dev/null || true)"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "${CYAN}              [SSH 远程连接端口管理]               ${PLAIN}"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        if [[ -n "$old_port" && -n "$new_port" ]]; then
+            echo -e "  当前待处理迁移: ${YELLOW}${old_port} → ${new_port}${PLAIN}"
+            echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+        fi
+        echo -e "  ${GREEN}1.${PLAIN} 修改 SSH 端口（保留旧端口）"
+        echo -e "     ${YELLOW}新端口登录成功后，必须回来选择 3 手动删除旧端口。${PLAIN}"
+        echo -e "  ${GREEN}2.${PLAIN} 修改 SSH 端口（新端口真实登录后自动删除旧端口）"
+        echo -e "     ${YELLOW}仅检测到实际新 SSH 会话后才删除，不能只凭端口监听状态判断。${PLAIN}"
+        echo -e "  ${GREEN}3.${PLAIN} 删除已验证的旧 SSH 端口"
+        echo -e "     ${YELLOW}必须同时检测到新旧两个端口正在监听，且当前会话必须通过新端口登录。${PLAIN}"
+        echo -e "  ${GREEN}4.${PLAIN} 放弃本次迁移并恢复原 SSH 端口"
+        echo -e "     ${YELLOW}用于解除迁移状态卡住的问题；如果当前会话来自新端口，回退可能导致当前连接断开。${PLAIN}"
+        echo -e "  ${GREEN}0.${PLAIN} 返回上一级"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        read -rp "请输入选项 [0-4]: " choice
+        case "$choice" in
+            1) change_ssh_port 1; read -rp "按回车继续..." ;;
+            2) change_ssh_port 2; read -rp "按回车继续..." ;;
+            3) remove_old_ssh_port; read -rp "按回车继续..." ;;
+            4) cancel_ssh_port_migration; read -rp "按回车继续..." ;;
+            0) return 0 ;;
+            *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
+        esac
+    done
+}
+
+firewall_show_allowed() {
+    local backend="$1"
+    case "$backend" in
+        ufw)
+            echo -e "${CYAN}当前 UFW 放行规则：${PLAIN}"
+            ufw status | sed -n '/^Status:/,$p' || true
+            ;;
+        firewalld)
+            echo -e "${CYAN}当前 firewalld 放行端口/服务：${PLAIN}"
+            echo -e "  ports:   $(firewall-cmd --list-ports 2>/dev/null || echo '（无）')"
+            echo -e "  services: $(firewall-cmd --list-services 2>/dev/null || echo '（无）')"
+            ;;
+        none)
+            echo -e "${YELLOW}当前没有已启用的 UFW/firewalld。${PLAIN}"
+            ;;
+    esac
+}
+
+firewall_rule_exists() {
+    local backend="$1" port="$2" proto="$3"
+    case "$backend" in
+        ufw)
+            ufw status 2>/dev/null | grep -Eq "^[[:space:]]*${port}/${proto}([[:space:]]|$)"
+            ;;
+        firewalld)
+            if firewall-cmd --query-port="${port}/${proto}" --permanent >/dev/null 2>&1; then
+                return 0
+            fi
+            # [安全保留] 80/443 若已经通过 firewalld 的 http/https service 放行，也视为已具备基线。
+            # 此时不创建重复的端口规则，原有 service 由管理员自行维护。
+            if [[ "$proto" == "tcp" && "$port" == "80" ]]; then
+                firewall-cmd --query-service=http --permanent >/dev/null 2>&1
+                return $?
+            fi
+            if [[ "$proto" == "tcp" && "$port" == "443" ]]; then
+                firewall-cmd --query-service=https --permanent >/dev/null 2>&1
+                return $?
+            fi
+            if [[ "$proto" == "tcp" && "$port" == "22" ]]; then
+                firewall-cmd --query-service=ssh --permanent >/dev/null 2>&1
+                return $?
+            fi
+            return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 setup_firewall() {
-    check_os || return
-    local cur_port backend answer
+    # [部分可撤销/安全保留] 防火墙基线只补充/维护本机规则；云安全组、网络 ACL 与外部防火墙不由本工具回滚。
+    check_os || return 1
+    local cur_port backend answer port proto
+    local -a required_rules=() missing_rules=()
     cur_port=$(get_current_ssh_port)
     backend=$(firewall_backend)
+    required_rules=("${cur_port}/tcp" "80/tcp" "443/tcp")
+
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${CYAN}              [防火墙基线状态检查]                 ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
 
     if [[ "$backend" == "ufw" ]]; then
-        ufw allow "${cur_port}/tcp" >/dev/null
-        ufw allow 80/tcp >/dev/null
-        ufw allow 443/tcp >/dev/null
-        ufw default deny incoming >/dev/null
-        ufw default allow outgoing >/dev/null
-        read -rp "UFW 当前已安装。立即启用？[y/N]: " answer
-        if [[ "$answer" =~ ^[Yy]$ ]]; then
-            ufw --force enable
+        echo -e "${GREEN}[状态]${PLAIN} UFW 已启用，不需要再次执行“立即启用”。"
+        firewall_show_allowed ufw
+        for rule in "${required_rules[@]}"; do
+            port="${rule%/*}"; proto="${rule#*/}"
+            if ! firewall_rule_exists ufw "$port" "$proto"; then
+                missing_rules+=("$rule")
+            fi
+        done
+        if ((${#missing_rules[@]} == 0)); then
+            echo -e "${GREEN}[完成]${PLAIN} 当前安全基线要求的 SSH ${cur_port}/tcp、80/tcp、443/tcp 均已放行。无需重复操作。"
+            return 0
         fi
-        log_action "[安全保留] 配置 UFW，SSH=${cur_port}, 80/tcp, 443/tcp"
-        echo -e "${GREEN}[完成]${PLAIN} UFW 规则已准备。"
+        echo -e "${YELLOW}[待补充]${PLAIN} 以下基线规则尚未放行：${missing_rules[*]}"
+        read -rp "是否现在补充这些规则？[y/N]: " answer
+        [[ "$answer" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}[提示]${PLAIN} 未修改现有防火墙规则。"; return 1; }
+        for rule in "${missing_rules[@]}"; do
+            port="${rule%/*}"; proto="${rule#*/}"
+            firewall_allow "$port" "$proto" || { echo -e "${RED}[错误]${PLAIN} 无法放行 ${rule}。"; return 1; }
+        done
+        firewall_show_allowed ufw
+        log_action "[安全保留] UFW 已启用，本次补充基线规则：${missing_rules[*]}"
+        echo -e "${GREEN}[完成]${PLAIN} 基线规则已补充并立即生效。"
         return 0
     fi
 
     if [[ "$backend" == "firewalld" ]]; then
-        firewall-cmd --permanent --add-port="${cur_port}/tcp" >/dev/null
-        firewall-cmd --permanent --add-service=http >/dev/null
-        firewall-cmd --permanent --add-service=https >/dev/null
-        firewall-cmd --reload >/dev/null
-        log_action "[安全保留] 配置 firewalld，SSH=${cur_port}, HTTP/HTTPS"
-        echo -e "${GREEN}[完成]${PLAIN} firewalld 规则已准备。"
+        local ssh_missing=0 http_missing=0 https_missing=0
+        echo -e "${GREEN}[状态]${PLAIN} firewalld 已运行，不需要再次执行“立即启用”。"
+        firewall_show_allowed firewalld
+        firewall_rule_exists firewalld "$cur_port" tcp || ssh_missing=1
+        firewall_rule_exists firewalld 80 tcp || http_missing=1
+        firewall_rule_exists firewalld 443 tcp || https_missing=1
+        if (( ssh_missing )); then missing_rules+=("SSH ${cur_port}/tcp"); fi
+        if (( http_missing )); then missing_rules+=("HTTP 80/tcp"); fi
+        if (( https_missing )); then missing_rules+=("HTTPS 443/tcp"); fi
+        if ((${#missing_rules[@]} == 0)); then
+            echo -e "${GREEN}[完成]${PLAIN} 当前安全基线要求已经具备，无需重复操作。"
+            return 0
+        fi
+        echo -e "${YELLOW}[待补充]${PLAIN} 以下基线规则尚未放行：${missing_rules[*]}"
+        read -rp "是否现在补充这些规则？[y/N]: " answer
+        [[ "$answer" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}[提示]${PLAIN} 未修改现有防火墙规则。"; return 1; }
+        # [安全保留] firewalld 基线统一通过 firewall_allow() 处理。
+        # 80/443 如果本来就是 http/https service，则视为已具备基线，不重复创建端口规则。
+        if (( ssh_missing )); then
+            firewall_allow "$cur_port" tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 SSH ${cur_port}/tcp。"; return 1; }
+        fi
+        if (( http_missing )); then
+            firewall_allow 80 tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 HTTP 80/tcp。"; return 1; }
+        fi
+        if (( https_missing )); then
+            firewall_allow 443 tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 HTTPS 443/tcp。"; return 1; }
+        fi
+        firewall_show_allowed firewalld
+        log_action "[安全保留] firewalld 已运行，本次补充基线规则：${missing_rules[*]}"
+        echo -e "${GREEN}[完成]${PLAIN} 基线规则已补充并立即生效。"
         return 0
     fi
 
-    echo -e "${YELLOW}[提示]${PLAIN} 当前没有已启用的 UFW/firewalld。"
+    echo -e "${YELLOW}[状态]${PLAIN} 当前没有已启用的 UFW/firewalld。"
+    firewall_show_allowed none
     if [[ "$PKG_MANAGER" == "apt" ]]; then
-        echo "如需启用 UFW，请先确认云平台安全组允许当前 SSH 端口。"
-        read -rp "是否安装并配置 UFW（随后由你确认是否启用）？[y/N]: " answer
-        if [[ "$answer" =~ ^[Yy]$ ]]; then
-            export DEBIAN_FRONTEND=noninteractive
+        if command_exists ufw; then
+            echo -e "${YELLOW}[状态]${PLAIN} 检测到 UFW 已安装但当前未启用。"
+            echo -e "${YELLOW}[计划]${PLAIN} 将配置并立即启用 UFW，默认放行：SSH ${cur_port}/tcp、HTTP 80/tcp、HTTPS 443/tcp。"
+            read -rp "是否配置并立即启用现有 UFW？[y/N]: " answer
+        else
+            echo -e "${YELLOW}[计划]${PLAIN} 将安装、配置并立即启用 UFW，默认放行：SSH ${cur_port}/tcp、HTTP 80/tcp、HTTPS 443/tcp。"
+            read -rp "是否安装、配置并立即启用 UFW？[y/N]: " answer
+        fi
+        echo -e "${RED}[重要警告]${PLAIN} 执行后入站默认策略将变为 deny；请先确认云平台安全组已允许当前 SSH 端口。"
+        [[ "$answer" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}[提示]${PLAIN} 未执行防火墙安装/启用。"; return 1; }
+        export DEBIAN_FRONTEND=noninteractive
+        if ! command_exists ufw; then
             apt-get update
             apt-get install -y ufw
-            ufw allow "${cur_port}/tcp" >/dev/null
-            ufw allow 80/tcp >/dev/null
-            ufw allow 443/tcp >/dev/null
-            ufw default deny incoming >/dev/null
-            ufw default allow outgoing >/dev/null
-            read -rp "规则已配置，是否现在启用 UFW？[y/N]: " answer
-            if [[ "$answer" =~ ^[Yy]$ ]]; then ufw --force enable; fi
         fi
+        ufw default deny incoming >/dev/null
+        firewall_allow "$cur_port" tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 SSH ${cur_port}/tcp。"; return 1; }
+        firewall_allow 80 tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 HTTP 80/tcp。"; return 1; }
+        firewall_allow 443 tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 HTTPS 443/tcp。"; return 1; }
+        ufw default allow outgoing >/dev/null
+        ufw --force enable
+        firewall_show_allowed ufw
+        log_action "[安全保留] 配置并启用 UFW，SSH=${cur_port}, 80/tcp, 443/tcp"
+        echo -e "${GREEN}[完成]${PLAIN} UFW 已启用，以上规则现在已经生效。以后再次进入本选项将只展示当前状态，不会重复要求立即启用。"
+    elif command_exists firewall-cmd; then
+        echo -e "${YELLOW}[状态]${PLAIN} 检测到 firewalld 已安装，但当前未运行。"
+        echo -e "${YELLOW}[计划]${PLAIN} 将启动并配置 firewalld，默认放行：SSH ${cur_port}/tcp、HTTP 80/tcp、HTTPS 443/tcp。"
+        echo -e "${RED}[重要警告]${PLAIN} 启动后入站访问将受 firewalld 管理；请先确认云平台安全组已允许当前 SSH 端口。"
+        read -rp "是否启动、配置并立即应用 firewalld？[y/N]: " answer
+        [[ "$answer" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}[提示]${PLAIN} 未启动或修改 firewalld。"; return 1; }
+        systemctl enable --now firewalld
+        firewall_allow "$cur_port" tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 SSH ${cur_port}/tcp。"; return 1; }
+        firewall_allow 80 tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 HTTP 80/tcp。"; return 1; }
+        firewall_allow 443 tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 HTTPS 443/tcp。"; return 1; }
+        firewall_show_allowed firewalld
+        log_action "[安全保留] 启动并配置 firewalld，SSH=${cur_port}, HTTP/HTTPS"
+        echo -e "${GREEN}[完成]${PLAIN} firewalld 已运行，以上规则现在已经生效。以后再次进入本选项将只展示当前状态，不会重复要求立即启用。"
     else
-        echo -e "${YELLOW}[提示]${PLAIN} 本工具不会在 RHEL 系系统上强制安装/启用新的防火墙，以避免无云控制台时锁死 SSH。"
+        echo -e "${YELLOW}[提示]${PLAIN} 本工具不会在 RHEL 系系统上强制安装全新的防火墙，以避免无云控制台时锁死 SSH。请先准备 firewalld 后再使用本选项。"
+        return 0
     fi
 }
 
@@ -347,7 +916,7 @@ security_menu() {
         case "$choice" in
             1) sys_full_upgrade; read -rp "按回车继续..." ;;
             2) sys_security_upgrade; read -rp "按回车继续..." ;;
-            3) change_ssh_port; read -rp "按回车继续..." ;;
+            3) ssh_port_menu ;;
             4) setup_firewall; read -rp "按回车继续..." ;;
             5) setup_ssh_key_auth; read -rp "按回车继续..." ;;
             0) break ;;
