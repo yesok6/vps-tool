@@ -145,4 +145,144 @@ normalized_link=$(readlink -f -- "$path_link")
 normalized_root=$(readlink -f -- "$ROOT/install.sh")
 [[ "$normalized_link" == "$normalized_root" ]]
 
+
+# 27. SSH 端口迁移必须提供三种模式，并要求自动/手动删除使用真实新会话验证。
+grep -q '修改 SSH 端口（保留旧端口）' "$ROOT/modules/security.sh"
+grep -q '新端口真实登录后自动删除旧端口' "$ROOT/modules/security.sh"
+grep -q '删除已验证的旧 SSH 端口' "$ROOT/modules/security.sh"
+grep -q 'current_ssh_session_uses_port' "$ROOT/modules/security.sh"
+grep -q 'wait_for_new_ssh_session' "$ROOT/modules/security.sh"
+
+# 28. 当前会话端口识别必须来自 SSH_CONNECTION；自动删除不得只看监听状态。
+SSH_CONNECTION='198.51.100.20 54321 192.0.2.10 34567' bash -c 'source "$1"; [[ "$(current_ssh_session_port)" == "34567" ]]; current_ssh_session_uses_port 34567' _ "$ROOT/modules/security.sh"
+
+# 29. 实际新 SSH 会话检测要求目标端口 + 当前来源地址同时匹配。
+ssh_stub_dir="$TEST_STATE_ROOT/ssh-stub"
+mkdir -p "$ssh_stub_dir"
+cat > "$ssh_stub_dir/ss" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'ESTAB 0 0 192.0.2.10:34567 198.51.100.20:54322 users:(())'
+EOF
+chmod +x "$ssh_stub_dir/ss"
+PATH="$ssh_stub_dir:$PATH" SSH_CONNECTION='198.51.100.20 54321 192.0.2.10 22' bash -c 'source "$1"; ssh_new_session_detected 34567' _ "$ROOT/modules/security.sh"
+
+# 30. SSH 双端口配置必须保留原有其它全局 Port，并保留 Match 块。
+ssh_cfg="$TEST_STATE_ROOT/sshd_config.test"
+cat > "$ssh_cfg" <<'EOF'
+Port 22
+Port 2200
+PermitRootLogin yes
+
+Match User test
+    Port 2201
+EOF
+bash -c 'source "$1"; SSHD_CONFIG="$2"; set_sshd_ports_global 22 34567; grep -qx "Port 22" "$SSHD_CONFIG"; grep -qx "Port 34567" "$SSHD_CONFIG"; grep -qx "Port 2200" "$SSHD_CONFIG"; grep -q "^Match User test$" "$SSHD_CONFIG"; grep -q "^    Port 2201$" "$SSHD_CONFIG"' _ "$ROOT/modules/security.sh" "$ssh_cfg"
+
+
+# 31. 自动删除模式必须依赖“真实新会话已检测到”，而不能要求当前脚本会话已经切到新端口；手动模式则相反。
+SSH_CONNECTION='198.51.100.20 54321 192.0.2.10 22' bash -c '
+    source "$1"
+    state_set ssh_migration_old_port 22
+    state_set ssh_migration_new_port 34567
+    ssh_new_session_detected() { return 0; }
+    current_ssh_session_uses_port() { return 1; }
+    sshd_has_port() { return 0; }
+    FAKE_OLD_REMOVED=0
+    ssh_port_listening() { if [[ "$1" == "22" && "$FAKE_OLD_REMOVED" == "1" ]]; then return 1; fi; return 0; }
+    backup_current_ssh_files() { mkdir -p "$1"; printf "missing\\n" > "$1/authorized_keys.state"; }
+    remove_sshd_port_global() { FAKE_OLD_REMOVED=1; return 0; }
+    validate_sshd_config() { return 0; }
+    restart_or_reload_ssh() { return 0; }
+    firewall_backend() { echo none; }
+    log_action() { :; }
+    make_temp_dir() { mktemp -d "'"$TEST_STATE_ROOT"'/auto-remove.XXXXXX"; }
+    remove_old_ssh_port 22 34567 1
+    [[ ! -f "'"$VPS_TOOL_STATE"'/ssh_migration_old_port" ]] && [[ ! -f "'"$VPS_TOOL_STATE"'/ssh_migration_new_port" ]]
+' _ "$ROOT/modules/security.sh"
+
+if SSH_CONNECTION='198.51.100.20 54321 192.0.2.10 22' bash -c '
+    source "$1"
+    state_set ssh_migration_old_port 22
+    state_set ssh_migration_new_port 34567
+    ssh_new_session_detected() { return 0; }
+    current_ssh_session_uses_port() { return 1; }
+    sshd_has_port() { return 0; }
+    ssh_port_listening() { return 0; }
+    remove_old_ssh_port 22 34567 0
+' _ "$ROOT/modules/security.sh"; then
+    echo 'manual old-port deletion unexpectedly accepted an old-port session' >&2
+    exit 1
+fi
+state_unset ssh_migration_old_port
+state_unset ssh_migration_new_port
+
+# 32. SSH Port 指令的空格/等号两种写法都必须被规范化，避免留下脏的 Port= 配置。
+ssh_cfg_eq="$TEST_STATE_ROOT/sshd_config.port-equals.test"
+cat > "$ssh_cfg_eq" <<'EOF'
+Port=22
+Port = 2200
+PermitRootLogin yes
+
+Match User test
+    Port=2201
+EOF
+bash -c 'source "$1"; SSHD_CONFIG="$2"; set_sshd_ports_global 22 34567; grep -qx "Port 22" "$SSHD_CONFIG"; grep -qx "Port 34567" "$SSHD_CONFIG"; grep -qx "Port 2200" "$SSHD_CONFIG"; ! grep -qE "^[[:space:]]*Port[[:space:]]*=" "$SSHD_CONFIG"; grep -q "^Match User test$" "$SSHD_CONFIG"; grep -q "^    Port=2201$" "$SSHD_CONFIG"' _ "$ROOT/modules/security.sh" "$ssh_cfg_eq"
+
+# 33. 自动删除的二次检测必须存在，避免第一次发现后瞬时状态变化造成假失败。
+grep -q '^confirm_new_ssh_session()' "$ROOT/modules/security.sh"
+grep -qF 'confirm_new_ssh_session "$new_port" 10' "$ROOT/modules/security.sh"
+
+# 34. SSH 迁移必须提供安全回退菜单项。
+grep -q '放弃本次迁移并恢复原 SSH 端口' "$ROOT/modules/security.sh"
+grep -q '^cancel_ssh_port_migration()' "$ROOT/modules/security.sh"
+
+# 35. 防火墙重复进入时应先展示当前状态；已启用后不应再次询问“立即启用”。
+grep -q '^firewall_show_allowed()' "$ROOT/modules/security.sh"
+grep -q 'UFW 已启用，不需要再次执行“立即启用”' "$ROOT/modules/security.sh"
+grep -q 'firewalld 已运行，不需要再次执行“立即启用”' "$ROOT/modules/security.sh"
+grep -q '以后再次进入本选项将只展示当前状态' "$ROOT/modules/security.sh"
+
+# 36. README 必须包含迁移回退与防火墙状态式流程说明。
+grep -q '模块 1 → 3 → 4 放弃迁移并恢复原端口' "$ROOT/README.md"
+grep -q '不会重复出现“立即启用”提示' "$ROOT/README.md"
+
+# 37. SSH endpoint 解析需覆盖 IPv4、标准方括号 IPv6 与极端未加方括号 IPv6。
+[[ "$(bash -c 'source "$1"; ssh_endpoint_host "198.51.100.20:34567"' _ "$ROOT/modules/security.sh")" == "198.51.100.20" ]]
+[[ "$(bash -c 'source "$1"; ssh_endpoint_host "[2001:db8::20]:34567"' _ "$ROOT/modules/security.sh")" == "2001:db8::20" ]]
+[[ "$(bash -c 'source "$1"; ssh_endpoint_host "2001:db8::20:34567"' _ "$ROOT/modules/security.sh")" == "2001:db8::20" ]]
+
+# 38. firewalld 已通过 http service 放行时，80/tcp 应被视为已具备基线。
+firewall_stub_dir="$TEST_STATE_ROOT/firewall-stub"
+mkdir -p "$firewall_stub_dir"
+cat > "$firewall_stub_dir/firewall-cmd" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *--query-port=80/tcp*) exit 1 ;;
+  *--query-service=http*) exit 0 ;;
+  *--query-service=https*) exit 1 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$firewall_stub_dir/firewall-cmd"
+PATH="$firewall_stub_dir:$PATH" bash -c 'source "$1"; firewall_rule_exists firewalld 80 tcp' _ "$ROOT/modules/security.sh"
+
+# 39. 回退时若防火墙清理失败，迁移 state 必须继续保留，避免用户失去后续重试入口。
+awk '/cancel_ssh_port_migration\(\)/,/^}/' "$ROOT/modules/security.sh" | grep -q 'if ! firewall_remove_owned_rules'
+
+# 40. firewall_allow 在 firewalld 已存在 http service 时不得重复创建 80/tcp 端口规则或留下工具记录。
+firewall_stub_dir2="$TEST_STATE_ROOT/firewall-allow-stub"
+mkdir -p "$firewall_stub_dir2"
+cat > "$firewall_stub_dir2/firewall-cmd" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *--state*) printf 'running\n'; exit 0 ;;
+  *--query-port=80/tcp*) exit 1 ;;
+  *--query-service=http*) exit 0 ;;
+  *--permanent*--add-port=*) echo "unexpected add-port" >&2; exit 99 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$firewall_stub_dir2/firewall-cmd"
+PATH="$firewall_stub_dir2:$PATH" bash -c 'source "$1"; VPS_TOOL_STATE="$2"; mkdir -p "$VPS_TOOL_STATE/firewall"; firewall_allow 80 tcp; ! compgen -G "$VPS_TOOL_STATE/firewall/*.rule" >/dev/null' _ "$ROOT/lib/common.sh" "$TEST_STATE_ROOT/firewall-state"
+
 echo 'smoke tests: OK'
