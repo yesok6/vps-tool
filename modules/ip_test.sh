@@ -104,9 +104,9 @@ ip_test_menu() {
 
         read -rp "请输入选项 [0-3]: " test_choice
         case "$test_choice" in
-            1) run_test_ipquality; read -rp "按回车键返回菜单..." ;;
-            2) run_test_streaming_ai; read -rp "按回车键返回菜单..." ;;
-            3) run_test_route; read -rp "按回车键返回菜单..." ;;
+            1) run_test_ipquality || true; read -rp "按回车键返回菜单..." ;;
+            2) run_test_streaming_ai || true; read -rp "按回车键返回菜单..." ;;
+            3) run_test_route || true; read -rp "按回车键返回菜单..." ;;
             0) break ;;
             *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
