@@ -8,6 +8,8 @@ VPS_TOOL_ETC="${VPS_TOOL_ETC:-/etc/vps-tool}"
 VPS_TOOL_STATE="${VPS_TOOL_STATE:-${VPS_TOOL_ETC}/state}"
 VPS_TOOL_BACKUPS="${VPS_TOOL_BACKUPS:-${VPS_TOOL_ETC}/backups}"
 VPS_TOOL_LOG="${VPS_TOOL_LOG:-${VPS_TOOL_ETC}/install.log}"
+# [可完全撤销] 工具专属 Swap；低内存且用户确认时按磁盘余量动态创建 256/512/768/1024 MiB，至少保留 1 GiB 根分区空间。
+VPS_TOOL_SWAP_PATH="${VPS_TOOL_SWAP_PATH:-/var/lib/vps-tool/swapfile}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -84,15 +86,198 @@ check_os() {
 
 confirm_safety_prompt() {
     local title="$1"
-    local warning="$2"
-    echo -e "${RED}${BOLD}==================== [ 风险操作警告 ] ====================${PLAIN}"
-    echo -e "操作名称: ${YELLOW}${title}${PLAIN}"
-    echo -e "警告说明: ${RED}${warning}${PLAIN}"
-    echo -e "特性提示: ${YELLOW}[请保留当前 SSH 会话，并确保云平台控制台/VNC 可用]${PLAIN}"
-    echo -e "${RED}${BOLD}==========================================================${PLAIN}"
+    local description="$2"
+    echo -e "${CYAN}[操作]${PLAIN} ${YELLOW}${title}${PLAIN}"
+    echo -e "${BLUE}[说明]${PLAIN} ${description}"
+    echo -e "${YELLOW}[注意]${PLAIN} 高风险操作请保留当前 SSH 会话，并确保云平台控制台/VNC 可用。"
     local confirm
-    read -rp "您确定要继续执行此操作吗？输入 y 确认，其他键取消 [y/N]: " confirm
+    read -rp "继续？[y/N]: " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}[提示]${PLAIN} 操作已取消。"; return 1; }
+}
+
+get_mem_available_mb() {
+    awk '/^MemAvailable:/ {printf "%d\n", $2/1024; exit}' /proc/meminfo 2>/dev/null || echo 0
+}
+
+get_root_free_mb() {
+    df -Pm / 2>/dev/null | awk 'NR==2 {print $4; exit}' || echo 0
+}
+
+show_system_resource_summary() {
+    local mem_mb disk_mb
+    mem_mb=$(get_mem_available_mb)
+    disk_mb=$(get_root_free_mb)
+    echo -e "${CYAN}[资源]${PLAIN} 可用内存 ${mem_mb} MiB | 根分区可用 ${disk_mb} MiB"
+}
+
+current_swap_mb() {
+    awk 'NR > 1 {sum += $3} END {printf "%d\n", sum / 1024}' /proc/swaps 2>/dev/null
+}
+
+recommend_managed_swap_mb() {
+    # [资源策略] 尽量增加可用 Swap，但始终至少保留 1 GiB 根分区空间。
+    # [安全保留] 仅按 256 MiB 递增、单次最多补到 1 GiB；不覆盖用户已有 Swap。
+    local disk_mb swap_mb room_mb target_mb
+    disk_mb=$(get_root_free_mb)
+    swap_mb=$(current_swap_mb)
+    room_mb=$((disk_mb - 1024))
+    target_mb=$((1024 - swap_mb))
+
+    (( room_mb < 256 )) && { echo 0; return 0; }
+    (( target_mb <= 0 )) && { echo 0; return 0; }
+    (( target_mb > 1024 )) && target_mb=1024
+    (( target_mb > room_mb )) && target_mb=$room_mb
+    target_mb=$((target_mb / 256 * 256))
+    (( target_mb >= 256 )) && echo "$target_mb" || echo 0
+}
+
+ensure_managed_swap() {
+    # [可完全撤销] 仅创建 VPS-Tool 自己管理的 Swap，不覆盖用户现有 Swap。
+    # [说明] Swap 使用磁盘空间模拟额外内存，可缓解内存峰值时的 OOM 风险，但速度明显低于真实 RAM，不能替代内存。
+    # [安全保留] 创建后必须至少保留 1 GiB 根分区空间；单次最多创建 1 GiB。
+    local requested_mb="${1:-1024}" disk_mb swap_mb create_mb fstab_line
+    (( requested_mb >= 256 )) || requested_mb=256
+    (( requested_mb > 1024 )) && requested_mb=1024
+    (( requested_mb % 256 != 0 )) && requested_mb=$((requested_mb / 256 * 256))
+
+    disk_mb=$(get_root_free_mb)
+    swap_mb=$(current_swap_mb)
+    create_mb=$requested_mb
+    if (( swap_mb >= 1024 )); then
+        echo -e "${GREEN}[状态]${PLAIN} 当前已有 ${swap_mb} MiB Swap，无需重复创建。"
+        return 0
+    fi
+    if (( create_mb > 1024 - swap_mb )); then
+        create_mb=$((1024 - swap_mb))
+    fi
+    if (( create_mb > disk_mb - 1024 )); then
+        create_mb=$((disk_mb - 1024))
+    fi
+    create_mb=$((create_mb / 256 * 256))
+    if (( create_mb < 256 )); then
+        echo -e "${YELLOW}[提示]${PLAIN} 当前根分区可用空间 ${disk_mb} MiB，不足以在保留 1 GiB 安全余量后再创建至少 256 MiB Swap，因此不创建。"
+        return 2
+    fi
+
+    if [[ -e "$VPS_TOOL_SWAP_PATH" ]] && ! is_owned "$VPS_TOOL_SWAP_PATH"; then
+        echo -e "${YELLOW}[提示]${PLAIN} ${VPS_TOOL_SWAP_PATH} 已存在但不是本工具创建的，拒绝覆盖。"
+        return 2
+    fi
+    mkdir -p "$(dirname "$VPS_TOOL_SWAP_PATH")"
+    if [[ ! -e "$VPS_TOOL_SWAP_PATH" ]]; then
+        if ! (fallocate -l "${create_mb}M" "$VPS_TOOL_SWAP_PATH" 2>/dev/null || dd if=/dev/zero of="$VPS_TOOL_SWAP_PATH" bs=1M count="$create_mb" status=none); then
+            rm -f "$VPS_TOOL_SWAP_PATH"
+            echo -e "${RED}[错误]${PLAIN} ${create_mb} MiB Swap 文件创建失败。"
+            return 1
+        fi
+        if ! chmod 600 "$VPS_TOOL_SWAP_PATH" || ! mkswap "$VPS_TOOL_SWAP_PATH" >/dev/null; then
+            rm -f "$VPS_TOOL_SWAP_PATH"
+            echo -e "${RED}[错误]${PLAIN} Swap 初始化失败，已清理临时文件。"
+            return 1
+        fi
+        if ! swapon "$VPS_TOOL_SWAP_PATH"; then
+            rm -f "$VPS_TOOL_SWAP_PATH"
+            echo -e "${RED}[错误]${PLAIN} swapon 失败，已自动回滚 Swap 文件。"
+            return 1
+        fi
+        fstab_line="$VPS_TOOL_SWAP_PATH none swap sw 0 0"
+        if ! grep -Fqx "$fstab_line" /etc/fstab; then
+            if ! printf '%s\n' "$fstab_line" >> /etc/fstab; then
+                swapoff "$VPS_TOOL_SWAP_PATH" >/dev/null 2>&1 || true
+                rm -f "$VPS_TOOL_SWAP_PATH"
+                echo -e "${RED}[错误]${PLAIN} 无法写入 /etc/fstab，Swap 已回滚。"
+                return 1
+            fi
+        fi
+        if ! mark_owned "$VPS_TOOL_SWAP_PATH" || ! state_set swap_created 1 || ! state_set swap_size_mb "$create_mb"; then
+            swapoff "$VPS_TOOL_SWAP_PATH" >/dev/null 2>&1 || true
+            sed -i "\#^${VPS_TOOL_SWAP_PATH}[[:space:]]#d" /etc/fstab 2>/dev/null || true
+            rm -f "$VPS_TOOL_SWAP_PATH"
+            unmark_owned "$VPS_TOOL_SWAP_PATH"
+            state_unset swap_created
+            state_unset swap_size_mb
+            echo -e "${RED}[错误]${PLAIN} Swap 状态记录失败，已回滚创建的 Swap。"
+            return 1
+        fi
+        log_action "[可完全撤销] 创建 VPS-Tool Swap：${create_mb} MiB，路径：${VPS_TOOL_SWAP_PATH}"
+        echo -e "${GREEN}[完成]${PLAIN} 已增加 ${create_mb} MiB 工具专属 Swap，用于缓解低内存峰值压力。"
+    fi
+    return 0
+}
+
+ensure_managed_swap_1g() {
+    # [兼容入口] 保留原函数名；新逻辑会根据磁盘余量和现有 Swap 动态决定实际创建大小。
+    local recommended_mb
+    recommended_mb=$(recommend_managed_swap_mb)
+    (( recommended_mb > 0 )) || return 2
+    ensure_managed_swap "$recommended_mb"
+}
+
+check_upgrade_resources() {
+    # [安全提示] 这是运行前风险检查，不是发行版硬性最低配置；主要依据可用内存、现有 Swap 与根分区剩余空间判断。
+    # [不可恢复] 系统升级本身仍属于不可逆软件包变更。
+    local mem_mb disk_mb swap_mb recommended_mb
+    mem_mb=$(get_mem_available_mb)
+    disk_mb=$(get_root_free_mb)
+    swap_mb=$(current_swap_mb)
+    show_system_resource_summary
+
+    # [安全底线] 根分区必须至少保留 1GiB；低于此值直接停止。
+    if (( disk_mb < 1024 )); then
+        echo -e "${RED}[资源过低]${PLAIN} 根分区可用空间仅 ${disk_mb} MiB，必须至少保留 1 GiB 才允许升级。"
+        echo -e "${YELLOW}[建议]${PLAIN} 先清理磁盘或扩容，不会为了升级自动牺牲最后 1 GiB 空间。"
+        return 1
+    fi
+
+    # [推荐] 可用内存达到 256 MiB 以上时，通常不需要额外准备 Swap。
+    if (( mem_mb >= 256 )); then
+        if (( disk_mb < 2048 )); then
+            echo -e "${YELLOW}[资源提示]${PLAIN} 可用内存 ${mem_mb} MiB 尚可，但根分区仅剩 ${disk_mb} MiB。"
+            confirm_safety_prompt "低磁盘空间下继续升级" "作用：继续更新系统；风险：升级缓存和软件包可能短时增加磁盘占用。" || return 1
+        fi
+        return 0
+    fi
+
+    # [建议] 128–255 MiB 可用内存属于低内存区；优先根据磁盘余量推荐 256/512/768/1024 MiB Swap。
+    if (( mem_mb >= 128 )); then
+        echo -e "${YELLOW}[资源提示]${PLAIN} 当前可用内存 ${mem_mb} MiB，低于推荐的 256 MiB。"
+        if (( swap_mb < 1024 )); then
+            recommended_mb=$(recommend_managed_swap_mb)
+            echo -e "${BLUE}[说明]${PLAIN} Swap 是磁盘提供的虚拟内存，可在内存峰值时降低 OOM 风险，但速度低于真实 RAM，不能替代内存。"
+            if (( recommended_mb > 0 )); then
+                if confirm_safety_prompt "建议增加 ${recommended_mb} MiB Swap" "作用：为升级提供额外内存缓冲；创建后至少保留 1 GiB 根分区空间。"; then
+                    ensure_managed_swap "$recommended_mb" || true
+                else
+                    echo -e "${YELLOW}[提示]${PLAIN} 未创建 Swap，将继续按低内存模式评估。"
+                fi
+            else
+                echo -e "${YELLOW}[提示]${PLAIN} 当前磁盘余量不足以安全增加 Swap，将不会占用最后 1 GiB 空间。"
+            fi
+        else
+            echo -e "${GREEN}[状态]${PLAIN} 已检测到 ${swap_mb} MiB Swap，可作为额外内存缓冲。"
+        fi
+        confirm_safety_prompt "低内存环境继续升级" "作用：继续更新系统；风险：内存峰值时仍可能变慢或失败。推荐可用内存达到 256 MiB 以上。" || return 1
+        return 0
+    fi
+
+    # [谨慎阻止] 低于 128 MiB 可用内存时，优先建议根据磁盘余量增加 Swap；只有资源改善后才继续。
+    echo -e "${RED}[资源过低]${PLAIN} 当前可用内存仅 ${mem_mb} MiB。"
+    if (( swap_mb >= 1024 )); then
+        echo -e "${GREEN}[状态]${PLAIN} 检测到 ${swap_mb} MiB Swap，但仍建议先释放内存。"
+        confirm_safety_prompt "极低内存环境继续升级" "作用：继续更新系统；风险：仍存在 OOM 或升级失败风险。建议先将可用内存提升到 256 MiB 以上。" || return 1
+        return 0
+    fi
+    recommended_mb=$(recommend_managed_swap_mb)
+    if (( recommended_mb > 0 )); then
+        echo -e "${YELLOW}[建议]${PLAIN} 当前可用内存极低，可先增加 ${recommended_mb} MiB Swap，再重新评估升级。"
+        if confirm_safety_prompt "先创建 ${recommended_mb} MiB Swap" "作用：提供额外内存缓冲；创建后至少保留 1 GiB 根分区空间。"; then
+            ensure_managed_swap "$recommended_mb" || return 1
+            confirm_safety_prompt "创建 Swap 后继续升级" "作用：继续更新系统；风险：当前真实内存仍很低，升级过程可能变慢。" || return 1
+            return 0
+        fi
+    fi
+    echo -e "${YELLOW}[建议]${PLAIN} 请先释放内存或增加 Swap 后再升级。"
+    return 1
 }
 
 sync_system_time() {
@@ -112,8 +297,9 @@ sync_system_time() {
 
 sys_full_upgrade() {
     check_os || return 1
-    echo -e "${BLUE}[信息]${PLAIN} 开始全自动系统更新..."
-    confirm_safety_prompt "执行完整系统升级" "升级属于不可逆系统变更；软件包版本可能无法由本工具恢复，请确认云平台控制台/VNC 可用。" || { echo -e "${YELLOW}[提示]${PLAIN} 已取消完整系统升级。"; return 1; }
+    echo -e "${BLUE}[说明]${PLAIN} 更新系统软件，减少已知 Bug 与安全漏洞。"
+    check_upgrade_resources || return 1
+    confirm_safety_prompt "升级系统" "作用：更新系统软件与补丁。风险：属于不可逆软件包变更，资源不足时可能失败。" || { echo -e "${YELLOW}[提示]${PLAIN} 已取消完整系统升级。"; return 1; }
     case "${PKG_MANAGER}" in
         apt)
             export DEBIAN_FRONTEND=noninteractive
@@ -131,8 +317,9 @@ sys_full_upgrade() {
 
 sys_security_upgrade() {
     check_os || return 1
-    echo -e "${BLUE}[信息]${PLAIN} 开始自动修补安全高危漏洞..."
-    confirm_safety_prompt "执行安全补丁升级" "安全补丁属于不可逆软件包变更，请确认云平台控制台/VNC 可用。" || { echo -e "${YELLOW}[提示]${PLAIN} 已取消安全补丁升级。"; return 1; }
+    echo -e "${BLUE}[说明]${PLAIN} 安装安全补丁，优先减少已知高危漏洞。"
+    check_upgrade_resources || return 1
+    confirm_safety_prompt "修补安全漏洞" "作用：更新安全补丁。风险：属于不可逆软件包变更，资源不足时可能失败。" || { echo -e "${YELLOW}[提示]${PLAIN} 已取消安全补丁升级。"; return 1; }
     case "${PKG_MANAGER}" in
         apt)
             export DEBIAN_FRONTEND=noninteractive
@@ -417,7 +604,7 @@ firewall_allow() {
     local port="$1"
     local proto="$2"
     local backend
-    validate_port "$port" || return 1
+    validate_port_any "$port" || return 1
     case "$proto" in tcp|udp) ;; *) return 1 ;; esac
     backend=$(firewall_backend)
 
@@ -484,7 +671,7 @@ firewall_remove_owned_rules() {
     if [[ $# -eq 2 ]]; then
         port="$1"
         proto="$2"
-        validate_port "$port" || return 1
+        validate_port_any "$port" || return 1
         case "$proto" in tcp|udp) ;; *) return 1 ;; esac
         file="${dir}/${proto}_${port}.rule"
         [[ -f "$file" ]] || return 1
@@ -513,3 +700,30 @@ firewall_remove_owned_rules() {
     done
     return "$failed"
 }
+
+firewall_close_port_rule() {
+    local port="$1" proto="$2" backend
+    validate_port_any "$port" || return 1
+    case "$proto" in tcp|udp) ;; *) return 1 ;; esac
+    backend=$(firewall_backend)
+    case "$backend" in
+        ufw)
+            ufw status 2>/dev/null | grep -Eq "^[[:space:]]*${port}/${proto}([[:space:]]|$)" || return 2
+            ufw delete allow "${port}/${proto}" >/dev/null 2>&1
+            ;;
+        firewalld)
+            firewall-cmd --query-port="${port}/${proto}" --permanent >/dev/null 2>&1 || return 2
+            firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || return 1
+            firewall-cmd --reload >/dev/null 2>&1 || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+validate_port_any() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && ((10#$port >= 1 && 10#$port <= 65535))
+}
+
