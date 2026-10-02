@@ -8,15 +8,12 @@ require_root
 SYSCTL_CONF="/etc/sysctl.d/99-vps-optimizer.conf"
 LIMITS_CONF="/etc/security/limits.d/99-nofile.conf"
 GAI_CONF="/etc/gai.conf"
-SWAP_PATH="/var/lib/vps-tool/swapfile"
+SWAP_PATH="${VPS_TOOL_SWAP_PATH}"
 
 get_default_interface() {
     ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'
 }
 
-current_swap_mb() {
-    awk 'NR > 1 {sum += $3} END {printf "%d\n", sum / 1024}' /proc/swaps 2>/dev/null
-}
 
 create_all_cpu_mask() {
     local cpu_count="$1" words=() cpu word bit value i out=""
@@ -34,55 +31,16 @@ create_all_cpu_mask() {
 }
 
 ensure_swap_if_needed() {
-    local mem_total_mb swap_mb
-    mem_total_mb=$(free -m | awk '/Mem:/ {print $2}')
+    # [可完全撤销] 生产级调优沿用公共 Swap 管理；不覆盖用户现有 Swap。
+    local mem_available_mb swap_mb recommended_mb
+    mem_available_mb=$(get_mem_available_mb)
     swap_mb=$(current_swap_mb)
-    if (( mem_total_mb >= 2048 || swap_mb >= 512 )); then
+    if (( mem_available_mb >= 256 || swap_mb >= 1024 )); then
         return 0
     fi
-
-    if [[ -e "$SWAP_PATH" ]] && ! is_owned "$SWAP_PATH"; then
-        echo -e "${YELLOW}[提示]${PLAIN} ${SWAP_PATH} 已存在但不是本工具创建的，拒绝覆盖。"
-        return 0
-    fi
-
-    mkdir -p "$(dirname "$SWAP_PATH")"
-    if [[ ! -e "$SWAP_PATH" ]]; then
-        if ! (fallocate -l 1G "$SWAP_PATH" 2>/dev/null || dd if=/dev/zero of="$SWAP_PATH" bs=1M count=1024 status=none); then
-            rm -f "$SWAP_PATH"
-            echo -e "${RED}[错误]${PLAIN} Swap 文件创建失败。"
-            return 1
-        fi
-        if ! chmod 600 "$SWAP_PATH" || ! mkswap "$SWAP_PATH" >/dev/null; then
-            rm -f "$SWAP_PATH"
-            echo -e "${RED}[错误]${PLAIN} Swap 初始化失败，已清理临时文件。"
-            return 1
-        fi
-        if ! swapon "$SWAP_PATH"; then
-            rm -f "$SWAP_PATH"
-            echo -e "${RED}[错误]${PLAIN} swapon 失败，已自动回滚 Swap 文件。"
-            return 1
-        fi
-        if ! grep -Fqx "$SWAP_PATH none swap sw 0 0" /etc/fstab; then
-            if ! printf '%s\n' "$SWAP_PATH none swap sw 0 0" >> /etc/fstab; then
-                swapoff "$SWAP_PATH" >/dev/null 2>&1 || true
-                rm -f "$SWAP_PATH"
-                echo -e "${RED}[错误]${PLAIN} 无法写入 /etc/fstab，Swap 已回滚。"
-                return 1
-            fi
-        fi
-        if ! mark_owned "$SWAP_PATH" || ! state_set swap_created 1; then
-            swapoff "$SWAP_PATH" >/dev/null 2>&1 || true
-            sed -i "\#^${SWAP_PATH}[[:space:]]#d" /etc/fstab 2>/dev/null || true
-            rm -f "$SWAP_PATH"
-            unmark_owned "$SWAP_PATH"
-            state_unset swap_created
-            echo -e "${RED}[错误]${PLAIN} Swap 状态记录失败，已回滚创建的 Swap。"
-            return 1
-        fi
-        log_action "[可撤销] 创建 VPS-Tool Swap：${SWAP_PATH}"
-        echo -e "${GREEN}[完成]${PLAIN} 低内存 VPS 已增加 1GB 工具专属 Swap。"
-    fi
+    recommended_mb=$(recommend_managed_swap_mb)
+    (( recommended_mb > 0 )) || return 2
+    ensure_managed_swap "$recommended_mb"
 }
 
 write_sysctl_config() {
@@ -360,6 +318,7 @@ reset_all_optimizations() {
         fi
     fi
     state_unset swap_created
+    state_unset swap_size_mb
 
     restore_runtime_values || true
     iface=$(state_get aggressive_nic 2>/dev/null || true)
@@ -417,12 +376,12 @@ optimize_menu() {
         echo -e "${CYAN}====================================================${PLAIN}"
         read -rp "请输入选项 [0-6]: " choice
         case "$choice" in
-            1) apply_production_tune; read -rp "按回车继续..." ;;
-            2) install_bbrv3_max; read -rp "按回车继续..." ;;
-            3) aggressive_speed_mode; read -rp "按回车继续..." ;;
-            4) set_ipv4_priority; read -rp "按回车继续..." ;;
-            5) enable_nic_multiqueue; read -rp "按回车继续..." ;;
-            6) reset_all_optimizations; read -rp "按回车继续..." ;;
+            1) apply_production_tune || true; read -rp "按回车继续..." ;;
+            2) install_bbrv3_max || true; read -rp "按回车继续..." ;;
+            3) aggressive_speed_mode || true; read -rp "按回车继续..." ;;
+            4) set_ipv4_priority || true; read -rp "按回车继续..." ;;
+            5) enable_nic_multiqueue || true; read -rp "按回车继续..." ;;
+            6) reset_all_optimizations || true; read -rp "按回车继续..." ;;
             0) break ;;
             *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
