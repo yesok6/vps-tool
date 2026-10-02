@@ -138,7 +138,8 @@ SH
 }
 
 check_version_update() {
-    local base remote
+    local base remote cache_file cache_age now
+    local cache_ttl="${VPS_TOOL_VERSION_CACHE_TTL:-900}"
     VERSION_TIPS="${GREEN}[当前版本 v${CURRENT_VERSION}]${PLAIN}"
     case "${VPS_TOOL_VERSION_CHECK,,}" in
         0|false|no|off)
@@ -146,9 +147,28 @@ check_version_update() {
             return 0
             ;;
     esac
-    base=$(raw_base_url)
-    remote=$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 2 --max-time 5 \
-        "${base}/install.sh?t=$(date +%s%N)" 2>/dev/null | grep '^CURRENT_VERSION=' | head -n1 | cut -d'"' -f2 || true)
+
+    # [体验优化] 启动时不再每次都等待网络；默认 15 分钟内复用一次远端版本结果。
+    cache_file="${LOG_DIR}/remote_version.cache"
+    now=$(date +%s)
+    remote=""
+    if [[ -f "$cache_file" ]]; then
+        cache_age=$(( now - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0) ))
+        if (( cache_age >= 0 && cache_age < cache_ttl )); then
+            remote=$(cat "$cache_file" 2>/dev/null || true)
+        fi
+    fi
+
+    if [[ -z "$remote" ]]; then
+        base=$(raw_base_url)
+        remote=$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 1.2 --max-time 2 \
+            "${base}/install.sh?t=$(date +%s%N)" 2>/dev/null | grep '^CURRENT_VERSION=' | head -n1 | cut -d'"' -f2 || true)
+        if [[ -n "$remote" && "$remote" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            printf '%s\n' "$remote" > "$cache_file" 2>/dev/null || true
+            chmod 600 "$cache_file" 2>/dev/null || true
+        fi
+    fi
+
     if [[ -n "$remote" && "$remote" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ && "$remote" != "$CURRENT_VERSION" ]]; then
         VERSION_TIPS="${YELLOW}[发现远端版本 v${remote}，可通过 8 更新]${PLAIN}"
     elif [[ -n "$remote" && ! "$remote" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
