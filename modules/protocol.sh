@@ -437,10 +437,10 @@ protocol_menu() {
         echo -e "${CYAN}====================================================${PLAIN}"
         read -rp "请选择 [0-4]: " choice
         case "$choice" in
-            1) deploy_vless_reality; read -rp "按回车继续..." ;;
-            2) deploy_hysteria2; read -rp "按回车继续..." ;;
-            3) [[ -f "$NODE_INFO_FILE" ]] && cat "$NODE_INFO_FILE" || echo "暂无节点信息"; read -rp "按回车继续..." ;;
-            4) uninstall_protocol_environment; read -rp "按回车继续..." ;;
+            1) deploy_vless_reality || true; read -rp "按回车继续..." ;;
+            2) deploy_hysteria2 || true; read -rp "按回车继续..." ;;
+            3) if [[ -f "$NODE_INFO_FILE" ]]; then cat "$NODE_INFO_FILE"; else echo "暂无节点信息"; fi; read -rp "按回车继续..." ;;
+            4) uninstall_protocol_environment || true; read -rp "按回车继续..." ;;
             0) break ;;
             *) echo -e "${RED}[错误]${PLAIN} 无效选项。"; sleep 1 ;;
         esac
