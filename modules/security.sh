@@ -166,15 +166,15 @@ ssh_endpoint_host() {
 
 ssh_new_session_detected() {
     local expected_port="$1"
-    local remote_ip remote_port current_local_ip current_local_port
+    local remote_ip remote_port current_session_local_port
     local local_endpoint peer_endpoint local_port_now peer_host peer_port
 
     # [可完全撤销] 本函数只读取现有 SSH 会话状态，不修改 sshd/firewall。
     # 安全条件：必须看到“当前脚本会话之外”的、来自同一来源地址的新 SSH established 连接。
     remote_ip=$(ssh_current_source_ip 2>/dev/null) || return 1
     [[ -n "$remote_ip" ]] || return 1
-    read -r _ remote_port _ current_local_port _ <<< "${SSH_CONNECTION:-}"
-    [[ "$remote_port" =~ ^[0-9]+$ && "$current_local_port" =~ ^[0-9]+$ ]] || return 1
+    read -r _ remote_port _ current_session_local_port _ <<< "${SSH_CONNECTION:-}"
+    [[ "$remote_port" =~ ^[0-9]+$ && "$current_session_local_port" =~ ^[0-9]+$ ]] || return 1
 
     while read -r _ _ _ local_endpoint peer_endpoint _; do
         [[ -n "$local_endpoint" && -n "$peer_endpoint" ]] || continue
@@ -184,9 +184,9 @@ ssh_new_session_detected() {
         [[ "$local_port_now" == "$expected_port" ]] || continue
         [[ "$peer_host" == "$remote_ip" ]] || continue
 
-        # 不再仅凭“当前会话端口等于新端口”排除连接；而是精确排除 SSH_CONNECTION 对应的同一条 TCP 会话。
-        # 这样自动模式只有在确实存在独立的新连接时才算验证成功。
-        if [[ "$peer_host" == "$remote_ip" && "$peer_port" == "$remote_port" && "$local_port_now" == "$current_local_port" ]]; then
+        # [安全校验] current_session_local_port 是当前工具会话在 VPS 本机的端口。
+        # 通过“来源 IP + 来源临时端口 + 本机端口”精确排除当前这条连接，避免把自己误判成“新会话”。
+        if [[ "$peer_host" == "$remote_ip" && "$peer_port" == "$remote_port" && "$local_port_now" == "$current_session_local_port" ]]; then
             continue
         fi
         return 0
@@ -365,9 +365,9 @@ remove_old_ssh_port() {
     echo -e "${YELLOW}[警告]${PLAIN} 删除后 SSH 将不再监听 ${old_port}；当前会话已确认通过新端口 ${new_port} 登录。"
     echo -e "${YELLOW}[警告]${PLAIN} 请再次确认云安全组/外部防火墙已经允许新端口 ${new_port}。"
     if [[ "$auto_confirm" != "1" ]]; then
-        confirm_safety_prompt "删除旧 SSH 端口 ${old_port}" "必须确认当前会话已通过新端口 ${new_port} 登录，且旧/新两个端口当前都在监听。" || return 1
+        confirm_safety_prompt "删除旧 SSH 端口 ${old_port}" "作用：只保留新端口 ${new_port}；成功后会同步关闭可安全识别的旧端口防火墙放行。" || return 1
     else
-        echo -e "${YELLOW}[自动执行]${PLAIN} 已满足新端口真实登录条件，现自动删除旧端口 ${old_port}。"
+        echo -e "${YELLOW}[自动执行]${PLAIN} 已满足新端口真实登录条件，现自动删除旧端口 ${old_port}，并同步清理可安全识别的旧端口防火墙放行。"
     fi
 
     action_dir=$(make_temp_dir ssh-remove-old)
@@ -402,10 +402,17 @@ remove_old_ssh_port() {
 
     if [[ "$(firewall_backend)" == "ufw" || "$(firewall_backend)" == "firewalld" ]]; then
         backend=$(firewall_backend)
+        # [安全闭环] SSH 旧端口删除后，同步关闭“本工具自己创建”的旧端口防火墙放行。
+        # [安全保留] 如果旧端口不是本工具创建的规则，或规则由更高层 service 管理，则不强删，避免误伤其它业务。
         if firewall_remove_owned_rules "$old_port" tcp; then
-            echo -e "${GREEN}[完成]${PLAIN} 工具自己创建的旧端口 ${old_port}/tcp 防火墙规则已清理。"
+            state_unset ssh_migration_firewall_cleanup_pending
+            echo -e "${GREEN}[完成]${PLAIN} SSH 旧端口 ${old_port} 已删除，对应的工具防火墙放行也已关闭。"
+        elif ! port_in_use "$old_port" tcp && firewall_close_port_rule "$old_port" tcp; then
+            state_unset ssh_migration_firewall_cleanup_pending
+            echo -e "${GREEN}[完成]${PLAIN} SSH 旧端口 ${old_port} 已删除，检测到旧端口无本机监听后，现有明确的端口放行规则也已关闭。"
         else
-            echo -e "${YELLOW}[提示]${PLAIN} SSH 已停止监听旧端口 ${old_port}，但旧端口的防火墙规则未由工具强制删除，以免误删其他服务正在使用的规则。"
+            state_set ssh_migration_firewall_cleanup_pending "$old_port"
+            echo -e "${YELLOW}[提示]${PLAIN} SSH 已停止监听旧端口 ${old_port}，但防火墙规则未能安全自动关闭（可能由 service/其它业务管理）。可在“查看/管理已放行端口”中手动处理。"
         fi
     fi
 
@@ -624,10 +631,10 @@ ssh_port_menu() {
         echo -e "${CYAN}====================================================${PLAIN}"
         read -rp "请输入选项 [0-4]: " choice
         case "$choice" in
-            1) change_ssh_port 1; read -rp "按回车继续..." ;;
-            2) change_ssh_port 2; read -rp "按回车继续..." ;;
-            3) remove_old_ssh_port; read -rp "按回车继续..." ;;
-            4) cancel_ssh_port_migration; read -rp "按回车继续..." ;;
+            1) change_ssh_port 1 || true; read -rp "按回车继续..." ;;
+            2) change_ssh_port 2 || true; read -rp "按回车继续..." ;;
+            3) remove_old_ssh_port || true; read -rp "按回车继续..." ;;
+            4) cancel_ssh_port_migration || true; read -rp "按回车继续..." ;;
             0) return 0 ;;
             *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
@@ -684,6 +691,205 @@ firewall_rule_exists() {
     esac
 }
 
+firewall_port_purpose() {
+    local port_proto="$1"
+    local port="${port_proto%/*}" proto="${port_proto#*/}"
+    case "$port_proto" in
+        22/tcp) echo "SSH 远程管理" ;;
+        80/tcp) echo "HTTP 网站" ;;
+        443/tcp) echo "HTTPS 网站" ;;
+        53/tcp|53/udp) echo "DNS 域名解析" ;;
+        21/tcp) echo "FTP 文件传输" ;;
+        25/tcp) echo "SMTP 邮件" ;;
+        110/tcp) echo "POP3 邮件" ;;
+        143/tcp) echo "IMAP 邮件" ;;
+        465/tcp) echo "SMTPS 加密邮件" ;;
+        587/tcp) echo "邮件提交" ;;
+        993/tcp) echo "IMAPS 加密邮件" ;;
+        995/tcp) echo "POP3S 加密邮件" ;;
+        3306/tcp) echo "MySQL/MariaDB" ;;
+        5432/tcp) echo "PostgreSQL" ;;
+        6379/tcp) echo "Redis" ;;
+        8080/tcp) echo "常见 Web/面板备用端口" ;;
+        8443/tcp) echo "常见 HTTPS/面板备用端口" ;;
+        51820/udp) echo "WireGuard" ;;
+        25565/tcp) echo "Minecraft 服务" ;;
+        *) echo "自定义/用途未知" ;;
+    esac
+}
+
+firewall_open_port_entries() {
+    # [维护备注] 本函数是叶子函数，当前仅由上层显示/管理函数调用。
+    # RETURN trap 会在函数返回时清理临时目录；若未来在本函数内部增加嵌套 RETURN trap，
+    # 必须同步处理 trap 保存/恢复，避免覆盖上层 RETURN trap。
+    local backend="$1" file tmp profile token svc info
+    tmp=$(make_temp_dir firewall-list) || return 1
+    trap 'rm -rf -- "$tmp"' RETURN
+    file="${tmp}/entries"
+    : > "$file" || return 1
+
+    case "$backend" in
+        ufw)
+            while read -r token; do
+                [[ -n "$token" ]] || continue
+                echo "${token}|UFW 端口规则" >> "$file"
+            done < <(ufw status 2>/dev/null | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
+            while IFS= read -r profile; do
+                profile="${profile#  }"
+                [[ -n "$profile" ]] || continue
+                while read -r token; do
+                    [[ -n "$token" ]] || continue
+                    echo "${token}|UFW 服务:${profile}" >> "$file"
+                done < <(ufw app info "$profile" 2>/dev/null | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
+            done < <(ufw app list 2>/dev/null | sed -n '/Available applications:/,$p' | sed -n 's/^  //p')
+            ;;
+        firewalld)
+            while read -r token; do
+                [[ -n "$token" ]] || continue
+                echo "${token}|firewalld 端口规则" >> "$file"
+            done < <(firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)$' | sort -u)
+            while read -r svc; do
+                [[ -n "$svc" ]] || continue
+                info=$(firewall-cmd --info-service="$svc" --permanent 2>/dev/null || true)
+                while read -r token; do
+                    [[ -n "$token" ]] || continue
+                    echo "${token}|firewalld 服务:${svc}" >> "$file"
+                done < <(printf '%s\n' "$info" | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
+            done < <(firewall-cmd --list-services 2>/dev/null | tr ' ' '\n' | sort -u)
+            ;;
+        *)
+            rm -rf "$tmp"
+            return 1
+            ;;
+    esac
+
+    sort -t'|' -k1,1 -k2,2 -u "$file"
+    trap - RETURN
+    rm -rf -- "$tmp"
+}
+
+firewall_show_open_ports() {
+    # [只读/可完全撤销] 仅读取当前 UFW/firewalld 放行状态，不修改规则。
+    local backend="$1" count=0 item rule source purpose
+    local -a lines=()
+    backend="${backend:-$(firewall_backend)}"
+    echo -e "${CYAN}当前防火墙放行端口：${PLAIN}"
+    if [[ "$backend" == "none" ]]; then
+        echo -e "  ${YELLOW}当前没有启用 UFW/firewalld。${PLAIN}"
+        return 0
+    fi
+    mapfile -t lines < <(firewall_open_port_entries "$backend" 2>/dev/null || true)
+    if ((${#lines[@]} == 0)); then
+        echo -e "  ${YELLOW}未识别到数字端口放行规则。${PLAIN}"
+        return 0
+    fi
+    for item in "${lines[@]}"; do
+        rule="${item%%|*}"; source="${item#*|}"; purpose=$(firewall_port_purpose "$rule")
+        count=$((count + 1))
+        printf '  %2d. %-12s %-18s %s\n' "$count" "$rule" "$purpose" "$source"
+    done
+    echo -e "${GREEN}共 ${count} 个已识别的端口规则。${PLAIN}"
+}
+
+firewall_manage_disable() {
+    local backend="$1" choice rule source purpose profile svc token
+    local -a entries=()
+    mapfile -t entries < <(firewall_open_port_entries "$backend" 2>/dev/null || true)
+    ((${#entries[@]} > 0)) || { echo -e "${YELLOW}[提示]${PLAIN} 当前没有可管理的数字端口规则。"; return 1; }
+    echo -e "${YELLOW}[警告]${PLAIN} 关闭端口会立即影响对应服务；当前 SSH 端口禁止关闭。"
+    read -rp "输入要禁用的编号 [1-${#entries[@]}，其他取消]: " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] || return 0
+    (( choice >= 1 && choice <= ${#entries[@]} )) || return 1
+    rule="${entries[$((choice-1))]%|*}"
+    source="${entries[$((choice-1))]#*|}"
+    purpose=$(firewall_port_purpose "$rule")
+    local port="${rule%/*}" proto="${rule#*/}" current_ssh
+    current_ssh=$(get_current_ssh_port)
+    if [[ "$port" == "$current_ssh" && "$proto" == "tcp" ]]; then
+        echo -e "${RED}[禁止操作]${PLAIN} ${rule} 是当前 SSH 端口，不能从这里关闭。"
+        return 1
+    fi
+    echo -e "${YELLOW}[目标]${PLAIN} ${rule} — ${purpose}"
+    echo -e "${BLUE}[来源]${PLAIN} ${source}"
+    if [[ "$source" == UFW\ 服务:* || "$source" == firewalld\ 服务:* ]]; then
+        local svc_name="${source#*:}"
+        local -a service_port_list=()
+        if [[ "$backend" == "ufw" ]]; then
+            mapfile -t service_port_list < <(ufw app info "$svc_name" 2>/dev/null | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
+        else
+            mapfile -t service_port_list < <(firewall-cmd --info-service="$svc_name" --permanent 2>/dev/null | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
+        fi
+        # 只有当服务本身只提供当前这一条端口时，才允许从这里删除整个 service。
+        if ((${#service_port_list[@]} != 1)) || [[ "${service_port_list[0]:-}" != "${rule}" ]]; then
+            echo -e "${YELLOW}[提示]${PLAIN} 该端口由服务规则 ${svc_name} 提供，关闭端口可能同时影响其它端口。为避免误删，请直接在对应防火墙服务中管理。"
+            return 1
+        fi
+        confirm_safety_prompt "关闭 ${rule}" "作用：关闭 ${purpose} 的防火墙放行；此操作会移除服务规则 ${svc_name}。" || return 1
+        if [[ "$backend" == "ufw" ]]; then
+            ufw delete allow "$svc_name" >/dev/null || return 1
+        else
+            firewall-cmd --permanent --remove-service="$svc_name" >/dev/null || return 1
+            firewall-cmd --reload >/dev/null || return 1
+        fi
+    else
+        confirm_safety_prompt "关闭 ${rule}" "作用：停止对 ${purpose} 的入站放行；不会停止服务本身。" || return 1
+        firewall_close_port_rule "$port" "$proto" || return 1
+    fi
+    if firewall_rule_exists "$backend" "$port" "$proto"; then
+        echo -e "${YELLOW}[提示]${PLAIN} ${rule} 仍被其它规则或服务放行，未宣布为“已关闭”。请根据上方来源继续处理。"
+        return 1
+    fi
+    # [本机规则可撤销] 这里仅管理当前主机防火墙；不会修改云安全组或外部 ACL。
+    echo -e "${GREEN}[完成]${PLAIN} ${rule} 已停止防火墙放行。"
+    log_action "[防火墙] 手动关闭 ${rule}（${purpose}）"
+}
+
+firewall_manage_add() {
+    # [可完全撤销] 新增的端口规则由工具记录，卸载时可按状态清理。
+    local port proto purpose
+    read -rp "输入要放行的端口 [1-65535]: " port
+    validate_port_any "$port" || { echo -e "${RED}[错误]${PLAIN} 端口必须在 1-65535。"; return 1; }
+    read -rp "协议 [tcp/udp，默认 tcp]: " proto
+    proto="${proto:-tcp}"
+    [[ "$proto" == "tcp" || "$proto" == "udp" ]] || { echo -e "${RED}[错误]${PLAIN} 协议只能是 tcp/udp。"; return 1; }
+    purpose=$(firewall_port_purpose "${port}/${proto}")
+    confirm_safety_prompt "放行 ${port}/${proto}" "作用：允许 ${purpose} 的入站流量；不会自动启动对应服务。" || return 1
+    firewall_allow "$port" "$proto" || { echo -e "${RED}[错误]${PLAIN} 无法放行 ${port}/${proto}。"; return 1; }
+    echo -e "${GREEN}[完成]${PLAIN} ${port}/${proto} 已放行。"
+    log_action "[防火墙] 手动放行 ${port}/${proto}（${purpose}）"
+}
+
+firewall_port_manager_menu() {
+    # [本机规则可撤销] 允许查看/新增/禁用本机防火墙规则；云安全组不在管理范围。
+    local backend
+    while true; do
+        clear
+        backend=$(firewall_backend)
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "${CYAN}            [防火墙] 已放行端口与规则管理           ${PLAIN}"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        if [[ "$backend" == "none" ]]; then
+            echo -e "${YELLOW}[状态]${PLAIN} 当前未启用 UFW/firewalld。先在选项 4 启用防火墙。"
+        else
+            firewall_show_open_ports "$backend"
+        fi
+        echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e "  ${GREEN}1.${PLAIN} 查看已放行端口"
+        echo -e "  ${GREEN}2.${PLAIN} 新增放行端口"
+        echo -e "  ${GREEN}3.${PLAIN} 禁用放行端口"
+        echo -e "  ${RED}0.${PLAIN} 返回"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        read -rp "请输入选项 [0-3]: " choice
+        case "$choice" in
+            1) clear; firewall_show_open_ports "$backend" || true; read -rp "按回车继续..." ;;
+            2) if [[ "$backend" == "none" ]]; then echo -e "${YELLOW}[提示]${PLAIN} 请先启用防火墙。"; sleep 1; else firewall_manage_add || true; read -rp "按回车继续..."; fi ;;
+            3) if [[ "$backend" == "none" ]]; then echo -e "${YELLOW}[提示]${PLAIN} 当前没有已启用的防火墙。"; sleep 1; else firewall_manage_disable "$backend" || true; read -rp "按回车继续..."; fi ;;
+            0) return 0 ;;
+            *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
+        esac
+    done
+}
+
 setup_firewall() {
     # [部分可撤销/安全保留] 防火墙基线只补充/维护本机规则；云安全组、网络 ACL 与外部防火墙不由本工具回滚。
     check_os || return 1
@@ -698,8 +904,8 @@ setup_firewall() {
     echo -e "${CYAN}====================================================${PLAIN}"
 
     if [[ "$backend" == "ufw" ]]; then
-        echo -e "${GREEN}[状态]${PLAIN} UFW 已启用，不需要再次执行“立即启用”。"
-        firewall_show_allowed ufw
+        echo -e "${GREEN}[状态]${PLAIN} UFW 已启用。"
+        firewall_show_open_ports ufw
         for rule in "${required_rules[@]}"; do
             port="${rule%/*}"; proto="${rule#*/}"
             if ! firewall_rule_exists ufw "$port" "$proto"; then
@@ -717,7 +923,7 @@ setup_firewall() {
             port="${rule%/*}"; proto="${rule#*/}"
             firewall_allow "$port" "$proto" || { echo -e "${RED}[错误]${PLAIN} 无法放行 ${rule}。"; return 1; }
         done
-        firewall_show_allowed ufw
+        firewall_show_open_ports ufw
         log_action "[安全保留] UFW 已启用，本次补充基线规则：${missing_rules[*]}"
         echo -e "${GREEN}[完成]${PLAIN} 基线规则已补充并立即生效。"
         return 0
@@ -725,8 +931,8 @@ setup_firewall() {
 
     if [[ "$backend" == "firewalld" ]]; then
         local ssh_missing=0 http_missing=0 https_missing=0
-        echo -e "${GREEN}[状态]${PLAIN} firewalld 已运行，不需要再次执行“立即启用”。"
-        firewall_show_allowed firewalld
+        echo -e "${GREEN}[状态]${PLAIN} firewalld 已运行。"
+        firewall_show_open_ports firewalld
         firewall_rule_exists firewalld "$cur_port" tcp || ssh_missing=1
         firewall_rule_exists firewalld 80 tcp || http_missing=1
         firewall_rule_exists firewalld 443 tcp || https_missing=1
@@ -751,14 +957,15 @@ setup_firewall() {
         if (( https_missing )); then
             firewall_allow 443 tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 HTTPS 443/tcp。"; return 1; }
         fi
-        firewall_show_allowed firewalld
+        firewall_show_open_ports firewalld
         log_action "[安全保留] firewalld 已运行，本次补充基线规则：${missing_rules[*]}"
         echo -e "${GREEN}[完成]${PLAIN} 基线规则已补充并立即生效。"
         return 0
     fi
 
     echo -e "${YELLOW}[状态]${PLAIN} 当前没有已启用的 UFW/firewalld。"
-    firewall_show_allowed none
+    echo -e "${BLUE}[说明]${PLAIN} 作用：建立 SSH/HTTP/HTTPS 最小入站基线；外部安全组仍需单独确认。"
+    firewall_show_open_ports none
     if [[ "$PKG_MANAGER" == "apt" ]]; then
         if command_exists ufw; then
             echo -e "${YELLOW}[状态]${PLAIN} 检测到 UFW 已安装但当前未启用。"
@@ -781,7 +988,7 @@ setup_firewall() {
         firewall_allow 443 tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 HTTPS 443/tcp。"; return 1; }
         ufw default allow outgoing >/dev/null
         ufw --force enable
-        firewall_show_allowed ufw
+        firewall_show_open_ports ufw
         log_action "[安全保留] 配置并启用 UFW，SSH=${cur_port}, 80/tcp, 443/tcp"
         echo -e "${GREEN}[完成]${PLAIN} UFW 已启用，以上规则现在已经生效。以后再次进入本选项将只展示当前状态，不会重复要求立即启用。"
     elif command_exists firewall-cmd; then
@@ -794,7 +1001,7 @@ setup_firewall() {
         firewall_allow "$cur_port" tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 SSH ${cur_port}/tcp。"; return 1; }
         firewall_allow 80 tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 HTTP 80/tcp。"; return 1; }
         firewall_allow 443 tcp || { echo -e "${RED}[错误]${PLAIN} 无法放行 HTTPS 443/tcp。"; return 1; }
-        firewall_show_allowed firewalld
+        firewall_show_open_ports firewalld
         log_action "[安全保留] 启动并配置 firewalld，SSH=${cur_port}, HTTP/HTTPS"
         echo -e "${GREEN}[完成]${PLAIN} firewalld 已运行，以上规则现在已经生效。以后再次进入本选项将只展示当前状态，不会重复要求立即启用。"
     else
@@ -893,9 +1100,25 @@ setup_ssh_key_auth() {
     rm -rf "$action_dir"
 }
 
+retry_pending_ssh_firewall_cleanup() {
+    local old_port backend
+    old_port="$(state_get ssh_migration_firewall_cleanup_pending 2>/dev/null || true)"
+    [[ -n "$old_port" ]] || return 0
+    # [状态自愈] 状态文件若被手工修改或损坏，不让无效 state 永久卡住菜单。
+    validate_port_any "$old_port" || { state_unset ssh_migration_firewall_cleanup_pending; return 0; }
+    backend=$(firewall_backend)
+    [[ "$backend" != "none" ]] || return 0
+    port_in_use "$old_port" tcp && return 0
+    if firewall_remove_owned_rules "$old_port" tcp >/dev/null 2>&1; then
+        state_unset ssh_migration_firewall_cleanup_pending
+        echo -e "${GREEN}[清理完成]${PLAIN} 旧 SSH 端口 ${old_port}/tcp 的工具防火墙规则已关闭。"
+    fi
+}
+
 security_menu() {
     check_os || return 1
     while true; do
+        retry_pending_ssh_firewall_cleanup || true
         clear
         local cur_port
         cur_port=$(get_current_ssh_port)
@@ -907,18 +1130,20 @@ security_menu() {
         echo -e "  ${GREEN}2.${PLAIN} 一键高危安全漏洞修补升级       ${YELLOW}[不可逆更新]${PLAIN}"
         echo -e "  ----------------------------------------------------"
         echo -e "  ${YELLOW}3.${PLAIN} 修改 SSH 远程连接端口           ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
-        echo -e "  ${YELLOW}4.${PLAIN} 开启 UFW 防火墙基线防御         ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
+        echo -e "  ${YELLOW}4.${PLAIN} 防火墙基线与端口管理             ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
         echo -e "  ${YELLOW}5.${PLAIN} 部署密钥认证并关闭密码         ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
+        echo -e "  ${YELLOW}6.${PLAIN} 查看/管理已放行端口               ${GREEN}[本机规则可撤销]${PLAIN}"
         echo -e "  ----------------------------------------------------"
         echo -e "  ${RED}0.${PLAIN} 返回主菜单"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请输入选项 [0-5]: " choice
+        read -rp "请输入选项 [0-6]: " choice
         case "$choice" in
-            1) sys_full_upgrade; read -rp "按回车继续..." ;;
-            2) sys_security_upgrade; read -rp "按回车继续..." ;;
-            3) ssh_port_menu ;;
-            4) setup_firewall; read -rp "按回车继续..." ;;
-            5) setup_ssh_key_auth; read -rp "按回车继续..." ;;
+            1) sys_full_upgrade || true; read -rp "按回车继续..." ;;
+            2) sys_security_upgrade || true; read -rp "按回车继续..." ;;
+            3) ssh_port_menu || true ;;
+            4) setup_firewall || true; read -rp "按回车继续..." ;;
+            5) setup_ssh_key_auth || true; read -rp "按回车继续..." ;;
+            6) firewall_port_manager_menu || true ;;
             0) break ;;
             *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
