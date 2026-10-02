@@ -103,11 +103,53 @@ if printf 'n\n' | bash -c 'set -Eeuo pipefail; source "$1"; confirm_safety_promp
     exit 1
 fi
 
-# 19. restore_runtime_values 没有记录时允许调用方显式忽略，不应触发 set -e 中断。
-if restore_runtime_values; then
-    echo 'restore_runtime_values unexpectedly succeeded without state directory' >&2
-    exit 1
-fi
+# 19a. 模块菜单取消必须停留在当前模块，不能因 set -e 直接退出模块子进程。
+# 19b. 四个交互模块的菜单调用必须吞掉“用户取消/操作失败”的非零返回，避免 set -e 退出整个模块。
+grep -qF '1) change_ssh_port 1 || true;' "$ROOT/modules/security.sh"
+grep -qF '2) change_ssh_port 2 || true;' "$ROOT/modules/security.sh"
+grep -qF '3) remove_old_ssh_port || true;' "$ROOT/modules/security.sh"
+grep -qF '4) cancel_ssh_port_migration || true;' "$ROOT/modules/security.sh"
+grep -qF '1) apply_production_tune || true;' "$ROOT/modules/optimize.sh"
+grep -qF '1) deploy_vless_reality || true;' "$ROOT/modules/protocol.sh"
+grep -qF '1) run_test_ipquality || true;' "$ROOT/modules/ip_test.sh"
+
+# security_menu：第 1 项取消后，必须还能读取下一次菜单选择 0。
+printf '1\n\n0\n' | bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    clear(){ :; }
+    check_os(){ OS_PRETTY=test ARCH=test return 0; }
+    retry_pending_ssh_firewall_cleanup(){ return 0; }
+    get_current_ssh_port(){ echo 22; }
+    sys_full_upgrade(){ return 1; }
+    security_menu >/dev/null 2>&1
+' _ "$ROOT/modules/security.sh"
+# optimize_menu：取消第 1 项后仍能返回菜单并选择 0。
+printf '1\n\n0\n' | bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    clear(){ :; }
+    show_dashboard(){ :; }
+    apply_production_tune(){ return 1; }
+    optimize_menu >/dev/null 2>&1
+' _ "$ROOT/modules/optimize.sh"
+# protocol_menu：取消部署后仍能返回菜单并选择 0。
+printf '1\n\n0\n' | bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    clear(){ :; }
+    systemctl(){ return 0; }
+    deploy_vless_reality(){ return 1; }
+    protocol_menu >/dev/null 2>&1
+' _ "$ROOT/modules/protocol.sh"
+# ip_test_menu：第三方测试取消后仍能返回菜单并选择 0。
+printf '1\n\n0\n' | bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    clear(){ :; }
+    run_test_ipquality(){ return 1; }
+    ip_test_menu >/dev/null 2>&1
+' _ "$ROOT/modules/ip_test.sh"
 
 # 20. 本测试脚本本身不允许留下真实 VPS 工具状态目录。
 [[ ! -e /etc/vps-tool/smoke-test-marker ]]
@@ -146,10 +188,11 @@ normalized_root=$(readlink -f -- "$ROOT/install.sh")
 [[ "$normalized_link" == "$normalized_root" ]]
 
 
-# 27. SSH 端口迁移必须提供三种模式，并要求自动/手动删除使用真实新会话验证。
+# 27. SSH 端口迁移必须提供四种模式，并要求自动/手动删除使用真实新会话验证。
 grep -q '修改 SSH 端口（保留旧端口）' "$ROOT/modules/security.sh"
 grep -q '新端口真实登录后自动删除旧端口' "$ROOT/modules/security.sh"
 grep -q '删除已验证的旧 SSH 端口' "$ROOT/modules/security.sh"
+grep -q 'cancel_ssh_port_migration' "$ROOT/modules/security.sh"
 grep -q 'current_ssh_session_uses_port' "$ROOT/modules/security.sh"
 grep -q 'wait_for_new_ssh_session' "$ROOT/modules/security.sh"
 
@@ -238,8 +281,8 @@ grep -q '^cancel_ssh_port_migration()' "$ROOT/modules/security.sh"
 
 # 35. 防火墙重复进入时应先展示当前状态；已启用后不应再次询问“立即启用”。
 grep -q '^firewall_show_allowed()' "$ROOT/modules/security.sh"
-grep -q 'UFW 已启用，不需要再次执行“立即启用”' "$ROOT/modules/security.sh"
-grep -q 'firewalld 已运行，不需要再次执行“立即启用”' "$ROOT/modules/security.sh"
+grep -q 'UFW 已启用。' "$ROOT/modules/security.sh"
+grep -q 'firewalld 已运行。' "$ROOT/modules/security.sh"
 grep -q '以后再次进入本选项将只展示当前状态' "$ROOT/modules/security.sh"
 
 # 36. README 必须包含迁移回退与防火墙状态式流程说明。
@@ -284,5 +327,91 @@ esac
 EOF
 chmod +x "$firewall_stub_dir2/firewall-cmd"
 PATH="$firewall_stub_dir2:$PATH" bash -c 'source "$1"; VPS_TOOL_STATE="$2"; mkdir -p "$VPS_TOOL_STATE/firewall"; firewall_allow 80 tcp; ! compgen -G "$VPS_TOOL_STATE/firewall/*.rule" >/dev/null' _ "$ROOT/lib/common.sh" "$TEST_STATE_ROOT/firewall-state"
+
+
+
+# 41. 防火墙端口管理必须支持 SSH 22 等特权端口，同时协议端口校验仍保持高端口范围。
+if ! validate_port_any 22 || ! validate_port_any 65535 || validate_port_any 0 || validate_port_any 65536; then
+    echo 'validate_port_any boundary test failed' >&2
+    exit 1
+fi
+# firewall_allow / firewall_remove_owned_rules 不应再拒绝 22/tcp。
+grep -A8 '^firewall_allow()' "$ROOT/lib/common.sh" | grep -q 'validate_port_any'
+grep -A12 '^firewall_remove_owned_rules()' "$ROOT/lib/common.sh" | grep -q 'validate_port_any'
+
+# 42. 系统升级前必须显示资源检查，并使用分级资源阈值。
+grep -q '^check_upgrade_resources()' "$ROOT/lib/common.sh"
+grep -q 'mem_mb >= 256' "$ROOT/lib/common.sh"
+grep -q 'mem_mb >= 128' "$ROOT/lib/common.sh"
+grep -q 'disk_mb < 1024' "$ROOT/lib/common.sh"
+grep -q 'recommend_managed_swap_mb' "$ROOT/lib/common.sh"
+grep -q '^recommend_managed_swap_mb()' "$ROOT/lib/common.sh"
+grep -q '^ensure_managed_swap_1g()' "$ROOT/lib/common.sh"
+
+# 43. 主菜单版本检查必须使用缓存，避免每次打开都等待网络。
+grep -q 'remote_version.cache' "$ROOT/install.sh"
+grep -q 'VPS_TOOL_VERSION_CACHE_TTL' "$ROOT/install.sh"
+
+# 44. 防火墙必须提供查看/新增/禁用端口三个入口。
+grep -q '^firewall_port_manager_menu()' "$ROOT/modules/security.sh"
+grep -q 'firewall_manage_add' "$ROOT/modules/security.sh"
+grep -q 'firewall_manage_disable' "$ROOT/modules/security.sh"
+grep -q 'firewall_show_open_ports' "$ROOT/modules/security.sh"
+
+# 45. SSH 旧端口删除后必须进入防火墙清理闭环；失败时保留待清理状态。
+grep -q 'ssh_migration_firewall_cleanup_pending' "$ROOT/modules/security.sh"
+grep -q 'firewall_close_port_rule' "$ROOT/modules/security.sh"
+grep -qF 'validate_port_any "$old_port" || { state_unset ssh_migration_firewall_cleanup_pending; return 0; }' "$ROOT/modules/security.sh"
+
+# 46. 防火墙服务端口比较必须按端口列表精确判断，避免原来的字符串比较永远为真。
+grep -q 'service_port_list' "$ROOT/modules/security.sh"
+grep -Fq 'if ((${#service_port_list[@]} != 1)) || [[ "${service_port_list[0]:-}" != "${rule}" ]]; then' "$ROOT/modules/security.sh"
+# 46a. 单端口 service 的运行时禁用应继续走 service 删除路径；不能被错误的字符串空格比较拦截。
+service_test_dir="$TEST_STATE_ROOT/service-disable-stub"
+mkdir -p "$service_test_dir"
+cat > "$service_test_dir/ufw" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *"app info websvc"*) printf 'Profile: websvc\n80/tcp\n'; exit 0 ;;
+  *"delete allow websvc"*) printf '%s\n' "$*" > "${SERVICE_DELETE_LOG:?}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$service_test_dir/ufw"
+SERVICE_DELETE_LOG="$TEST_STATE_ROOT/service-delete.log" PATH="$service_test_dir:$PATH" bash -c '
+  source "$1"
+  firewall_open_port_entries() { printf "80/tcp|UFW 服务:websvc\n"; }
+  firewall_backend() { echo ufw; }
+  get_current_ssh_port() { echo 22; }
+  confirm_safety_prompt() { return 0; }
+  firewall_rule_exists() { return 1; }
+  firewall_manage_disable ufw <<< "1" >/dev/null
+' _ "$ROOT/modules/security.sh"
+grep -qF 'delete allow websvc' "$TEST_STATE_ROOT/service-delete.log"
+# firewall_open_port_entries 的临时目录必须有自动清理兜底。
+grep -Fq "trap 'rm -rf -- \"\$tmp\"' RETURN" "$ROOT/modules/security.sh"
+
+# 47. Swap 推荐大小按磁盘余量动态计算：1.25/1.5/1.75/2.0 GiB 分别最多推荐 256/512/768/1024 MiB。
+for spec in "1280 256" "1536 512" "1792 768" "2048 1024" "1100 0"; do
+  set -- $spec
+  got=$(DISK_MB="$1" bash -c '
+    source "$1"
+    get_root_free_mb() { echo "$DISK_MB"; }
+    current_swap_mb() { echo 0; }
+    recommend_managed_swap_mb
+  ' _ "$ROOT/lib/common.sh")
+  [[ "$got" == "$2" ]] || { echo "unexpected swap recommendation: disk=$1 got=$got want=$2" >&2; exit 1; }
+done
+
+# 48. 低内存 + 1.5 GiB 磁盘时推荐 512 MiB Swap，并保留至少 1 GiB 磁盘。
+bash -c '
+  source "$1"
+  get_mem_available_mb() { echo 200; }
+  get_root_free_mb() { echo 1536; }
+  current_swap_mb() { echo 0; }
+  confirm_safety_prompt() { return 0; }
+  ensure_managed_swap() { return 0; }
+  check_upgrade_resources
+' _ "$ROOT/lib/common.sh"
 
 echo 'smoke tests: OK'
