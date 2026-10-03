@@ -21,6 +21,22 @@ get_current_ssh_port() {
     echo "${port:-22}"
 }
 
+get_current_ssh_ports() {
+    # [安全真相源] 以 sshd 当前实际生效配置为准。
+    # [迁移状态] SSH 迁移期间 sshd 同时监听旧/新端口，因此这里会自然返回两个端口。
+    # [安全保留] 本函数只读取状态，不修改 SSH、防火墙或 Fail2Ban。
+    local output port
+    if command_exists sshd && output=$(sshd -T 2>/dev/null); then
+        while read -r port; do
+            validate_ssh_port "$port" && printf '%s\n' "$port"
+        done < <(awk '$1 == "port" {print $2}' <<< "$output" | sort -n -u)
+        return 0
+    fi
+
+    port=$(get_current_ssh_port)
+    validate_ssh_port "$port" && printf '%s\n' "$port"
+}
+
 ssh_port_listening() {
     local port="$1"
     ss -H -ltn 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit found ? 0 : 1}'
@@ -195,57 +211,6 @@ ssh_new_session_detected() {
     return 1
 }
 
-confirm_new_ssh_session() {
-    local expected_port="$1"
-    local timeout_seconds="${2:-10}"
-    local elapsed=0
-    while (( elapsed < timeout_seconds )); do
-        if ssh_new_session_detected "$expected_port"; then
-            return 0
-        fi
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-    return 1
-}
-
-wait_for_new_ssh_session() {
-    local new_port="$1"
-    local timeout_seconds="${2:-600}"
-    local elapsed=0
-
-    if ! current_ssh_session_port >/dev/null 2>&1; then
-        echo -e "${RED}[无法自动确认]${PLAIN} 当前不是可识别的 SSH 会话。"
-        echo -e "${YELLOW}[提示]${PLAIN} 自动删除旧端口模式需要当前终端通过 SSH 进入 VPS，才能安全确认后续新连接。"
-        return 1
-    fi
-
-    local current_port source_ip
-    current_port=$(current_ssh_session_port 2>/dev/null || true)
-    source_ip=$(ssh_current_source_ip 2>/dev/null || true)
-    if [[ -z "$source_ip" ]]; then
-        echo -e "${RED}[无法自动确认]${PLAIN} 无法从当前 SSH 会话获取可靠的来源 IP。"
-        echo -e "${YELLOW}[安全处理]${PLAIN} 自动删除模式已停止，旧端口将继续保留；请使用选项 3，在新端口会话中手动删除。"
-        return 1
-    fi
-    echo -e "${YELLOW}[重要警告]${PLAIN} 当前工具会保持旧端口 ${current_port} 与新端口 ${new_port} 同时监听。"
-    echo -e "${YELLOW}[操作要求]${PLAIN} 请保持当前终端不要关闭，并立即用同一台客户端通过新端口 ${new_port} 新开一个 SSH 会话。"
-    echo -e "${YELLOW}[超时处理]${PLAIN} ${timeout_seconds} 秒内没有检测到新端口登录，将自动保留旧端口、删除新端口，并恢复旧端口防火墙放行。"
-
-    while (( elapsed < timeout_seconds )); do
-        if ssh_new_session_detected "$new_port"; then
-            echo -e "${GREEN}[确认成功]${PLAIN} 已检测到新端口 ${new_port} 的实际 SSH 连接。"
-            return 0
-        fi
-        sleep 2
-        elapsed=$((elapsed + 2))
-        printf '\r%s[等待中]%s 已等待 %s/%s 秒，旧端口仍保持监听。' "${CYAN}" "${PLAIN}" "$elapsed" "$timeout_seconds"
-    done
-    printf '\n'
-    echo -e "${YELLOW}[超时]${PLAIN} 未检测到新端口 ${new_port} 的实际 SSH 新会话，旧端口保持不变。"
-    return 1
-}
-
 set_sshd_ports_global() {
     local old_port="$1" new_port="$2"
     local tmp out existing_port
@@ -329,7 +294,6 @@ sshd_has_port() {
 }
 
 remove_old_ssh_port() {
-    local auto_confirm="${3:-0}"
     local old_port new_port action_dir backend
     old_port="${1:-$(state_get ssh_migration_old_port 2>/dev/null || true)}"
     new_port="${2:-$(state_get ssh_migration_new_port 2>/dev/null || true)}"
@@ -338,13 +302,7 @@ remove_old_ssh_port() {
     validate_ssh_port "$new_port" || { echo -e "${RED}[错误]${PLAIN} 未找到有效的新 SSH 端口记录。"; return 1; }
     [[ "$old_port" != "$new_port" ]] || { echo -e "${RED}[错误]${PLAIN} 新旧 SSH 端口不能相同。"; return 1; }
 
-    if [[ "$auto_confirm" == "1" ]]; then
-        if ! confirm_new_ssh_session "$new_port" 10; then
-            echo -e "${RED}[禁止自动删除]${PLAIN} 已触发自动删除流程，但二次确认时未能再次确认新端口 ${new_port} 的真实 SSH 会话。"
-            echo -e "${YELLOW}[安全处理]${PLAIN} 旧端口继续保留，请确认新端口会话仍在线后，再从选项 3 手动处理。"
-            return 1
-        fi
-    elif ! current_ssh_session_uses_port "$new_port"; then
+    if ! current_ssh_session_uses_port "$new_port"; then
         echo -e "${RED}[禁止删除]${PLAIN} 当前这次 SSH 会话不是通过新端口 ${new_port} 登录的。"
         echo -e "${YELLOW}[安全条件]${PLAIN} 必须先用新端口建立一个全新的 SSH 会话，再从那个新会话进入此工具删除旧端口。"
         return 1
@@ -362,11 +320,7 @@ remove_old_ssh_port() {
     echo -e "${RED}${BOLD}[高风险操作]${PLAIN} 即将删除旧 SSH 端口 ${old_port}。"
     echo -e "${YELLOW}[警告]${PLAIN} 删除后 SSH 将不再监听 ${old_port}；当前会话已确认通过新端口 ${new_port} 登录。"
     echo -e "${YELLOW}[警告]${PLAIN} 请再次确认云安全组/外部防火墙已经允许新端口 ${new_port}。"
-    if [[ "$auto_confirm" != "1" ]]; then
-        confirm_safety_prompt "删除旧 SSH 端口 ${old_port}" "作用：只保留新端口 ${new_port}；成功后会同步关闭可安全识别的旧端口防火墙放行。" || return 1
-    else
-        echo -e "${YELLOW}[自动执行]${PLAIN} 已满足新端口真实登录条件，现自动删除旧端口 ${old_port}，并同步清理可安全识别的旧端口防火墙放行。"
-    fi
+    confirm_safety_prompt "删除旧 SSH 端口 ${old_port}" "作用：只保留新端口 ${new_port}；成功后会同步关闭可安全识别的旧端口防火墙放行。" || return 1
 
     action_dir=$(make_temp_dir ssh-remove-old)
     if ! backup_current_ssh_files "$action_dir"; then
@@ -414,9 +368,15 @@ remove_old_ssh_port() {
         fi
     fi
 
+    # [安全同步] 删除旧 SSH 后，F2 重新读取 sshd 实际端口集合，只保护仍然存在的新端口。
+    if command_exists fail2ban-client && [[ -f "$FAIL2BAN_CONFIG" ]] && is_owned "$FAIL2BAN_CONFIG"; then
+        if ! fail2ban_sync_ssh_protection; then
+            echo -e "${YELLOW}[提示]${PLAIN} 旧 SSH 端口已删除，但 Fail2Ban 尚未完成端口同步；后续进入模块 1 会自动重试。"
+        fi
+    fi
+
     state_unset ssh_migration_old_port
     state_unset ssh_migration_new_port
-    state_unset ssh_migration_mode
     rm -rf "${VPS_TOOL_BACKUPS}/ssh_migration_sshd_config"
     log_action "[安全保留] SSH 旧端口 ${old_port} 已在确认当前会话通过新端口 ${new_port} 登录后完成删除。"
     rm -rf "$action_dir"
@@ -424,7 +384,6 @@ remove_old_ssh_port() {
 }
 
 change_ssh_port() {
-    local mode="${1:-1}"
     local cur_port new_port action_dir socket_unit
     check_os || return 1
     cur_port=$(get_current_ssh_port)
@@ -438,27 +397,11 @@ change_ssh_port() {
 
     if state_exists ssh_migration_old_port; then
         echo -e "${YELLOW}[提示]${PLAIN} 已存在待处理的 SSH 端口迁移：旧端口 $(state_get ssh_migration_old_port) → 新端口 $(state_get ssh_migration_new_port)。"
-        echo -e "请先通过选项 3 完成旧端口处理，再开始新的迁移。"
+        echo -e "请先通过选项 2 或选项 3 处理当前迁移状态，再开始新的迁移。"
         return 1
     fi
 
-    case "$mode" in
-        1)
-            confirm_safety_prompt "修改 SSH 端口（保留旧端口）" "旧端口会与新端口同时保留；你必须新开终端通过新端口登录成功。之后请再次进入本选项并选择 3，才会删除旧端口。" || return 1
-            ;;
-        2)
-            if ! current_ssh_session_port >/dev/null 2>&1; then
-                echo -e "${RED}[错误]${PLAIN} 自动删除模式必须从当前 SSH 会话启动。"
-                echo -e "${YELLOW}[提示]${PLAIN} 请改用选项 1，或从可识别的 SSH 会话重新进入工具。"
-                return 1
-            fi
-            confirm_safety_prompt "修改 SSH 端口（新会话验证后自动删除旧端口）" "旧端口会暂时保留；只有检测到当前客户端通过新端口建立真实的新 SSH 会话后，工具才会自动删除旧端口。仅仅看到新端口监听绝不算验证成功。" || return 1
-            ;;
-        *)
-            echo -e "${RED}[错误]${PLAIN} 无效的 SSH 端口迁移模式。" 
-            return 1
-            ;;
-    esac
+    confirm_safety_prompt "修改 SSH 端口（保留旧端口）" "旧端口会与新端口同时保留；你必须新开终端通过新端口登录成功。之后再次进入本选项并选择 2，才会删除旧端口。" || return 1
 
     read -rp "当前 SSH 端口 ${cur_port}，请输入新端口 [1024-65535]: " new_port
     validate_port "$new_port" || { echo -e "${RED}[错误]${PLAIN} 端口必须在 1024-65535。"; return 1; }
@@ -513,42 +456,26 @@ change_ssh_port() {
         return 1
     fi
 
+    # [安全同步] 若已启用本工具的 F2，迁移期间应同时保护旧/新两个实际 SSH 端口。
+    if command_exists fail2ban-client && [[ -f "$FAIL2BAN_CONFIG" ]] && is_owned "$FAIL2BAN_CONFIG"; then
+        if ! fail2ban_sync_ssh_protection; then
+            echo -e "${YELLOW}[提示]${PLAIN} SSH 双端口已建立，但 Fail2Ban 尚未完成新旧端口同步；后续进入模块 1 会自动重试。"
+        fi
+    fi
+
     state_set ssh_migration_old_port "$cur_port"
     state_set ssh_migration_new_port "$new_port"
-    state_set ssh_migration_mode "$mode"
     log_action "[安全保留] SSH 端口由 ${cur_port} 切换为双端口 ${cur_port},${new_port}；等待新端口真实登录验证。"
     rm -rf "$action_dir"
 
     echo -e "${GREEN}[成功]${PLAIN} SSH 现在同时监听旧端口 ${cur_port} 和新端口 ${new_port}。"
     echo -e "${YELLOW}[重要警告]${PLAIN} 当前连接不要关闭；请新开一个终端，通过 ${new_port} 实际登录 VPS。"
-
-    case "$mode" in
-        1)
-            echo -e "${YELLOW}[必须操作]${PLAIN} 新端口登录成功后，再回到模块 1 → 3 → 选项 3 删除旧端口 ${cur_port}。"
-            echo -e "${YELLOW}[安全说明]${PLAIN} 旧端口现在不会自动删除。"
-            ;;
-        2)
-            if wait_for_new_ssh_session "$new_port" 600; then
-                if ! remove_old_ssh_port "$cur_port" "$new_port" 1; then
-                    echo -e "${YELLOW}[提示]${PLAIN} 已确认新端口真实登录，但旧端口自动删除失败。旧端口会继续保留，请从新端口会话进入选项 3 重试。"
-                    return 1
-                fi
-            else
-                echo -e "${YELLOW}[自动回退]${PLAIN} 600 秒内未检测到新端口 ${new_port} 登录，正在自动恢复旧端口 ${cur_port}。"
-                if cancel_ssh_port_migration 1; then
-                    echo -e "${GREEN}[回退完成]${PLAIN} 已保留旧端口 ${cur_port}，删除新端口 ${new_port}，并恢复旧端口防火墙放行。"
-                else
-                    echo -e "${YELLOW}[提示]${PLAIN} SSH 配置回退或防火墙恢复未完全完成，请检查模块 1 → 3 → 4 的迁移状态。"
-                fi
-                return 1
-            fi
-            ;;
-    esac
+    echo -e "${YELLOW}[必须操作]${PLAIN} 新端口登录成功后，再回到模块 1 → 3 → 选项 2 删除旧端口 ${cur_port}。"
+    echo -e "${YELLOW}[安全说明]${PLAIN} 旧端口现在不会自动删除。"
 }
 
 
 cancel_ssh_port_migration() {
-    local auto_rollback="${1:-0}"
     local old_port new_port current_port backup_dir action_dir backend
     old_port="$(state_get ssh_migration_old_port 2>/dev/null || true)"
     new_port="$(state_get ssh_migration_new_port 2>/dev/null || true)"
@@ -571,11 +498,7 @@ cancel_ssh_port_migration() {
     else
         echo -e "${YELLOW}[提示]${PLAIN} 当前会话不是可识别的旧/新 SSH 端口，将要求你确认是否继续回退。"
     fi
-    if [[ "$auto_rollback" == "1" ]]; then
-        echo -e "${YELLOW}[自动执行]${PLAIN} 未检测到新端口登录，将自动恢复原端口 ${old_port}。"
-    else
-        confirm_safety_prompt "放弃 SSH 端口迁移并恢复原端口" "回退会停止新端口 ${new_port}；如果当前会话来自新端口，当前连接可能会被立即断开。" || return 1
-    fi
+    confirm_safety_prompt "放弃 SSH 端口迁移并恢复原端口" "回退会停止新端口 ${new_port}；如果当前会话来自新端口，当前连接可能会被立即断开。" || return 1
 
     action_dir=$(make_temp_dir ssh-cancel-migration)
     if ! backup_current_ssh_files "$action_dir"; then
@@ -614,9 +537,15 @@ cancel_ssh_port_migration() {
         fi
     fi
 
+    # [安全同步] 回退完成后，F2 重新读取 sshd 实际端口，只保护恢复后的旧端口。
+    if command_exists fail2ban-client && [[ -f "$FAIL2BAN_CONFIG" ]] && is_owned "$FAIL2BAN_CONFIG"; then
+        if ! fail2ban_sync_ssh_protection; then
+            echo -e "${YELLOW}[提示]${PLAIN} SSH 已恢复，但 Fail2Ban 尚未完成端口同步；后续进入模块 1 会自动重试。"
+        fi
+    fi
+
     state_unset ssh_migration_old_port
     state_unset ssh_migration_new_port
-    state_unset ssh_migration_mode
     rm -rf "$action_dir" "$backup_dir"
     log_action "[安全保留] 已放弃 SSH 端口迁移，恢复原端口 ${old_port}。"
     echo -e "${GREEN}[成功]${PLAIN} SSH 端口迁移已取消，当前恢复为原端口 ${old_port}。"
@@ -637,21 +566,18 @@ ssh_port_menu() {
             echo -e "${CYAN}----------------------------------------------------${PLAIN}"
         fi
         echo -e "  ${GREEN}1.${PLAIN} 修改 SSH 端口（保留旧端口）"
-        echo -e "     ${YELLOW}新端口登录成功后，必须回来选择 3 手动删除旧端口。${PLAIN}"
-        echo -e "  ${GREEN}2.${PLAIN} 修改 SSH 端口（新端口真实登录后自动删除旧端口）"
-        echo -e "     ${YELLOW}请新开终端通过新端口登录；如要放弃迁移，可选择 4。${PLAIN}"
-        echo -e "  ${GREEN}3.${PLAIN} 删除已验证的旧 SSH 端口"
+        echo -e "     ${YELLOW}新端口登录成功后，必须回来选择 2 手动删除旧端口。${PLAIN}"
+        echo -e "  ${GREEN}2.${PLAIN} 删除已验证的旧 SSH 端口"
         echo -e "     ${YELLOW}必须同时检测到新旧两个端口正在监听，且当前会话必须通过新端口登录。${PLAIN}"
-        echo -e "  ${GREEN}4.${PLAIN} 放弃本次迁移并恢复原 SSH 端口"
+        echo -e "  ${GREEN}3.${PLAIN} 放弃本次迁移并恢复原 SSH 端口"
         echo -e "     ${YELLOW}用于解除迁移状态卡住的问题；如果当前会话来自新端口，回退可能导致当前连接断开。${PLAIN}"
         echo -e "  ${GREEN}0.${PLAIN} 返回上一级"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请输入选项 [0-4]: " choice
+        read -rp "请输入选项 [0-3]: " choice
         case "$choice" in
-            1) change_ssh_port 1 || true; read -rp "按回车继续..." ;;
-            2) change_ssh_port 2 || true; read -rp "按回车继续..." ;;
-            3) remove_old_ssh_port || true; read -rp "按回车继续..." ;;
-            4) cancel_ssh_port_migration || true; read -rp "按回车继续..." ;;
+            1) change_ssh_port || true; read -rp "按回车继续..." ;;
+            2) remove_old_ssh_port || true; read -rp "按回车继续..." ;;
+            3) cancel_ssh_port_migration || true; read -rp "按回车继续..." ;;
             0) return 0 ;;
             *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
@@ -1132,10 +1058,353 @@ retry_pending_ssh_firewall_cleanup() {
     fi
 }
 
+
+# ========================================================
+# SSH 防爆破保护（Fail2Ban）
+# ========================================================
+# [部分可撤销/安全保留] 本功能仅安装/配置 Fail2Ban 的 SSH 防爆破 jail。
+# 停用时删除本工具自己创建的 jail 配置并停止该 jail；Fail2Ban 软件包本身不会强制卸载，
+# 以免影响用户机器上其它由 Fail2Ban 管理的防护规则。
+FAIL2BAN_JAIL_NAME="${FAIL2BAN_JAIL_NAME:-vps-tool-sshd}"
+FAIL2BAN_CONFIG="${FAIL2BAN_CONFIG:-/etc/fail2ban/jail.d/${FAIL2BAN_JAIL_NAME}.local}"
+
+fail2ban_package_name() {
+    printf '%s\n' "fail2ban"
+}
+
+fail2ban_service_name() {
+    printf '%s\n' "fail2ban"
+}
+
+fail2ban_install_package() {
+    local pkg
+    pkg=$(fail2ban_package_name)
+    check_os || return 1
+    if command_exists fail2ban-client; then
+        return 0
+    fi
+
+    echo -e "${BLUE}[准备]${PLAIN} 未检测到 Fail2Ban，将尝试安装。"
+    case "$PKG_MANAGER" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y "$pkg"
+            ;;
+        dnf|yum)
+            "${PKG_MANAGER}" -y install "$pkg"
+            ;;
+        *)
+            echo -e "${RED}[错误]${PLAIN} 当前系统没有可用的 Fail2Ban 安装方式。"
+            return 1
+            ;;
+    esac
+    command_exists fail2ban-client || {
+        echo -e "${RED}[错误]${PLAIN} Fail2Ban 安装后仍无法找到 fail2ban-client。"
+        return 1
+    }
+}
+
+fail2ban_detect_log_config() {
+    # [兼容性] 优先使用发行版常见认证日志；如果日志只进入 systemd journal，则使用 journal backend。
+    if [[ -f /var/log/auth.log ]]; then
+        printf '%s\n' 'backend = auto' 'logpath = /var/log/auth.log'
+        return 0
+    fi
+    if [[ -f /var/log/secure ]]; then
+        printf '%s\n' 'backend = auto' 'logpath = /var/log/secure'
+        return 0
+    fi
+    if command_exists journalctl; then
+        printf '%s\n' 'backend = systemd' 'journalmatch = _COMM=sshd + _COMM=sshd-session'
+        return 0
+    fi
+    return 1
+}
+
+fail2ban_detect_banaction() {
+    local backend action_file
+    backend=$(firewall_backend)
+    case "$backend" in
+        ufw)
+            action_file="/etc/fail2ban/action.d/ufw.conf"
+            [[ -f "$action_file" ]] && { printf '%s\n' 'banaction = ufw'; return 0; }
+            ;;
+        firewalld)
+            action_file="/etc/fail2ban/action.d/firewallcmd-ipset.conf"
+            [[ -f "$action_file" ]] && { printf '%s\n' 'banaction = firewallcmd-ipset'; return 0; }
+            ;;
+    esac
+
+    # [兼容性] 已启用 UFW/firewalld 时优先使用对应 action；没有已知防火墙后端时交给 Fail2Ban 默认 action。
+    return 0
+}
+
+fail2ban_current_source_ignoreip() {
+    local source_ip=""
+    source_ip=$(ssh_current_source_ip 2>/dev/null || true)
+    if [[ -n "$source_ip" ]]; then
+        printf '%s\n' "127.0.0.1/8 ::1 ${source_ip}"
+    else
+        printf '%s\n' '127.0.0.1/8 ::1'
+    fi
+}
+
+fail2ban_target_ssh_ports() {
+    # [安全真相源] F2 永远保护当前 sshd 实际生效的端口，而不是依赖旧的工具记录。
+    # 迁移期间如果 sshd 同时监听 22/2222，这里会返回 22,2222；旧端口删除后自然只剩新端口。
+    local -a ports=() valid_ports=()
+    local port csv
+    mapfile -t ports < <(get_current_ssh_ports)
+    ((${#ports[@]} > 0)) || return 1
+    for port in "${ports[@]}"; do
+        validate_ssh_port "$port" || continue
+        valid_ports+=("$port")
+    done
+    ((${#valid_ports[@]} > 0)) || return 1
+    csv=$(IFS=,; echo "${valid_ports[*]}")
+    printf '%s\n' "$csv"
+}
+
+validate_fail2ban_port_list() {
+    local csv="$1" port
+    local -a ports=()
+    IFS=',' read -r -a ports <<< "$csv"
+    ((${#ports[@]} > 0)) || return 1
+    for port in "${ports[@]}"; do
+        validate_ssh_port "$port" || return 1
+    done
+}
+
+fail2ban_write_config() {
+    local ssh_ports="$1" tmp log_lines banaction_line ignoreip
+    validate_fail2ban_port_list "$ssh_ports" || return 1
+    mkdir -p "$(dirname "$FAIL2BAN_CONFIG")" || return 1
+
+    if [[ -e "$FAIL2BAN_CONFIG" ]] && ! is_owned "$FAIL2BAN_CONFIG"; then
+        echo -e "${RED}[错误]${PLAIN} 已存在非本工具创建的 Fail2Ban 配置：${FAIL2BAN_CONFIG}"
+        echo -e "${YELLOW}[提示]${PLAIN} 为避免覆盖用户现有防护配置，本工具不会修改它。"
+        return 1
+    fi
+
+    local log_config
+    log_config=$(fail2ban_detect_log_config) || {
+        echo -e "${RED}[错误]${PLAIN} 无法找到 SSH 认证日志或 systemd journal，无法安全配置 Fail2Ban。"
+        return 1
+    }
+    mapfile -t log_lines <<< "$log_config"
+    banaction_line=$(fail2ban_detect_banaction || true)
+    ignoreip=$(fail2ban_current_source_ignoreip)
+    tmp=$(mktemp) || return 1
+
+    {
+        printf '%s\n' "# Managed by VPS-Tool: SSH brute-force protection" \
+            "# [部分可撤销] 删除本文件即可撤销本工具创建的 Fail2Ban SSH jail；Fail2Ban 软件包本身不自动卸载。" \
+            "# [状态同步] port 始终按 sshd 当前实际生效端口同步；迁移期间会同时保护旧/新端口。" \
+            "[${FAIL2BAN_JAIL_NAME}]" \
+            'enabled = true' \
+            'filter = sshd' \
+            "port = ${ssh_ports}" \
+            'findtime = 10m' \
+            'maxretry = 5' \
+            'bantime = 1d' \
+            "ignoreip = ${ignoreip}"
+        printf '%s\n' "${log_lines[@]}"
+        if [[ -n "$banaction_line" ]]; then
+            printf '%s\n' "$banaction_line"
+        fi
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$FAIL2BAN_CONFIG" || { rm -f "$tmp"; return 1; }
+    mark_owned "$FAIL2BAN_CONFIG" || { rm -f "$FAIL2BAN_CONFIG"; return 1; }
+    state_set fail2ban_sshd_config_owned 1
+}
+
+fail2ban_sync_ssh_protection() {
+    # [自动同步] 已启用且由本工具管理的 F2 jail 才允许自动同步；不会安装/接管用户自己的 Fail2Ban 配置。
+    # [迁移安全] 迁移期间实际 sshd 端口集合包含旧+新，因此 F2 同时保护两者；旧端口删除后自动收缩到新端口。
+    local target_ports current_ports backup_tmp=""
+    command_exists fail2ban-client || return 0
+    [[ -f "$FAIL2BAN_CONFIG" ]] || return 0
+    is_owned "$FAIL2BAN_CONFIG" || return 0
+
+    target_ports=$(fail2ban_target_ssh_ports) || return 1
+    current_ports=$(awk -F= '/^[[:space:]]*port[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$FAIL2BAN_CONFIG" 2>/dev/null || true)
+    [[ "$current_ports" == "$target_ports" ]] && { state_unset fail2ban_ssh_sync_pending; return 0; }
+
+    backup_tmp=$(mktemp) || return 1
+    cp -a "$FAIL2BAN_CONFIG" "$backup_tmp" || { rm -f "$backup_tmp"; return 1; }
+    if ! fail2ban_write_config "$target_ports" || ! fail2ban_apply_config; then
+        cp -a "$backup_tmp" "$FAIL2BAN_CONFIG" 2>/dev/null || true
+        rm -f "$backup_tmp"
+        state_set fail2ban_ssh_sync_pending 1
+        echo -e "${YELLOW}[提示]${PLAIN} Fail2Ban 未能同步当前 SSH 端口 ${target_ports}，旧防爆破配置仍保留。"
+        return 1
+    fi
+    rm -f "$backup_tmp"
+    state_unset fail2ban_ssh_sync_pending
+    log_action "[安全同步] Fail2Ban SSH 防爆破端口已同步为 ${target_ports}"
+    echo -e "${GREEN}[F2 同步]${PLAIN} SSH 防爆破已同步保护：${target_ports}/tcp。"
+    return 0
+}
+
+fail2ban_apply_config() {
+    local service
+    service=$(fail2ban_service_name)
+    command_exists fail2ban-client || return 1
+
+    if ! fail2ban-client -t >/dev/null 2>&1; then
+        echo -e "${RED}[错误]${PLAIN} Fail2Ban 配置检查失败，已拒绝启动新的 SSH 防护。"
+        return 1
+    fi
+
+    systemctl enable --now "$service" >/dev/null 2>&1 || {
+        echo -e "${RED}[错误]${PLAIN} 无法启动 Fail2Ban 服务。"
+        return 1
+    }
+    fail2ban-client reload >/dev/null 2>&1 || {
+        echo -e "${RED}[错误]${PLAIN} Fail2Ban 重载失败。"
+        return 1
+    }
+    fail2ban-client status "$FAIL2BAN_JAIL_NAME" >/dev/null 2>&1 || {
+        echo -e "${RED}[错误]${PLAIN} SSH 防爆破 jail 未成功启用。"
+        return 1
+    }
+}
+
+fail2ban_enable_ssh_protection() {
+    local ssh_ports old_config config_created=0 backup_tmp=""
+    check_os || return 1
+    ssh_ports=$(fail2ban_target_ssh_ports) || {
+        echo -e "${RED}[错误]${PLAIN} 无法可靠确定当前 SSH 端口，暂不启用 Fail2Ban。"
+        return 1
+    }
+
+    echo -e "${CYAN}[当前策略]${PLAIN} SSH 失败 ${YELLOW}5 次 / 10 分钟${PLAIN} → 封禁 ${YELLOW}1 天${PLAIN}。"
+    echo -e "${BLUE}[说明]${PLAIN} 作用：连续登录失败的来源 IP 会被临时封禁，减少 SSH 爆破干扰。"
+    echo -e "${YELLOW}[安全提示]${PLAIN} 当前 SSH 来源 IP 会加入忽略列表，避免误封本次管理连接。"
+    if ! confirm_safety_prompt "启用 SSH 防爆破保护" "Fail2Ban 将监控当前 SSH 认证失败并自动封禁高频失败来源。默认 5 次/10 分钟封禁 1 天；封禁按来源 IP 生效。"; then
+        return 1
+    fi
+
+    fail2ban_install_package || return 1
+
+    old_config=0
+    if [[ -f "$FAIL2BAN_CONFIG" ]]; then
+        old_config=1
+        if ! is_owned "$FAIL2BAN_CONFIG"; then
+            echo -e "${RED}[错误]${PLAIN} 已存在非本工具创建的 Fail2Ban 配置，拒绝覆盖。"
+            return 1
+        fi
+        backup_tmp=$(mktemp) || return 1
+        cp -a "$FAIL2BAN_CONFIG" "$backup_tmp" || { rm -f "$backup_tmp"; return 1; }
+    fi
+    if ! fail2ban_write_config "$ssh_ports"; then
+        rm -f "$backup_tmp"
+        return 1
+    fi
+    config_created=1
+
+    if ! fail2ban_apply_config; then
+        if (( old_config == 1 )); then
+            cp -a "$backup_tmp" "$FAIL2BAN_CONFIG" 2>/dev/null || true
+            mark_owned "$FAIL2BAN_CONFIG" || true
+            state_set fail2ban_sshd_config_owned 1
+        else
+            rm -f "$FAIL2BAN_CONFIG"
+            unmark_owned "$FAIL2BAN_CONFIG"
+            state_unset fail2ban_sshd_config_owned
+        fi
+        rm -f "$backup_tmp"
+        return 1
+    fi
+    rm -f "$backup_tmp"
+
+    echo -e "${GREEN}[完成]${PLAIN} SSH 防爆破已启用：5 次失败 / 10 分钟，封禁 1 天。"
+    echo -e "${BLUE}[状态]${PLAIN} 当前保护端口：${ssh_ports}/tcp | jail：${FAIL2BAN_JAIL_NAME}"
+    log_action "[安全保留] 启用 Fail2Ban SSH 防爆破（5/10m，ban=1d，port=${ssh_ports})"
+}
+
+fail2ban_show_ssh_status() {
+    fail2ban_sync_ssh_protection || true
+    if ! command_exists fail2ban-client; then
+        echo -e "${YELLOW}[状态]${PLAIN} 尚未安装 Fail2Ban。"
+        return 1
+    fi
+    if ! fail2ban-client status "$FAIL2BAN_JAIL_NAME" 2>/dev/null; then
+        echo -e "${YELLOW}[状态]${PLAIN} SSH 防爆破 jail 当前未启用。"
+        return 1
+    fi
+}
+
+fail2ban_unban_ssh_ip() {
+    local ip
+    command_exists fail2ban-client || { echo -e "${YELLOW}[提示]${PLAIN} Fail2Ban 尚未安装。"; return 1; }
+    read -rp "输入要解除封禁的 IPv4/IPv6 地址：" ip
+    [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || { echo -e "${RED}[错误]${PLAIN} IP 地址格式不正确。"; return 1; }
+    fail2ban-client set "$FAIL2BAN_JAIL_NAME" unbanip "$ip" >/dev/null 2>&1 || {
+        echo -e "${RED}[错误]${PLAIN} 未能解除 ${ip} 的封禁，请检查它是否在当前 jail 中。"
+        return 1
+    }
+    echo -e "${GREEN}[完成]${PLAIN} 已请求解除 ${ip} 的封禁。"
+}
+
+fail2ban_disable_ssh_protection() {
+    if ! command_exists fail2ban-client; then
+        state_unset fail2ban_sshd_config_owned
+        return 0
+    fi
+    if [[ -f "$FAIL2BAN_CONFIG" ]] && ! is_owned "$FAIL2BAN_CONFIG"; then
+        echo -e "${RED}[错误]${PLAIN} 当前配置并非本工具创建，拒绝自动删除。"
+        return 1
+    fi
+    confirm_safety_prompt "停用 SSH 防爆破保护" "作用：停止本工具创建的 SSH Fail2Ban jail；不会卸载 Fail2Ban 软件，也不会删除其它 jail。" || return 1
+    fail2ban-client stop "$FAIL2BAN_JAIL_NAME" >/dev/null 2>&1 || true
+    if [[ -f "$FAIL2BAN_CONFIG" ]]; then
+        rm -f "$FAIL2BAN_CONFIG" || return 1
+        unmark_owned "$FAIL2BAN_CONFIG"
+    fi
+    state_unset fail2ban_sshd_config_owned
+    fail2ban-client reload >/dev/null 2>&1 || true
+    echo -e "${GREEN}[完成]${PLAIN} 本工具创建的 SSH 防爆破 jail 已停用。Fail2Ban 软件包保留，便于其它防护继续使用。"
+    log_action "[安全保留] 停用本工具的 Fail2Ban SSH 防爆破 jail"
+}
+
+ssh_bruteforce_menu() {
+    # [部分可撤销/安全保留] 本菜单只管理本工具创建的 Fail2Ban SSH jail；不会强制接管用户已有的其它 jail。
+    while true; do
+        fail2ban_sync_ssh_protection || true
+        clear
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "${CYAN}              [SSH 防爆破保护] Fail2Ban              ${PLAIN}"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "  当前策略: ${YELLOW}10 分钟内失败 5 次 → 封禁 1 天${PLAIN}"
+        echo -e "  ${GREEN}1.${PLAIN} 启用/更新 SSH 防爆破"
+        echo -e "  ${GREEN}2.${PLAIN} 查看防爆破状态"
+        echo -e "  ${GREEN}3.${PLAIN} 解除指定 IP 封禁"
+        echo -e "  ${GREEN}4.${PLAIN} 停用本工具的 SSH 防爆破"
+        echo -e "  ${RED}0.${PLAIN} 返回"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        read -rp "请输入选项 [0-4]: " choice
+        case "$choice" in
+            1) fail2ban_enable_ssh_protection || true; read -rp "按回车继续..." ;;
+            2) clear; fail2ban_show_ssh_status || true; read -rp "按回车继续..." ;;
+            3) fail2ban_unban_ssh_ip || true; read -rp "按回车继续..." ;;
+            4) fail2ban_disable_ssh_protection || true; read -rp "按回车继续..." ;;
+            0) return 0 ;;
+            *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
+        esac
+    done
+}
+
 security_menu() {
     check_os || return 1
     while true; do
         retry_pending_ssh_firewall_cleanup || true
+        if command_exists fail2ban-client && [[ -f "$FAIL2BAN_CONFIG" ]] && is_owned "$FAIL2BAN_CONFIG"; then
+            fail2ban_sync_ssh_protection || true
+        fi
         clear
         local cur_port
         cur_port=$(get_current_ssh_port)
@@ -1150,10 +1419,11 @@ security_menu() {
         echo -e "  ${YELLOW}4.${PLAIN} 防火墙基线与端口管理             ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
         echo -e "  ${YELLOW}5.${PLAIN} 部署密钥认证并关闭密码         ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
         echo -e "  ${YELLOW}6.${PLAIN} 查看/管理已放行端口               ${GREEN}[本机规则可撤销]${PLAIN}"
+        echo -e "  ${YELLOW}7.${PLAIN} SSH 防爆破保护（Fail2Ban）        ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
         echo -e "  ----------------------------------------------------"
         echo -e "  ${RED}0.${PLAIN} 返回主菜单"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请输入选项 [0-6]: " choice
+        read -rp "请输入选项 [0-7]: " choice
         case "$choice" in
             1) sys_full_upgrade || true; read -rp "按回车继续..." ;;
             2) sys_security_upgrade || true; read -rp "按回车继续..." ;;
@@ -1161,6 +1431,7 @@ security_menu() {
             4) setup_firewall || true; read -rp "按回车继续..." ;;
             5) setup_ssh_key_auth || true; read -rp "按回车继续..." ;;
             6) firewall_port_manager_menu || true ;;
+            7) ssh_bruteforce_menu || true ;;
             0) break ;;
             *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
