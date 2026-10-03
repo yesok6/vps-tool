@@ -554,11 +554,19 @@ cancel_ssh_port_migration() {
 
 ssh_success_login_entries() {
     # [只读/可完全撤销] 只读取系统已有 SSH 成功登录记录，不修改 SSH、防火墙或 F2。
-    local journal_line journal_entries file_line
+    # 为避免读取整个 systemd journal 导致卡顿，仅扫描 SSH 服务最近 5000 条日志；
+    # journal 无有效 SSH 登录记录时，再回退到 auth.log/secure。
+    local journal_line journal_entries file_line login_count=0
     if command_exists journalctl; then
-        journal_line=$(journalctl --no-pager -o short-iso 2>/dev/null || true)
+        journal_line=$(journalctl --no-pager -o short-iso \
+            -u ssh.service -u sshd.service -n 5000 2>/dev/null || true)
         if [[ -n "$journal_line" ]]; then
-            journal_entries=$(awk 'index($0,"sshd") && $0 ~ /Accepted (password|publickey|keyboard-interactive)/ {
+            # 先估算最近记录中的 SSH 成功登录数量；数量较多时提前告知用户，避免看起来像程序卡死。
+            login_count=$(awk '$0 ~ /sshd[^:]*:.*Accepted (password|publickey|keyboard-interactive)/ {count++} END {print count+0}' <<< "$journal_line")
+            if (( login_count >= 500 )); then
+                echo -e "${YELLOW}[提示]${PLAIN} 最近 5000 条 SSH 日志中约有 ${login_count} 条成功登录记录，正在整理并合并重复 IP，可能需要一些时间..." >&2
+            fi
+            journal_entries=$(awk '$0 ~ /sshd[^:]*:.*Accepted (password|publickey|keyboard-interactive)/ {
                 ip="";
                 for (i=1; i<NF; i++) if ($i=="from") { ip=$(i+1); break }
                 if (ip!="") print $1 "|" ip
@@ -583,30 +591,66 @@ ssh_success_login_entries() {
 
 show_successful_ssh_login_ips() {
     local -a entries=()
-    local line rank stamp ip count
+    local line rank stamp ip count page=0 page_size=10 total_pages start end choice
     mapfile -t entries < <(ssh_success_login_entries | awk -F'|' '{ip=$2; if (!(ip in latest) || $1 > latest[ip]) latest[ip]=$1; count[ip]++} END {for (ip in latest) print latest[ip] "|" ip "|" count[ip]}' | sort -t'|' -k1,1r)
 
-    clear
-    echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${CYAN}             [SSH 成功登录来源 IP]                 ${PLAIN}"
-    echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${BLUE}[说明]${PLAIN} 重复 IP 已合并，按最近一次成功登录时间从近到远排列。"
-    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    if ((${#entries[@]} == 0)); then
-        echo -e "${YELLOW}暂无可读取的 SSH 成功登录记录。${PLAIN}"
-    else
+    while true; do
+        clear
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "${CYAN}             [SSH 成功登录来源 IP]                 ${PLAIN}"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "${BLUE}[说明]${PLAIN} 重复 IP 已合并，按最近一次成功登录时间从近到远排列。"
+        echo -e "${BLUE}[范围]${PLAIN} 读取最近 5000 条 SSH 服务日志。"
+        echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+        if ((${#entries[@]} == 0)); then
+            echo -e "${YELLOW}暂无可读取的 SSH 成功登录记录。${PLAIN}"
+            echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+            read -rp "按回车返回..."
+            return 0
+        fi
+
+        total_pages=$(( (${#entries[@]} + page_size - 1) / page_size ))
+        if (( page >= total_pages )); then
+            page=$((total_pages - 1))
+        fi
+        start=$((page * page_size))
+        end=$((start + page_size))
+        if (( end > ${#entries[@]} )); then
+            end=${#entries[@]}
+        fi
+
         printf '%-4s %-22s %-40s %s\n' '序号' '最近登录' 'IP 地址' '登录次数'
-        rank=1
-        for line in "${entries[@]}"; do
+        for ((rank=start+1; rank<=end; rank++)); do
+            line=${entries[rank-1]}
             stamp=${line%%|*}
             ip=${line#*|}; ip=${ip%%|*}
             count=${line##*|}
             printf '%-4s %-22s %-40s %s\n' "$rank" "$stamp" "$ip" "$count"
-            rank=$((rank + 1))
         done
-    fi
-    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    read -rp "按回车返回..."
+        echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e "第 $((page + 1)) / ${total_pages} 页，共 ${#entries[@]} 个 IP"
+        if (( total_pages > 1 )); then
+            echo -e "${GREEN}n${PLAIN}. 下一页   ${GREEN}p${PLAIN}. 上一页   ${GREEN}q${PLAIN}. 返回"
+            read -rp "请选择：[n/p/q] " choice
+            case "${choice,,}" in
+                n)
+                    if (( page < total_pages - 1 )); then
+                        page=$((page + 1))
+                    fi
+                    ;;
+                p)
+                    if (( page > 0 )); then
+                        page=$((page - 1))
+                    fi
+                    ;;
+                q|0) return 0 ;;
+                *) ;;
+            esac
+        else
+            read -rp "按回车返回..."
+            return 0
+        fi
+    done
 }
 
 ssh_port_menu() {
@@ -1441,8 +1485,7 @@ fail2ban_recent_banned_ips() {
 
 fail2ban_show_ssh_status() {
     local target_ports current_banned total_banned
-    local -a banned_ips=() recent_ips=()
-    fail2ban_sync_ssh_protection || true
+    target_ports=$(fail2ban_target_ssh_ports 2>/dev/null || echo '未知')
     clear
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${CYAN}              [SSH 防爆破状态]                     ${PLAIN}"
@@ -1453,49 +1496,78 @@ fail2ban_show_ssh_status() {
         return 1
     fi
     if ! fail2ban-client status "$FAIL2BAN_JAIL_NAME" >/dev/null 2>&1; then
-        target_ports=$(fail2ban_target_ssh_ports 2>/dev/null || echo '未知')
         echo -e "${YELLOW}[状态]${PLAIN} SSH 防爆破当前未启用。"
-        echo -e "${BLUE}[保护端口]${PLAIN} ${target_ports}/tcp"
+        echo -e "${BLUE}[当前应保护端口]${PLAIN} ${target_ports}/tcp"
         return 1
     fi
 
-    target_ports=$(fail2ban_target_ssh_ports 2>/dev/null || echo '未知')
     current_banned=$(fail2ban_current_ban_summary | head -n1)
     total_banned=$(fail2ban_total_ban_actions | head -n1)
-    mapfile -t banned_ips < <(fail2ban_current_banned_ips)
-    mapfile -t recent_ips < <(fail2ban_recent_banned_ips)
-
     echo -e "${GREEN}[运行状态]${PLAIN} SSH 防爆破已启用"
     echo -e "${BLUE}[当前保护端口]${PLAIN} ${target_ports}/tcp"
     echo -e "${BLUE}[策略]${PLAIN} 10 分钟内失败 5 次 → 封禁 1 天"
+    echo -e "${BLUE}[当前封禁 IP]${PLAIN} ${current_banned:-0}"
+    echo -e "${BLUE}[累计封禁次数]${PLAIN} ${total_banned:-0}"
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    echo -e "${GREEN}一、当前封禁 IP 总数${PLAIN}: ${current_banned:-0}"
-    echo -e "${GREEN}累计封禁次数${PLAIN}: ${total_banned:-0}"
+    echo -e "  ${GREEN}1.${PLAIN} 查看当前封禁 IP 总数"
+    echo -e "  ${GREEN}2.${PLAIN} 查看近 5 分钟新封禁 IP"
+    echo -e "  ${GREEN}3.${PLAIN} 查看当前封禁 IP 详细"
+    echo -e "  ${GREEN}0.${PLAIN} 返回 F2 菜单"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    read -rp "请输入选项 [0-3]: " choice
+    case "$choice" in
+        1)
+            clear
+            echo -e "${CYAN}====================================================${PLAIN}"
+            echo -e "${CYAN}              [当前封禁 IP 总数]                   ${PLAIN}"
+            echo -e "${CYAN}====================================================${PLAIN}"
+            echo -e "${GREEN}当前封禁 IP：${PLAIN}${current_banned:-0}"
+            echo -e "${GREEN}累计封禁次数：${PLAIN}${total_banned:-0}"
+            echo -e "${BLUE}当前保护端口：${PLAIN}${target_ports}/tcp"
+            ;;
+        2)
+            clear
+            echo -e "${CYAN}====================================================${PLAIN}"
+            echo -e "${CYAN}              [近 5 分钟新封禁 IP]                 ${PLAIN}"
+            echo -e "${CYAN}====================================================${PLAIN}"
+            local -a recent_ips=()
+            mapfile -t recent_ips < <(fail2ban_recent_banned_ips)
+            if ((${#recent_ips[@]} == 0)); then
+                echo -e "${YELLOW}近 5 分钟没有新的封禁记录。${PLAIN}"
+            else
+                local i=1 entry stamp ip
+                for entry in "${recent_ips[@]}"; do
+                    stamp=${entry%%|*}
+                    ip=${entry#*|}
+                    printf '  %s. %s  %s\\n' "$i" "$stamp" "$ip"
+                    i=$((i+1))
+                done
+            fi
+            ;;
+        3)
+            clear
+            echo -e "${CYAN}====================================================${PLAIN}"
+            echo -e "${CYAN}              [当前封禁 IP 详细]                   ${PLAIN}"
+            echo -e "${CYAN}====================================================${PLAIN}"
+            local -a banned_ips=()
+            mapfile -t banned_ips < <(fail2ban_current_banned_ips)
+            if ((${#banned_ips[@]} == 0)); then
+                echo -e "${YELLOW}暂无当前封禁 IP。${PLAIN}"
+            else
+                local i=1 ip
+                for ip in "${banned_ips[@]}"; do
+                    printf '  %s. %s\\n' "$i" "$ip"
+                    i=$((i+1))
+                done
+            fi
+            ;;
+        0) return 0 ;;
+        *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; return 1 ;;
+    esac
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    echo -e "${GREEN}二、近 5 分钟新封禁 IP${PLAIN}:"
-    if ((${#recent_ips[@]} == 0)); then
-        echo -e "  ${YELLOW}暂无${PLAIN}"
-    else
-        local i=1 entry stamp ip
-        for entry in "${recent_ips[@]}"; do
-            stamp=${entry%%|*}; ip=${entry#*|}
-            printf '  %s. %s  %s\n' "$i" "$stamp" "$ip"
-            i=$((i+1))
-        done
-    fi
-    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    echo -e "${GREEN}三、当前封禁 IP 详细${PLAIN}:"
-    if ((${#banned_ips[@]} == 0)); then
-        echo -e "  ${YELLOW}暂无当前封禁 IP${PLAIN}"
-    else
-        local i=1 ip
-        for ip in "${banned_ips[@]}"; do
-            printf '  %s. %s\n' "$i" "$ip"
-            i=$((i+1))
-        done
-    fi
-    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    read -rp "按回车返回 F2 菜单..."
 }
+
 
 fail2ban_unban_ssh_ip() {
     local ip
