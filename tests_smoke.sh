@@ -233,7 +233,7 @@ grep -qF 'return 1' "$ROOT/modules/ip_test.sh"
 
 
 # 24. round22 补丁：版本号提升到 2.4.0；协议监听优先取 config.json，且不依赖 ss 固定字段号。
-grep -q '^CURRENT_VERSION="2.4.0"$' "$ROOT/install.sh"
+grep -q '^CURRENT_VERSION="2.5.0"$' "$ROOT/install.sh"
 grep -qF 'port=$(jq -r --arg tag "${name}-in"' "$ROOT/modules/protocol.sh"
 grep -qF 'for (i = 1; i <= NF; i++)' "$ROOT/modules/protocol.sh"
 ! grep -qF '$5 ~ p' "$ROOT/modules/protocol.sh"
@@ -903,3 +903,35 @@ echo 'smoke tests: OK'
     rm -f "$tmp_checksum"
     unset VPS_TOOL_SKIP_SINGBOX_VERIFY
 )
+
+
+# 57. Round25：sing-box systemd 加固必须允许 AF_NETLINK，并限制失败重试。
+grep -q '^RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK$' "$ROOT/modules/protocol.sh"
+grep -q '^StartLimitIntervalSec=300$' "$ROOT/modules/protocol.sh"
+grep -q '^StartLimitBurst=5$' "$ROOT/modules/protocol.sh"
+grep -q 'VPS_TOOL_SERVICE_HARDENING' "$ROOT/modules/protocol.sh"
+
+# 58. Round25：/etc/vps-tool 必须可穿越，但 state/backups 保持 0700。
+grep -q '^chmod 711 "${VPS_TOOL_ETC}"' "$ROOT/lib/common.sh"
+grep -q '^chmod 700 "${VPS_TOOL_STATE}" "${VPS_TOOL_BACKUPS}"' "$ROOT/lib/common.sh"
+grep -q '^chmod 711 "$LOG_DIR" || true$' "$ROOT/install.sh"
+! grep -q '^chmod 700 "${VPS_TOOL_ETC}"' "$ROOT/lib/common.sh"
+
+# 59. Round25：同步包不得重新安装明显过旧的 security.sh。
+grep -q 'firewall_port_has_service_rule' "$ROOT/modules/security.sh"
+grep -q '\[P0 安全闸门\]' "$ROOT/modules/security.sh"
+grep -q '下载到的 modules/security.sh 不是当前兼容版本' "$ROOT/install.sh"
+
+# 60. Round25：真实启动失败必须输出 journalctl 排障命令。
+grep -q 'journalctl -u "\$SERVICE_UNIT" -n 20 --no-pager -l' "$ROOT/modules/protocol.sh"
+grep -q 'journalctl -u \${SERVICE_UNIT} -n 50 --no-pager -l' "$ROOT/modules/protocol.sh"
+
+# 61. Round25：启动验证不能再只 sleep 1 秒。
+! grep -q '^    sleep 1$' "$ROOT/modules/protocol.sh"
+grep -q 'attempt = 1; attempt <= 20' "$ROOT/modules/protocol.sh"
+grep -q 'sleep 0.5' "$ROOT/modules/protocol.sh"
+
+# 62. Round25：失败回滚必须 stop/reset-failed，不能立即 restart 进入循环。
+grep -q 'systemctl stop "\$SERVICE_UNIT"' "$ROOT/modules/protocol.sh"
+grep -q 'systemctl reset-failed "\$SERVICE_UNIT"' "$ROOT/modules/protocol.sh"
+! grep -q 'systemctl restart "\$SERVICE_UNIT" >/dev/null 2>&1 || true' "$ROOT/modules/protocol.sh"
