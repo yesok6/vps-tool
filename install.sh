@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # 系统与高亮配色配置
 # ========================================================
 export LANG="${LANG:-C.UTF-8}"
-CURRENT_VERSION="2.3.0"
+CURRENT_VERSION="2.4.0"
 # GitHub 仓库配置
 GITHUB_USER="yesok6"
 GITHUB_REPO="vps-tool"
