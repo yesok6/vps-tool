@@ -102,7 +102,7 @@ bash <(curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/yesok6/v
 
 - **VLESS + Reality**：TCP + Reality，适合常规网页/流式代理场景。Reality 密钥由 sing-box 生成，服务端不会保存客户端私钥。
 - **Hysteria 2**：QUIC/UDP，当前实现使用本工具生成的自签名证书，因此分享链接带 `insecure=1`。这能正常建立连接，但没有公网 CA 证书提供的服务器身份校验。
-- **TUIC v5**：QUIC/UDP，默认 `udp_relay_mode=native`、`congestion_control=bbr`、`zero_rtt_handshake=false`、`alpn=h3`，更适合需要大量 UDP 流量的实时应用，例如游戏。TUIC 的原生 UDP 中继不会把 UDP 再套进 QUIC stream，避免额外的无损流式封装开销；同时关闭 0-RTT 以避免其重放攻击风险。
+- **TUIC v5**：QUIC/UDP，默认 `udp_relay_mode=native`、`congestion_control=bbr`、`zero_rtt_handshake=false`、`alpn=h3`，更适合需要大量 UDP 流量的实时应用，例如游戏。 分享链接采用标准 `tuic://` URI；其中 `allow_insecure=1` 用于兼容本工具生成的自签名证书与当前 v2rayN 的 TUIC URI 解析。TUIC 的原生 UDP 中继不会把 UDP 再套进 QUIC stream，避免额外的无损流式封装开销；同时关闭 0-RTT 以避免其重放攻击风险。
 
 > 注意：TUIC/Hysteria 2 都依赖 UDP。除了 VPS 本机防火墙外，还需要确认云厂商安全组允许对应 UDP 端口。游戏实际延迟还受线路、运营商、服务端距离和游戏服务器位置影响，协议本身不保证固定低延迟。
 
