@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # 系统与高亮配色配置
 # ========================================================
 export LANG="${LANG:-C.UTF-8}"
-CURRENT_VERSION="2.6.0"
+CURRENT_VERSION="2.9.1"
 # GitHub 仓库配置
 GITHUB_USER="yesok6"
 GITHUB_REPO="vps-tool"
@@ -93,16 +93,20 @@ sync_bundle() (
     for name in security protocol optimize apps ip_test; do
         download_one "modules/${name}.sh"
     done
+    download_one "protocol_catalog.json"
 
     for file in "${temp}/install.sh" "${temp}/lib/common.sh" "${temp}"/modules/*.sh; do
         bash -n "$file"
     done
+    if ! jq -e '(.schema_version | type == "number") and (.tool_version | type == "string") and (.protocols | type == "array") and all(.protocols[]; (.id | type == "string") and (.name | type == "string") and (.adapter_version | type == "number") and (.status | type == "string") and (.implemented | type == "boolean"))' "${temp}/protocol_catalog.json" >/dev/null 2>&1; then
+        echo -e "${RED}[错误]${PLAIN} 下载到的 protocol_catalog.json 格式无效，已拒绝更新。"
+        return 1
+    fi
 
     # 防止“版本号正确但关键 security.sh 实际仍是旧版”再次进入本机。
-    # 当前版本的安全模块必须包含 round19+ 的 P0 防失联闸门与精确规则判断。
-    if ! grep -q 'firewall_port_has_service_rule' "${temp}/modules/security.sh" || \
-       ! grep -q '\[P0 安全闸门\]' "${temp}/modules/security.sh"; then
-        echo -e "${RED}[错误]${PLAIN} 下载到的 modules/security.sh 不是当前兼容版本，拒绝覆盖本机安全模块。"
+    # 不依赖中文注释文本，只检查关键函数是否存在，避免未来正常改文案导致误报。
+    if ! grep -Eq '^firewall_port_has_service_rule[[:space:]]*\(\)' "${temp}/modules/security.sh"; then
+        echo -e "${RED}[错误]${PLAIN} 下载到的 modules/security.sh 缺少关键防火墙归属函数，拒绝覆盖本机安全模块。"
         return 1
     fi
 
@@ -119,6 +123,7 @@ sync_bundle() (
     for name in security protocol optimize apps ip_test; do
         install -m 755 "${temp}/modules/${name}.sh" "${LOCAL_MODULES}/${name}.sh"
     done
+    install -m 644 "${temp}/protocol_catalog.json" "${LOCAL_ROOT}/protocol_catalog.json"
     printf '%s\n' "$remote_version" > "${LOCAL_ROOT}/VERSION"
     chmod 644 "${LOCAL_ROOT}/VERSION"
     log_action "[安装/更新] 本地工具包同步完成，版本=${remote_version}"
@@ -214,6 +219,8 @@ load_module() {
 }
 
 update_tool() {
+    local reexec=1
+    [[ "${1:-}" == "--return" ]] && reexec=0
     clear
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${CYAN}                 [在线更新]                        ${PLAIN}"
@@ -243,8 +250,11 @@ update_tool() {
         return 1
     fi
     echo -e "${GREEN}[成功]${PLAIN} 更新包已完成语法检查并安装到 ${LOCAL_ROOT}。"
-    sleep 1
-    exec "${LOCAL_ROOT}/install.sh"
+    if (( reexec )); then
+        sleep 1
+        exec "${LOCAL_ROOT}/install.sh"
+    fi
+    log_action "[在线更新] 由模块 2 触发更新后返回调用方"
 }
 
 uninstall_everything() {
@@ -339,6 +349,10 @@ main_menu() {
 
 
 install_dependencies
+if [[ "${1:-}" == "--update-return" ]]; then
+    update_tool --return
+    exit $?
+fi
 current_script_path=$(readlink -f -- "${BASH_SOURCE[0]}") || current_script_path="${BASH_SOURCE[0]}"
 local_install_path=$(readlink -f -- "${LOCAL_ROOT}/install.sh") || local_install_path="${LOCAL_ROOT}/install.sh"
 if [[ "$current_script_path" != "$local_install_path" ]]; then
