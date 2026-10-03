@@ -40,6 +40,13 @@ grep -q '系统清理与还原审计' "$ROOT/install.sh"
 # 6. Hysteria2 证书/私钥必须记录为本工具创建的资源，以便精确清理。
 grep -q 'mark_owned "$cert_file"' "$ROOT/modules/protocol.sh"
 grep -q 'mark_owned "$key_file"' "$ROOT/modules/protocol.sh"
+# 6b. TUIC v5 必须使用原生 UDP、关闭 0-RTT，并记录证书/私钥所有权。
+grep -q '^deploy_tuic_v5()' "$ROOT/modules/protocol.sh"
+grep -q 'udp_relay_mode=native' "$ROOT/modules/protocol.sh"
+grep -q 'zero_rtt_handshake:false' "$ROOT/modules/protocol.sh"
+grep -q 'congestion_control:"bbr"' "$ROOT/modules/protocol.sh"
+grep -q 'tuic_cert.pem' "$ROOT/modules/protocol.sh"
+grep -q 'tuic_key.pem' "$ROOT/modules/protocol.sh"
 
 # 7. install_singbox 不应使用 EXIT trap 依赖函数局部临时目录。
 ! awk '/install_singbox\(\)/,/^}/ { if ($0 ~ /trap .*EXIT/) found=1 } END { exit found ? 0 : 1 }' "$ROOT/modules/protocol.sh"
@@ -56,6 +63,9 @@ grep -q 'remote.*=~' "$ROOT/install.sh"
 # 10. 流水线协议部署必须跳过端口交互式输入。
 grep -q -- '--pipeline-reality) deploy_vless_reality pipeline' "$ROOT/modules/protocol.sh"
 grep -q '无需手动输入' "$ROOT/modules/protocol.sh"
+# 10b. 模块二菜单必须暴露 TUIC v5。
+grep -q '3\. TUIC v5' "$ROOT/modules/protocol.sh"
+grep -q 'deploy_tuic_v5 || true' "$ROOT/modules/protocol.sh"
 
 # 11. 防火墙回滚统一走 firewall_remove_owned_rules，兼容单条与全部清理。
 grep -q '^firewall_remove_owned_rule()' "$ROOT/lib/common.sh"
@@ -150,7 +160,59 @@ printf '1\n\n0\n' | bash -c '
     ip_test_menu >/dev/null 2>&1
 ' _ "$ROOT/modules/ip_test.sh"
 
-# 20. 本测试脚本本身不允许留下真实 VPS 工具状态目录。
+# 20. 增项 1：多协议片段化/共存/单协议移除/损坏片段不得覆盖旧 config。
+grep -q '^write_protocol_fragment()' "$ROOT/modules/protocol.sh"
+grep -q '^regenerate_singbox_config()' "$ROOT/modules/protocol.sh"
+grep -q '^remove_protocol_fragment()' "$ROOT/modules/protocol.sh"
+grep -q 'node_info_vless.txt' "$ROOT/modules/protocol.sh"
+grep -q 'node_info_hy2.txt' "$ROOT/modules/protocol.sh"
+grep -q 'node_info_tuic.txt' "$ROOT/modules/protocol.sh"
+grep -q 'state_set protocol_vless' "$ROOT/modules/protocol.sh"
+grep -q 'state_set protocol_hy2' "$ROOT/modules/protocol.sh"
+grep -q 'state_set protocol_tuic' "$ROOT/modules/protocol.sh"
+grep -q 'remove_protocol_menu' "$ROOT/modules/protocol.sh"
+(
+    proto_test_root=$(mktemp -d /tmp/vps-tool-protocol-smoke.XXXXXX)
+    trap 'rm -rf "$proto_test_root"' EXIT
+    export VPS_TOOL_ROOT="$proto_test_root/root"
+    export VPS_TOOL_ETC="$proto_test_root/etc"
+    export VPS_TOOL_STATE="$proto_test_root/state"
+    export VPS_TOOL_BACKUPS="$proto_test_root/backups"
+    export VPS_TOOL_LOG="$proto_test_root/install.log"
+    mkdir -p "$VPS_TOOL_ROOT" "$VPS_TOOL_ETC" "$VPS_TOOL_STATE" "$VPS_TOOL_BACKUPS"
+    source "$ROOT/modules/protocol.sh"
+    CONF_DIR="$proto_test_root/sing-box"
+    CONF_FILE="$CONF_DIR/config.json"
+    NODE_INFO_FILE="$CONF_DIR/node_info.txt"
+    SERVICE_FILE="$proto_test_root/vps-tool-sing-box.service"
+    mkdir -p "$CONF_DIR"
+    chown(){ :; }
+    systemctl(){ case "$1" in is-active|is-enabled) return 1 ;; stop|disable|daemon-reload) return 0 ;; *) return 0 ;; esac; }
+
+    vless_fragment='{"type":"vless","tag":"vless-in","listen":"::","listen_port":10001,"users":[],"tls":{"enabled":true}}'
+    hy2_fragment='{"type":"hysteria2","tag":"hy2-in","listen":"::","listen_port":10002,"users":[],"tls":{"enabled":true}}'
+    write_protocol_fragment vless "$vless_fragment"
+    is_owned "$CONF_DIR/vless.json"
+    regenerate_singbox_config
+    write_protocol_fragment hy2 "$hy2_fragment"
+    regenerate_singbox_config
+    [[ $(jq '[.inbounds[].tag] | length' "$CONF_FILE") -eq 2 ]]
+    jq -e '([.inbounds[].tag] | sort) == ["hy2-in","vless-in"]' "$CONF_FILE" >/dev/null
+    remove_protocol_fragment hy2
+    jq -e '([.inbounds[].tag] | . == ["vless-in"])' "$CONF_FILE" >/dev/null
+    [[ -f "$CONF_DIR/vless.json" ]]
+    [[ ! -f "$CONF_DIR/hy2.json" ]]
+
+    cp "$CONF_FILE" "$proto_test_root/config-good.json"
+    printf '%s\n' '{bad-json' > "$CONF_DIR/vless.json"
+    if regenerate_singbox_config >/dev/null 2>&1; then
+        echo 'corrupt protocol fragment unexpectedly returned success' >&2
+        exit 1
+    fi
+    cmp -s "$CONF_FILE" "$proto_test_root/config-good.json"
+)
+
+# 20b. 本测试脚本本身不允许留下真实 VPS 工具状态目录。
 [[ ! -e /etc/vps-tool/smoke-test-marker ]]
 
 
@@ -168,18 +230,59 @@ grep -qF '[取消]${PLAIN} 未执行第三方脚本。' "$ROOT/modules/ip_test.s
 grep -qF 'return 1' "$ROOT/modules/ip_test.sh"
 
 
-# 24. 已安装的本地 install.sh 启动时不得静默 sync_bundle；更新应通过选项 8。
+# 24. round21 补丁：版本号提升到 2.3.0；协议监听优先取 config.json，且不依赖 ss 固定字段号。
+grep -q '^CURRENT_VERSION="2.3.0"$' "$ROOT/install.sh"
+grep -qF 'port=$(jq -r --arg tag "${name}-in"' "$ROOT/modules/protocol.sh"
+grep -qF 'for (i = 1; i <= NF; i++)' "$ROOT/modules/protocol.sh"
+! grep -qF '$5 ~ p' "$ROOT/modules/protocol.sh"
+# 同一协议重复部署仍要求先移除：本轮采用补丁 3 的方案 B，避免扩大证书/密钥回滚范围。
+grep -q 'VLESS + Reality 已经部署。若需更换端口、SNI 或密钥，请先选择“5. 移除指定协议”' "$ROOT/modules/protocol.sh"
+grep -q 'Hysteria 2 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除指定协议”' "$ROOT/modules/protocol.sh"
+grep -q 'TUIC v5 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除指定协议”' "$ROOT/modules/protocol.sh"
+# 旧版 node_info.txt 不再由卸载流程恢复。
+! grep -qF 'restore_file_backup "$NODE_INFO_FILE" protocol_node_info' "$ROOT/modules/protocol.sh"
+grep -qF '检测到旧版节点信息文件' "$ROOT/modules/protocol.sh"
+
+# 24a. protocol_listener_is_up：配置端口优先于 state，且能识别 TCP/UDP 本地监听地址。
+(
+    listener_test_root=$(mktemp -d /tmp/vps-tool-listener-smoke.XXXXXX)
+    trap 'rm -rf "$listener_test_root"' EXIT
+    export VPS_TOOL_ROOT="$listener_test_root/root"
+    export VPS_TOOL_ETC="$listener_test_root/etc"
+    export VPS_TOOL_STATE="$listener_test_root/state"
+    export VPS_TOOL_BACKUPS="$listener_test_root/backups"
+    export VPS_TOOL_LOG="$listener_test_root/install.log"
+    mkdir -p "$VPS_TOOL_ROOT" "$VPS_TOOL_ETC" "$VPS_TOOL_STATE" "$VPS_TOOL_BACKUPS"
+    source "$ROOT/modules/protocol.sh"
+    CONF_DIR="$listener_test_root/sing-box"
+    CONF_FILE="$CONF_DIR/config.json"
+    mkdir -p "$CONF_DIR"
+    printf '%s\n' '{"inbounds":[{"type":"vless","tag":"vless-in","listen_port":12345}]}' > "$CONF_FILE"
+    state_set protocol_vless_port 54321
+    listener_bin="$listener_test_root/bin"
+    mkdir -p "$listener_bin"
+    cat > "$listener_bin/ss" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'tcp LISTEN 0 128 0.0.0.0:12345 0.0.0.0:* users:(("sing-box",pid=1,fd=3))'
+EOF
+    chmod +x "$listener_bin/ss"
+    PATH="$listener_bin:$PATH"
+    export PATH
+    protocol_listener_is_up vless
+)
+
+# 25. 已安装的本地 install.sh 启动时不得静默 sync_bundle；更新应通过选项 8。
 grep -qF 'current_script_path=$(readlink -f -- "${BASH_SOURCE[0]}")' "$ROOT/install.sh"
 grep -qF 'local_install_path=$(readlink -f -- "${LOCAL_ROOT}/install.sh")' "$ROOT/install.sh"
 grep -qF '    # 首次通过网络脚本启动时同步完整本地工具包；已安装版本启动时不再静默更新。' "$ROOT/install.sh"
 
-# 25. 顶层防火墙单条删除 helper 应按后端参数校验并返回失败，而不是异常成功。
+# 26. 顶层防火墙单条删除 helper 应按后端参数校验并返回失败，而不是异常成功。
 if firewall_remove_owned_rule invalid_backend 65535 tcp; then
     echo 'firewall_remove_owned_rule unexpectedly accepted an invalid backend' >&2
     exit 1
 fi
 
-# 26. 路径规范化应让同一实际文件的不同符号链接解析到相同目标。
+# 27. 路径规范化应让同一实际文件的不同符号链接解析到相同目标。
 path_link="$TEST_STATE_ROOT/install-link.sh"
 ln -s "$ROOT/install.sh" "$path_link"
 normalized_link=$(readlink -f -- "$path_link")
@@ -187,7 +290,7 @@ normalized_root=$(readlink -f -- "$ROOT/install.sh")
 [[ "$normalized_link" == "$normalized_root" ]]
 
 
-# 27. SSH 端口迁移只保留“保留旧端口 / 手动删除旧端口 / 回退”三种操作。
+# 28. SSH 端口迁移只保留“保留旧端口 / 手动删除旧端口 / 回退”三种操作。
 grep -qF '1) change_ssh_port || true;' "$ROOT/modules/security.sh"
 grep -qF '2) remove_old_ssh_port || true;' "$ROOT/modules/security.sh"
 grep -qF '4) cancel_ssh_port_migration || true;' "$ROOT/modules/security.sh"
@@ -231,11 +334,12 @@ grep -q '^cancel_ssh_port_migration()' "$ROOT/modules/security.sh"
 grep -q '^firewall_show_allowed()' "$ROOT/modules/security.sh"
 grep -q 'UFW 已启用。' "$ROOT/modules/security.sh"
 grep -q 'firewalld 已运行。' "$ROOT/modules/security.sh"
-grep -q '以后再次进入本选项将只展示当前状态' "$ROOT/modules/security.sh"
+grep -q '基线规则已补充并立即生效' "$ROOT/modules/security.sh"
+! grep -q '以后再次进入本选项将只展示当前状态' "$ROOT/modules/security.sh"
 
 # 36. README 必须包含迁移回退与防火墙状态式流程说明。
 grep -q '模块 1 → 3 → 4 放弃迁移并恢复原端口' "$ROOT/README.md"
-grep -q '不会重复出现“立即启用”提示' "$ROOT/README.md"
+grep -q '只展示当前已放行的端口' "$ROOT/README.md"
 
 # 37. SSH endpoint 解析需覆盖 IPv4、标准方括号 IPv6 与极端未加方括号 IPv6。
 [[ "$(bash -c 'source "$1"; ssh_endpoint_host "198.51.100.20:34567"' _ "$ROOT/modules/security.sh")" == "198.51.100.20" ]]
@@ -542,4 +646,156 @@ bash -c '
   [[ ! -e "$FAIL2BAN_CONFIG" ]]
 ' _ "$ROOT"
 
-echo 'smoke tests: OK'
+# 49. get_current_ssh_port 探测失败必须返回非零，绝不静默回退 22。
+ssh_probe_stub="$TEST_STATE_ROOT/ssh-probe-stub"
+mkdir -p "$ssh_probe_stub"
+cat > "$ssh_probe_stub/sshd" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+cat > "$ssh_probe_stub/ss" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$ssh_probe_stub/sshd" "$ssh_probe_stub/ss"
+if PATH="$ssh_probe_stub:$PATH" bash -c 'source "$1"; get_current_ssh_port >/dev/null 2>&1' _ "$ROOT/modules/security.sh"; then
+    echo 'get_current_ssh_port unexpectedly returned success' >&2
+    exit 1
+fi
+
+# 50. 多 SSH 端口同时存在时，防火墙禁用入口必须保护所有实际 SSH 端口。
+if PATH="$service_test_dir:$PATH" bash -c '
+  source "$1"
+  firewall_open_port_entries() { printf "22/tcp|UFW 端口\n2222/tcp|UFW 端口\n"; }
+  get_current_ssh_ports() { printf "22\n2222\n"; }
+  firewall_rule_exists() { return 0; }
+  firewall_backend() { echo ufw; }
+  firewall_manage_disable ufw <<< "1" >/tmp/vps-firewall-disable-test.out 2>&1
+' _ "$ROOT/modules/security.sh"; then
+    echo 'firewall_manage_disable unexpectedly allowed current SSH port' >&2
+    exit 1
+fi
+! grep -q "已停止防火墙放行" /tmp/vps-firewall-disable-test.out
+
+# 51. 旧 SSH 端口清理前必须先确认新端口已经被本机防火墙放行；未放行时不得调用删除动作。
+ssh_cleanup_stub="$TEST_STATE_ROOT/ssh-cleanup-stub"
+mkdir -p "$ssh_cleanup_stub"
+marker_old="$TEST_STATE_ROOT/old-firewall-delete.marker"
+marker_fallback="$TEST_STATE_ROOT/old-firewall-close.marker"
+MARKER_OLD="$marker_old" MARKER_FALLBACK="$marker_fallback" BACKUP_ROOT="$TEST_STATE_ROOT/backups" FAIL2BAN_TEST_CONFIG="$TEST_STATE_ROOT/no-fail2ban" \
+bash -c '
+  source "$1"
+  state_get(){ case "$1" in ssh_migration_old_port) echo 22;; ssh_migration_new_port) echo 2222;; *) return 1;; esac; }
+  state_set(){ :; }
+  state_unset(){ :; }
+  current_ssh_session_uses_port(){ return 0; }
+  sshd_has_port(){ return 0; }
+  ssh_port_listening(){ return 0; }
+  validate_sshd_config(){ return 0; }
+  restart_or_reload_ssh(){ return 0; }
+  make_temp_dir(){ mktemp -d; }
+  backup_current_ssh_files(){ return 0; }
+  remove_sshd_port_global(){ return 0; }
+  restore_action_ssh_files(){ return 0; }
+  confirm_safety_prompt(){ return 0; }
+  firewall_backend(){ echo ufw; }
+  firewall_rule_exists(){ [[ "$2" == "2222" ]] && return 1; return 0; }
+  firewall_port_has_service_rule(){ return 1; }
+  firewall_remove_owned_rules(){ printf x > "$MARKER_OLD"; return 0; }
+  port_in_use(){ return 1; }
+  firewall_close_port_rule(){ printf x > "$MARKER_FALLBACK"; return 0; }
+  FAIL2BAN_CONFIG="$FAIL2BAN_TEST_CONFIG"
+  VPS_TOOL_BACKUPS="$BACKUP_ROOT"
+  remove_old_ssh_port || true
+' _ "$ROOT/modules/security.sh" >/dev/null 2>&1
+[[ ! -e "$marker_old" && ! -e "$marker_fallback" ]]
+
+# 51a. 防火墙探测不到 SSH 端口时必须中止，不得启用防火墙。
+if bash -c '
+  source "$1"
+  check_os(){ PKG_MANAGER=apt; return 0; }
+  get_current_ssh_ports(){ return 1; }
+  firewall_backend(){ echo none; }
+  setup_firewall
+' _ "$ROOT/modules/security.sh" >/dev/null 2>&1; then
+    echo 'setup_firewall unexpectedly continued without SSH port detection' >&2
+    exit 1
+fi
+
+# 51b. 防火墙基线必须覆盖所有实际 SSH 端口以及当前 SSH 会话端口。
+firewall_rules_seen="$TEST_STATE_ROOT/firewall-rules-seen.txt"
+: > "$firewall_rules_seen"
+printf 'y\n' | RULE_LOG="$firewall_rules_seen" bash -c '
+  source "$1"
+  check_os(){ PKG_MANAGER=apt; return 0; }
+  get_current_ssh_ports(){ printf "22\n2222\n"; }
+  current_ssh_session_port(){ echo 2222; }
+  firewall_backend(){ echo ufw; }
+  firewall_show_open_ports(){ :; }
+  firewall_rule_exists(){ return 1; }
+  firewall_allow(){ printf "%s/%s\n" "$1" "$2" >> "$RULE_LOG"; return 0; }
+  setup_firewall
+' _ "$ROOT/modules/security.sh" >/dev/null 2>&1
+for expected in 22/tcp 2222/tcp 80/tcp 443/tcp; do grep -qx "$expected" "$firewall_rules_seen"; done
+
+# 51c. UFW 单端口规则允许精确删除；重复同端口规则必须拒绝删除。
+ufw_delete_single="$TEST_STATE_ROOT/ufw-delete-single.log"
+mkdir -p "$TEST_STATE_ROOT/ufw-single"
+cat > "$TEST_STATE_ROOT/ufw-single/ufw" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  "status numbered") printf '[ 1] 2222/tcp                 ALLOW IN    Anywhere\n'; exit 0 ;;
+  "delete allow 2222/tcp") printf 'deleted\n' > "${DELETE_LOG:?}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$TEST_STATE_ROOT/ufw-single/ufw"
+DELETE_LOG="$ufw_delete_single" PATH="$TEST_STATE_ROOT/ufw-single:$PATH" bash -c '
+  source "$1"
+  firewall_port_has_service_rule(){ return 1; }
+  firewall_remove_owned_rule ufw 2222 tcp
+' _ "$ROOT/lib/common.sh"
+grep -q '^deleted$' "$ufw_delete_single"
+
+mkdir -p "$TEST_STATE_ROOT/ufw-dup"
+cat > "$TEST_STATE_ROOT/ufw-dup/ufw" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  "status numbered") printf '[ 1] 2222/tcp                 ALLOW IN    Anywhere\n[ 2] 2222/tcp                 ALLOW IN    198.51.100.0/24\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$TEST_STATE_ROOT/ufw-dup/ufw"
+PATH="$TEST_STATE_ROOT/ufw-dup:$PATH" bash -c '
+  source "$1"
+  firewall_port_has_service_rule(){ return 1; }
+  if firewall_remove_owned_rule ufw 2222 tcp; then exit 1; fi
+' _ "$ROOT/lib/common.sh"
+
+# 52. GAI IPv4 优先规则对空白数量不敏感，已有等价规则不重复添加。
+gai_test="$TEST_STATE_ROOT/gai.conf"
+printf 'precedence ::ffff:0:0/96 100\n' > "$gai_test"
+Gai_added=$(
+  bash -c 'source "$1"; GAI_CONF="$2"; backup_file_once(){ :; }; state_set(){ printf "%s=%s\\n" "$1" "$2"; }; apply_gai_ipv4_priority' _ "$ROOT/modules/optimize.sh" "$gai_test"
+)
+grep -q 'gai_added_by_tool=0' <<< "$Gai_added"
+[[ "$(grep -cE '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100[[:space:]]*$' "$gai_test")" -eq 1 ]]
+
+# 53. random_free_port 对 port_in_use 的非法协议状态必须视为失败，不能把未检查端口当成空闲。
+if bash -c 'source "$1"; port_in_use(){ return 2; }; random_free_port tcp' _ "$ROOT/lib/common.sh" >/dev/null 2>&1; then
+    echo 'random_free_port unexpectedly accepted failed port probe' >&2
+    exit 1
+fi
+
+# 54. 版本比较必须只在远端主.次.补更高时判定为更新；后缀忽略比较。
+version_fn="$TEST_STATE_ROOT/version_gt.sh"
+awk '''/^version_gt\(\) \{/{found=1} found{print; if ($0 == "}") exit}''' "$ROOT/install.sh" > "$version_fn"
+bash -c 'source "$1"; version_gt 2.1.0 2.0.0' _ "$version_fn"
+! bash -c 'source "$1"; version_gt 2.0.0 2.1.0' _ "$version_fn"
+! bash -c 'source "$1"; version_gt 2.0.1-beta.1 2.0.1' _ "$version_fn"
+
+# 55. apt 安全升级文案必须明确说明 Debian/Ubuntu 实际执行全量 upgrade。
+grep -q 'Debian/Ubuntu 为全量升级' "$ROOT/lib/common.sh"
+grep -q 'openssh-server/内核' "$ROOT/lib/common.sh"
+
+echo 'smoke tests: OK' 
