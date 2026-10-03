@@ -12,6 +12,8 @@ PROTOCOL_NODE_INFO_DIR="${CONF_DIR}"
 SERVICE_UNIT="vps-tool-sing-box.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_UNIT}"
 SINGBOX_BIN=""
+PROTOCOL_CATALOG_FILE="${VPS_TOOL_ROOT}/protocol_catalog.json"
+PROTOCOL_CATALOG_URL="${VPS_TOOL_PROTOCOL_CATALOG_URL:-https://raw.githubusercontent.com/yesok6/vps-tool/main/protocol_catalog.json}"
 
 resolve_singbox() {
     if [[ -n "${SINGBOX_BIN:-}" && -x "$SINGBOX_BIN" ]]; then return 0; fi
@@ -43,7 +45,7 @@ latest_singbox_version() {
         *) return 1 ;;
     esac
 
-    releases_json=$(github_release_api_json 'releases?per_page=100') || return 1
+    releases_json=$(github_release_api_json 'releases?per_page=10') || return 1
     jq -er --arg arch "$arch" '
         .[]
         | select((.draft // false) == false and (.prerelease // false) == false)
@@ -123,6 +125,7 @@ resolve_singbox_checksum() {
 
     if [[ "${VPS_TOOL_SKIP_SINGBOX_VERIFY:-0}" == "1" ]]; then
         echo -e "${YELLOW}[警告]${PLAIN} VPS_TOOL_SKIP_SINGBOX_VERIFY=1：已跳过 sing-box SHA-256 校验，仅适用于明确完成人工核验的应急场景。" >&2
+        log_action "[警告] 本次跳过了 sing-box SHA-256 校验（VPS_TOOL_SKIP_SINGBOX_VERIFY=1）"
         return 0
     fi
 
@@ -323,7 +326,13 @@ get_best_sni() {
     wait
     if [[ -s "${tmp}/results" ]]; then best=$(sort -n "${tmp}/results" | head -n1 | awk '{print $2}'); fi
     rm -rf "$tmp"
-    echo "${best:-addons.mozilla.org}"
+    if [[ -n "$best" ]]; then
+        echo "$best"
+    else
+        echo -e "${YELLOW}[提示]${PLAIN} 所有候选 SNI 均探测失败，已回退默认值 addons.mozilla.org（不影响使用，但可能不是最优）" >&2
+        log_action "[提示] 所有候选 SNI 均探测失败，已回退默认值 addons.mozilla.org"
+        echo "addons.mozilla.org"
+    fi
 }
 
 protocol_fragment_file() {
@@ -546,6 +555,7 @@ remove_protocol_resources() {
         *) return 1 ;;
     esac
 
+    remove_port_hopping "$name" || true
     if [[ -n "$port" ]] && ! firewall_remove_owned_rules "$port" "$transport"; then
         echo -e "${YELLOW}[警告]${PLAIN} ${name} 的 ${port}/${transport} 防火墙规则未能删除，已保留记录以便后续重试。"
     fi
@@ -623,13 +633,590 @@ firewall_note() {
     fi
 }
 
+
+protocol_hop_state_key() {
+    printf '%s_hop_ports' "$1"
+}
+
+protocol_hop_backend_state_key() {
+    printf '%s_hop_backend' "$1"
+}
+
+protocol_hop_listen_state_key() {
+    printf '%s_hop_listen_port' "$1"
+}
+
+validate_hop_range() {
+    local range="$1" start end span
+    [[ "$range" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || return 1
+    start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"
+    (( start >= 1024 && end <= 65535 && start < end )) || return 1
+    span=$((end-start))
+    (( span <= 200 ))
+}
+
+hop_range_conflicts() {
+    local start="$1" end="$2" other_name other_port other_range other_start other_end occupied_ports
+    for other_name in $(protocol_fragment_names); do
+        [[ -f "$(protocol_fragment_file "$other_name")" ]] || continue
+        other_port=$(state_get "$(protocol_port_state_key "$other_name")" 2>/dev/null || true)
+        if [[ "$other_port" =~ ^[0-9]+$ ]] && (( other_port >= start && other_port <= end )); then
+            return 0
+        fi
+        other_range=$(state_get "$(protocol_hop_state_key "$other_name")" 2>/dev/null || true)
+        if [[ "$other_range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            other_start="${BASH_REMATCH[1]}"
+            other_end="${BASH_REMATCH[2]}"
+            if (( start <= other_end && end >= other_start )); then
+                return 0
+            fi
+        fi
+    done
+
+    if command_exists ss; then
+        occupied_ports=$(ss -H -lun 2>/dev/null | awk -v start="$start" -v end="$end" '
+            {
+                for (i = 1; i <= NF; i++) {
+                    field=$i
+                    if (field ~ /:[0-9]+$/) {
+                        port=field
+                        sub(/^.*:/, "", port)
+                        if (port ~ /^[0-9]+$/ && port >= start && port <= end) {
+                            print port
+                        }
+                        break
+                    }
+                }
+            }
+        ')
+        [[ -z "$occupied_ports" ]] || return 0
+    else
+        for ((port=start; port<=end; port++)); do
+            port_in_use "$port" udp && return 0
+        done
+    fi
+    return 1
+}
+
+prompt_port_hopping() {
+    local choice range start end
+    PORT_HOP_RANGE=""
+    PORT_HOP_ENABLED=0
+    [[ "${1:-0}" == "1" ]] || return 0
+    read -rp "是否启用 UDP 端口跳跃？[y/N]: " choice
+    [[ "$choice" =~ ^[Yy]$ ]] || return 0
+    while true; do
+        read -rp "输入端口范围（例如 20000-20100，跨度 ≤ 200）：" range
+        if ! validate_hop_range "$range"; then
+            echo -e "${RED}[错误]${PLAIN} 范围必须为 1024-65535、起 < 止、跨度 ≤ 200。"
+            continue
+        fi
+        start="${range%-*}"; end="${range#*-}"
+        if hop_range_conflicts "$start" "$end"; then
+            echo -e "${RED}[错误]${PLAIN} 端口范围与现有监听/已部署协议存在冲突，请换一段范围。"
+            continue
+        fi
+        PORT_HOP_RANGE="$range"
+        PORT_HOP_ENABLED=1
+        return 0
+    done
+}
+
+write_hop_persistence_file() {
+    local name="$1" backend="$2" range="$3" listen_port="$4" dir file
+    dir="${VPS_TOOL_ETC}/port-hop"
+    mkdir -p "$dir"
+    case "$backend" in
+        nft)
+            file="${dir}/${name}.nft"
+            cat > "$file" <<EOF
+ table ip vps_tool_hop_${name} {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    udp dport ${range/-/:} dnat to :${listen_port}
+  }
+}
+EOF
+            ;;
+        iptables)
+            file="${dir}/${name}.iptables"
+            printf '%s\n' "iptables -t nat -N VPS_TOOL_HOP_${name^^}" \
+                "iptables -t nat -A PREROUTING -p udp --dport ${range/-/:} -j VPS_TOOL_HOP_${name^^}" \
+                "iptables -t nat -A VPS_TOOL_HOP_${name^^} -p udp -j DNAT --to-destination :${listen_port}" > "$file"
+            ;;
+        *) return 1 ;;
+    esac
+    chmod 600 "$file"
+    mark_owned "$file"
+    printf '%s\n' "$file"
+}
+
+setup_port_hopping() {
+    local name="$1" range="$2" listen_port="$3" backend file start end p
+    [[ -n "$range" ]] || return 0
+    start="${range%-*}"; end="${range#*-}"
+
+    if command_exists nft; then
+        backend=nft
+        file=$(write_hop_persistence_file "$name" "$backend" "$range" "$listen_port") || return 1
+        if ! nft -f "$file" >/dev/null 2>&1; then
+            rm -f "$file"; unmark_owned "$file"
+            return 1
+        fi
+        state_set "$(protocol_hop_backend_state_key "$name")" nft
+    elif command_exists iptables; then
+        backend=iptables
+        file=$(write_hop_persistence_file "$name" "$backend" "$range" "$listen_port") || return 1
+        iptables -t nat -N "VPS_TOOL_HOP_${name^^}" 2>/dev/null || true
+        iptables -t nat -C PREROUTING -p udp --dport "${start}:${end}" -j "VPS_TOOL_HOP_${name^^}" 2>/dev/null || \
+            iptables -t nat -A PREROUTING -p udp --dport "${start}:${end}" -j "VPS_TOOL_HOP_${name^^}"
+        iptables -t nat -C "VPS_TOOL_HOP_${name^^}" -p udp -j DNAT --to-destination ":${listen_port}" 2>/dev/null || \
+            iptables -t nat -A "VPS_TOOL_HOP_${name^^}" -p udp -j DNAT --to-destination ":${listen_port}"
+        state_set "$(protocol_hop_backend_state_key "$name")" iptables
+        if command_exists netfilter-persistent; then
+            netfilter-persistent save >/dev/null 2>&1 || echo -e "${YELLOW}[提示]${PLAIN} iptables 规则已生效，但持久化保存失败。"
+        else
+            echo -e "${YELLOW}[提示]${PLAIN} 未检测到 netfilter-persistent；iptables 端口跳跃规则重启后可能失效。规则已保存在 ${file}。"
+        fi
+    else
+        echo -e "${RED}[错误]${PLAIN} 未找到 nftables 或 iptables，无法启用端口跳跃。"
+        return 1
+    fi
+
+    state_set "$(protocol_hop_state_key "$name")" "$range"
+    state_set "$(protocol_hop_listen_state_key "$name")" "$listen_port"
+    for ((p=start; p<=end; p++)); do
+        if ! firewall_allow "$p" udp; then
+            echo -e "${YELLOW}[警告]${PLAIN} 无法为 UDP ${p} 添加主机防火墙规则，正在回滚本次端口跳跃。"
+            if ! remove_port_hopping "$name"; then
+                echo -e "${RED}[错误]${PLAIN} 端口跳跃回滚未能完全完成，请立即使用“关闭端口跳跃并恢复单端口”重试。"
+            fi
+            return 1
+        fi
+    done
+    log_action "[可撤销] ${name} 启用端口跳跃 ${range} -> ${listen_port}/${backend}"
+}
+
+remove_port_hopping() {
+    local name="$1" range backend listen_port file start end p failed=0
+    range=$(state_get "$(protocol_hop_state_key "$name")" 2>/dev/null || true)
+    [[ -n "$range" ]] || return 0
+    backend=$(state_get "$(protocol_hop_backend_state_key "$name")" 2>/dev/null || true)
+    listen_port=$(state_get "$(protocol_hop_listen_state_key "$name")" 2>/dev/null || true)
+    if ! validate_hop_range "$range"; then
+        echo -e "${RED}[错误]${PLAIN} ${name} 的端口跳跃状态记录无效：${range}；保留记录，未执行破坏性清理。"
+        return 1
+    fi
+    start="${range%-*}"; end="${range#*-}"
+    case "$backend" in
+        nft)
+            file="${VPS_TOOL_ETC}/port-hop/${name}.nft"
+            if command_exists nft; then
+                if nft delete table ip "vps_tool_hop_${name}" >/dev/null 2>&1; then
+                    :
+                elif nft list table ip "vps_tool_hop_${name}" >/dev/null 2>&1; then
+                    failed=1
+                    echo -e "${YELLOW}[警告]${PLAIN} 无法删除 nft 端口跳跃表 vps_tool_hop_${name}，已保留状态记录。"
+                fi
+            elif [[ -f "$file" ]]; then
+                failed=1
+                echo -e "${YELLOW}[警告]${PLAIN} 当前系统没有 nft，无法确认 ${name} 的端口跳跃规则已删除；已保留状态记录。"
+            fi
+            ;;
+        iptables)
+            file="${VPS_TOOL_ETC}/port-hop/${name}.iptables"
+            if command_exists iptables; then
+                if iptables -t nat -D PREROUTING -p udp --dport "${start}:${end}" -j "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then :; fi
+                if iptables -t nat -F "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then :; elif iptables -t nat -L "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then
+                    failed=1
+                    echo -e "${YELLOW}[警告]${PLAIN} 无法清空 iptables 端口跳跃链 VPS_TOOL_HOP_${name^^}，已保留状态记录。"
+                fi
+                if iptables -t nat -X "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then :; elif iptables -t nat -L "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then
+                    failed=1
+                    echo -e "${YELLOW}[警告]${PLAIN} 无法删除 iptables 端口跳跃链 VPS_TOOL_HOP_${name^^}，已保留状态记录。"
+                fi
+                if command_exists netfilter-persistent && ! netfilter-persistent save >/dev/null 2>&1; then
+                    failed=1
+                    echo -e "${YELLOW}[警告]${PLAIN} iptables 持久化保存失败，已保留端口跳跃记录。"
+                fi
+            elif [[ -f "$file" ]]; then
+                failed=1
+                echo -e "${YELLOW}[警告]${PLAIN} 当前系统没有 iptables，无法确认 ${name} 的端口跳跃规则已删除；已保留状态记录。"
+            fi
+            ;;
+        *)
+            failed=1
+            echo -e "${YELLOW}[警告]${PLAIN} ${name} 的端口跳跃后端记录未知：${backend}；已保留状态记录。"
+            ;;
+    esac
+
+    for ((p=start; p<=end; p++)); do
+        if ! firewall_remove_owned_rules "$p" udp; then
+            failed=1
+            echo -e "${YELLOW}[警告]${PLAIN} ${name} 的 UDP ${p} 防火墙规则未能精确删除，已保留端口跳跃记录。"
+        fi
+    done
+
+    if (( failed )); then
+        log_action "[警告] ${name} 端口跳跃 ${range} 撤销未完全成功，保留状态记录等待重试"
+        return 1
+    fi
+
+    if is_owned "$file"; then rm -f "$file"; unmark_owned "$file"; fi
+    state_unset "$(protocol_hop_state_key "$name")"
+    state_unset "$(protocol_hop_backend_state_key "$name")"
+    state_unset "$(protocol_hop_listen_state_key "$name")"
+    log_action "[已撤销] ${name} 端口跳跃 ${range}"
+    return 0
+}
+
+check_protocol_resources() {
+    local target_protocols=("$@") protocol_count=0 name mem_mb root_mb swap_mb cpu_count
+    local mem_pass mem_warn root_pass root_warn blocked=0 warn=0 confirm action buf_warn=0
+    for name in $(protocol_fragment_names); do
+        state_exists "protocol_${name}" && ((protocol_count+=1))
+    done
+    for name in "${target_protocols[@]}"; do
+        if ! state_exists "protocol_${name}"; then
+            ((protocol_count+=1))
+        fi
+    done
+    (( protocol_count < 1 )) && protocol_count=1
+    mem_mb=$(get_mem_available_mb)
+    root_mb=$(get_root_free_mb)
+    swap_mb=$(current_swap_mb)
+    cpu_count=$(nproc 2>/dev/null || echo 1)
+
+    if (( protocol_count == 1 )); then
+        mem_pass=128; mem_warn=96
+        root_pass=512; root_warn=300
+    elif (( protocol_count == 2 )); then
+        mem_pass=192; mem_warn=128
+        root_pass=800; root_warn=500
+    else
+        mem_pass=256; mem_warn=192
+        root_pass=800; root_warn=500
+    fi
+
+    echo -e "${CYAN}[资源预检]${PLAIN} 可用内存 ${mem_mb} MiB / 根分区 ${root_mb} MiB / Swap ${swap_mb} MiB / CPU ${cpu_count} / 协议数 ${protocol_count}"
+
+    if (( mem_mb < mem_warn )); then
+        if (( swap_mb >= 512 )); then
+            echo -e "${YELLOW}[警告]${PLAIN} 可用内存低于当前协议数的拦截阈值，但已有 Swap ≥ 512 MiB；Swap 只是缓冲，速度远低于真实内存。"
+            warn=1
+        else
+            blocked=1
+        fi
+    elif (( mem_mb < mem_pass )); then
+        warn=1
+        echo -e "${YELLOW}[警告]${PLAIN} 可用内存 ${mem_mb} MiB 处于警告区，协议数越多越容易出现 OOM。"
+    fi
+    if (( root_mb < root_warn )); then
+        blocked=1
+    elif (( root_mb < root_pass )); then
+        warn=1
+        echo -e "${YELLOW}[警告]${PLAIN} 根分区可用空间 ${root_mb} MiB 处于警告区。"
+    fi
+
+    local tcp_wmem_max wmem_default threshold
+    tcp_wmem_max=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | awk '{print $NF}' || echo 0)
+    wmem_default=$(sysctl -n net.core.wmem_default 2>/dev/null || echo 0)
+    threshold=$((mem_mb * 1024 / 8))
+    if [[ "$tcp_wmem_max" =~ ^[0-9]+$ ]] && (( tcp_wmem_max >= threshold )); then buf_warn=1; fi
+    if [[ "$wmem_default" =~ ^[0-9]+$ ]] && (( wmem_default >= threshold )); then buf_warn=1; fi
+    if (( buf_warn )); then
+        echo -e "${YELLOW}[警告]${PLAIN} 当前内核缓冲区上限对小内存机器偏大，可能在高并发时触发 OOM，建议先执行模块 3 的低内存适配（或手动降低）。"
+    fi
+
+    if (( blocked )); then
+        if [[ "${VPS_TOOL_FORCE_DEPLOY:-0}" == "1" ]]; then
+            echo -e "${YELLOW}[强制继续]${PLAIN} 已按用户要求强制继续，当前资源不足可能导致 OOM 或磁盘耗尽。"
+            return 0
+        fi
+        echo -e "${RED}[拦截]${PLAIN} 当前资源低于安全部署阈值。"
+        echo "  1. 增加 Swap：可调用现有 Swap 管理功能；Swap 只作缓冲。"
+        echo "  2. 释放磁盘：du -xh / --max-depth=1 | sort -h | tail"
+        echo "  3. 明确设置 VPS_TOOL_FORCE_DEPLOY=1 可强制继续（风险自负）。"
+        if [[ "${VPS_TOOL_PIPELINE:-0}" == "1" ]]; then
+            echo -e "${RED}[流水线]${PLAIN} 资源处于拦截区，按既有语义直接中止，不等待输入。"
+            return 1
+        fi
+        if ! IFS= read -r -p "现在尝试增加 Swap？[y/N]: " action; then
+            action=""
+        fi
+        if [[ "$action" =~ ^[Yy]$ ]]; then
+            local recommended
+            recommended=$(recommend_managed_swap_mb)
+            if (( recommended >= 256 )); then
+                ensure_managed_swap "$recommended" || return 1
+                mem_mb=$(get_mem_available_mb)
+                swap_mb=$(current_swap_mb)
+                if (( mem_mb < mem_warn && swap_mb < 512 )); then return 1; fi
+                if (( root_mb < root_warn )); then return 1; fi
+                echo -e "${GREEN}[继续]${PLAIN} Swap 调整后允许继续。"
+                return 0
+            fi
+        fi
+        return 1
+    fi
+
+    if (( warn )); then
+        if [[ "${VPS_TOOL_PIPELINE:-0}" == "1" ]]; then
+            echo -e "${YELLOW}[流水线]${PLAIN} 资源处于警告区，按流水线语义继续，不等待输入。"
+            return 0
+        fi
+        if ! IFS= read -r -p "资源处于警告区，仍要继续部署？[y/N]: " confirm; then
+            confirm=""
+        fi
+        [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+    fi
+    echo -e "${GREEN}[通过]${PLAIN} 资源预检通过。"
+    return 0
+}
+
+node_info_value() {
+    local file="$1" key="$2"
+    awk -v k="$key" 'index($0, k ": ") == 1 { print substr($0, length(k) + 3); exit }' "$file"
+}
+
+node_info_share_link() {
+    local file="$1"
+    awk '/^【一键导入分享链接】:/{getline; print; exit}' "$file"
+}
+
+yaml_quote() {
+    jq -Rn --arg v "$1" '$v'
+}
+
+display_protocol_qr() {
+    local name="$1" file link
+    [[ -n "${VPS_TOOL_PIPELINE:-}" ]] && return 0
+    [[ -t 1 ]] || return 0
+    if ! command_exists qrencode; then
+        echo -e "${YELLOW}[提示]${PLAIN} 未安装 qrencode，已跳过二维码；可执行 apt install qrencode 后重新查看。"
+        return 0
+    fi
+    file=$(protocol_node_info_file "$name") || return 1
+    [[ -f "$file" ]] || return 1
+    link=$(node_info_share_link "$file")
+    [[ -n "$link" ]] || { echo -e "${YELLOW}[提示]${PLAIN} ${name} 未找到可生成二维码的分享链接。"; return 0; }
+    echo -e "${CYAN}[${name}] 节点二维码：${PLAIN}"
+    printf '%s\n' "$link" | qrencode -t ANSIUTF8
+}
+
+show_protocol_qr_menu() {
+    local choices=() name choice idx
+    for name in $(protocol_fragment_names); do
+        state_exists "protocol_${name}" && choices+=("$name")
+    done
+    (( ${#choices[@]} )) || { echo "暂无已部署协议。"; return 1; }
+    echo "请选择要显示二维码的协议："
+    for idx in "${!choices[@]}"; do echo "  $((idx+1)). ${choices[$idx]}"; done
+    echo "  0. 返回"
+    read -rp "请选择: " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] || return 1
+    (( choice == 0 )) && return 0
+    (( choice >= 1 && choice <= ${#choices[@]} )) || return 1
+    display_protocol_qr "${choices[$((choice-1))]}"
+}
+
+generate_clash_yaml() {
+    local file tmp name node_file server port uuid password sni public_key short_id range
+    local count=0
+    local -a proxies=()
+    local -a names=()
+    for name in $(protocol_fragment_names); do
+        state_exists "protocol_${name}" && names+=("$name")
+    done
+    (( ${#names[@]} )) || { echo -e "${YELLOW}[提示]${PLAIN} 暂无已部署协议，无法生成 Clash 配置。"; return 1; }
+    command_exists jq || { echo -e "${RED}[错误]${PLAIN} 缺少 jq，无法安全生成 Clash YAML。"; return 1; }
+
+    tmp=$(mktemp "${CONF_DIR}/.clash.yaml.XXXXXX")
+    {
+        echo "# VPS-Tool 生成的可粘贴 Clash/Mihomo 配置片段"
+        echo "proxies:"
+    } > "$tmp"
+
+    for name in "${names[@]}"; do
+        node_file=$(protocol_node_info_file "$name")
+        [[ -f "$node_file" ]] || { echo -e "${YELLOW}[跳过]${PLAIN} ${name} 节点信息缺失。"; continue; }
+        server=$(node_info_value "$node_file" '服务器地址')
+        port=$(node_info_value "$node_file" '连接端口')
+        [[ -n "$port" ]] || port=$(node_info_value "$node_file" 'UDP 端口')
+        sni=$(node_info_value "$node_file" 'SNI')
+        case "$name" in
+            vless)
+                uuid=$(node_info_value "$node_file" '用户 ID (UUID)')
+                public_key=$(node_info_value "$node_file" 'PublicKey')
+                short_id=$(node_info_value "$node_file" 'ShortId')
+                vision_flow=$(node_info_value "$node_file" '流控')
+                [[ "$vision_flow" == "已关闭 Vision" ]] && vision_flow=""
+                if [[ -z "$server" || -z "$port" || -z "$uuid" || -z "$sni" || -z "$public_key" || -z "$short_id" ]]; then
+                    echo -e "${YELLOW}[跳过]${PLAIN} VLESS 缺少必要字段，未输出残缺 YAML。"
+                    continue
+                fi
+                {
+                    echo "  - name: VPS-Tool-Reality"
+                    echo "    type: vless"
+                    echo "    server: $(yaml_quote "$server")"
+                    echo "    port: ${port}"
+                    echo "    uuid: $(yaml_quote "$uuid")"
+                    echo "    network: tcp"
+                    echo "    tls: true"
+                    echo "    udp: true"
+                    [[ -n "$vision_flow" ]] && echo "    flow: $(yaml_quote "$vision_flow")"
+                    echo "    servername: $(yaml_quote "$sni")"
+                    echo "    client-fingerprint: chrome"
+                    echo "    reality-opts:"
+                    echo "      public-key: $(yaml_quote "$public_key")"
+                    echo "      short-id: $(yaml_quote "$short_id")"
+                } >> "$tmp"
+                proxies+=(VPS-Tool-Reality)
+                ((count+=1))
+                ;;
+            hy2)
+                password=$(node_info_value "$node_file" '连接密码')
+                if [[ -z "$server" || -z "$port" || -z "$password" || -z "$sni" ]]; then
+                    echo -e "${YELLOW}[跳过]${PLAIN} Hysteria2 缺少必要字段，未输出残缺 YAML。"
+                    continue
+                fi
+                {
+                    echo "  - name: VPS-Tool-Hysteria2"
+                    echo "    type: hysteria2"
+                    echo "    server: $(yaml_quote "$server")"
+                    echo "    port: ${port}"
+                    echo "    password: $(yaml_quote "$password")"
+                    echo "    sni: $(yaml_quote "$sni")"
+                    echo "    alpn: [h3]"
+                    echo "    skip-cert-verify: true"
+                    range=$(state_get "$(protocol_hop_state_key hy2)" 2>/dev/null || true)
+                    [[ -n "$range" ]] && echo "    ports: $(yaml_quote "$range")"
+                } >> "$tmp"
+                proxies+=(VPS-Tool-Hysteria2)
+                ((count+=1))
+                ;;
+            tuic)
+                uuid=$(node_info_value "$node_file" '用户 ID (UUID)')
+                password=$(node_info_value "$node_file" '连接密码')
+                if [[ -z "$server" || -z "$port" || -z "$uuid" || -z "$password" || -z "$sni" ]]; then
+                    echo -e "${YELLOW}[跳过]${PLAIN} TUIC 缺少必要字段，未输出残缺 YAML。"
+                    continue
+                fi
+                {
+                    echo "  - name: VPS-Tool-TUICv5"
+                    echo "    type: tuic"
+                    echo "    server: $(yaml_quote "$server")"
+                    echo "    port: ${port}"
+                    echo "    uuid: $(yaml_quote "$uuid")"
+                    echo "    password: $(yaml_quote "$password")"
+                    echo "    congestion-controller: bbr"
+                    echo "    udp-relay-mode: native"
+                    echo "    alpn: [h3]"
+                    echo "    sni: $(yaml_quote "$sni")"
+                    echo "    skip-cert-verify: true"
+                    range=$(state_get "$(protocol_hop_state_key tuic)" 2>/dev/null || true)
+                    [[ -n "$range" ]] && echo "    ports: $(yaml_quote "$range")"
+                } >> "$tmp"
+                proxies+=(VPS-Tool-TUICv5)
+                ((count+=1))
+                ;;
+        esac
+    done
+
+    if (( count == 0 )); then
+        rm -f "$tmp"
+        echo -e "${RED}[错误]${PLAIN} 没有任何协议拥有生成 Clash 配置所需的完整字段。"
+        return 1
+    fi
+
+    {
+        echo
+        echo "proxy-groups:"
+        echo "  - name: VPS-Tool-Auto"
+        echo "    type: select"
+        echo "    proxies:"
+        for name in "${proxies[@]}"; do echo "      - ${name}"; done
+        echo
+        echo "rules:"
+        echo "  - GEOIP,CN,DIRECT"
+        echo "  - MATCH,VPS-Tool-Auto"
+    } >> "$tmp"
+
+    chown root:root "$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "${CONF_DIR}/clash.yaml"
+    mark_owned "${CONF_DIR}/clash.yaml"
+    echo -e "${GREEN}[完成]${PLAIN} Clash/Mihomo 配置已生成：${CONF_DIR}/clash.yaml"
+    cat "${CONF_DIR}/clash.yaml"
+}
+
+show_clash_yaml() {
+    if [[ ! -f "${CONF_DIR}/clash.yaml" ]]; then
+        generate_clash_yaml || return 1
+        return 0
+    fi
+    cat "${CONF_DIR}/clash.yaml"
+}
+
+protocol_diagnose() {
+    local name file tag port proto status backend
+    echo -e "${CYAN}================ 协议诊断（只读） ================${PLAIN}"
+    if resolve_singbox; then
+        echo "[sing-box version]"
+        "$SINGBOX_BIN" version 2>&1 || true
+    else
+        echo -e "${YELLOW}[提示]${PLAIN} 未检测到 sing-box。"
+    fi
+    echo "[sing-box check]"
+    if [[ -f "$CONF_FILE" ]] && resolve_singbox; then
+        "$SINGBOX_BIN" check -c "$CONF_FILE" 2>&1 || true
+    else
+        echo "未找到 ${CONF_FILE}"
+    fi
+    echo "[inbounds]"
+    if [[ -f "$CONF_FILE" ]] && command_exists jq; then
+        while IFS=$'\t' read -r tag name port; do
+            [[ -n "$tag" ]] || continue
+            proto=$(case "$name" in vless-in) echo vless;; hy2-in) echo hy2;; tuic-in) echo tuic;; *) echo unknown;; esac)
+            status="未监听"
+            if [[ "$proto" != unknown ]] && protocol_listener_is_up "$proto"; then status="已监听"; fi
+            echo "  tag=${tag} type=${name} port=${port} -> ${status}"
+        done < <(jq -r '.inbounds[]? | [.tag,.type,(.listen_port|tostring)] | @tsv' "$CONF_FILE" 2>/dev/null)
+    else
+        echo "无法读取 config.json"
+    fi
+    echo "[firewall]"
+    backend=$(firewall_backend)
+    for name in vless hy2 tuic; do
+        state_exists "protocol_${name}" || continue
+        port=$(state_get "$(protocol_port_state_key "$name")" 2>/dev/null || true)
+        proto=$(protocol_transport "$name") || continue
+        if [[ "$backend" != none ]]; then
+            if firewall_rule_exists "$backend" "$port" "$proto" >/dev/null 2>&1; then status="已放行"; else status="未检测到本机放行"; fi
+        else
+            status="未检测到活动主机防火墙"
+        fi
+        echo "  ${name}: ${port}/${proto} -> ${status}"
+    done
+    echo "[云安全组]"
+    echo "  请确认云平台安全组至少放行协议对应 TCP/UDP 端口；UDP 协议需放行 UDP。"
+    if [[ -f "$CONF_FILE" ]] && command_exists jq; then
+        while IFS=$'\t' read -r tag type port; do
+            [[ -n "$tag" ]] || continue
+            if ! protocol_listener_is_up "$(case "$type" in vless) echo vless;; hysteria2) echo hy2;; tuic) echo tuic;; esac)"; then
+                echo -e "${YELLOW}[下一步]${PLAIN} ${tag}:${port} 未监听：systemctl status ${SERVICE_UNIT}；journalctl -u ${SERVICE_UNIT} -n 50 --no-pager -l"
+            fi
+        done < <(jq -r '.inbounds[]? | [.tag,.type,(.listen_port|tostring)] | @tsv' "$CONF_FILE" 2>/dev/null)
+    fi
+}
+
 deploy_vless_reality() {
     [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${CYAN}              [VLESS + Reality]                    ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
 
-    local default_port input_port port sni uuid key_pair private_key public_key short_id server_ip
+    local default_port input_port port sni uuid key_pair private_key public_key short_id server_ip vision_flow
     local pipeline_mode="${1:-}"
     local fragment rollback_dir had_fragment=0
     default_port=$(get_random_protocol_port tcp) || { echo -e "${RED}[错误]${PLAIN} 无法找到空闲 TCP 端口。"; return 1; }
@@ -643,6 +1230,12 @@ deploy_vless_reality() {
     validate_user_port "$port" || { echo -e "${RED}[错误]${PLAIN} 端口无效。"; return 1; }
     port_in_use "$port" tcp && { echo -e "${RED}[错误]${PLAIN} TCP 端口已被占用。"; return 1; }
     state_exists protocol_vless && { echo -e "${YELLOW}[提示]${PLAIN} VLESS + Reality 已经部署。若需更换端口、SNI 或密钥，请先选择“5. 移除指定协议”移除它，再重新部署；移除过程中服务会短暂重启，完成后需要重新导入新的节点链接。"; return 1; }
+    check_protocol_resources vless || return 1
+    vision_flow="xtls-rprx-vision"
+    if [[ "$pipeline_mode" != "pipeline" && -z "${VPS_TOOL_PIPELINE:-}" ]]; then
+        read -rp "启用 Vision 流控？[Y/n]: " vision_choice
+        [[ "$vision_choice" =~ ^[Nn]$ ]] && vision_flow=""
+    fi
 
     install_singbox || return 1
     prepare_protocol_state
@@ -671,7 +1264,8 @@ deploy_vless_reality() {
         --arg sni "$sni" \
         --arg private_key "$private_key" \
         --arg short_id "$short_id" \
-        '{type:"vless",tag:"vless-in",listen:"::",listen_port:$port,users:[{uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$private_key,short_id:[$short_id]}}}')
+        --arg flow "$vision_flow" \
+        '{type:"vless",tag:"vless-in",listen:"::",listen_port:$port,users:[{uuid:$uuid} + (if $flow != "" then {flow:$flow} else {} end)],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$private_key,short_id:[$short_id]}}}')
 
     if ! write_protocol_fragment vless "$fragment_json" || ! regenerate_singbox_config || ! validate_singbox_config; then
         restore_protocol_fragment_transaction vless "$rollback_dir" "$had_fragment" >/dev/null
@@ -697,14 +1291,16 @@ deploy_vless_reality() {
     state_set protocol_vless 1
     state_set protocol_vless_port "$port"
     local vless_link
-    vless_link="vless://${uuid}@${server_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp#VPS-Tool-Reality"
+    vless_link="vless://${uuid}@${server_ip}:${port}?encryption=none&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp"
+    [[ -n "$vision_flow" ]] && vless_link+="&flow=${vision_flow}"
+    vless_link+="#VPS-Tool-Reality"
     if ! write_protocol_node_info vless "===================== 节点连接信息 =====================
 协议方案: VLESS + Vision + Reality
 运行状态: $(protocol_status_text vless)
 服务器地址: ${server_ip}
 连接端口: ${port}
 用户 ID (UUID): ${uuid}
-流控: xtls-rprx-vision
+流控: ${vision_flow:-已关闭 Vision}
 SNI: ${sni}
 PublicKey: ${public_key}
 ShortId: ${short_id}
@@ -717,6 +1313,7 @@ ${vless_link}
     log_action "[可撤销] VLESS-Reality 端口=${port} SNI=${sni}"
     [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
     cat "$(protocol_node_info_file vless)"
+    display_protocol_qr vless
     echo -e "\n${GREEN}[成功]${PLAIN} VLESS + Reality 部署完成。"
 }
 
@@ -726,7 +1323,7 @@ deploy_hysteria2() {
     echo -e "${CYAN}                [Hysteria 2]                       ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
 
-    local default_port input_port port password cert_file key_file server_ip sni="bing.com"
+    local default_port input_port port password cert_file key_file server_ip sni="bing.com" hop_range=""
     local fragment rollback_dir had_fragment=0 fragment_json
     default_port=$(get_random_protocol_port udp) || { echo -e "${RED}[错误]${PLAIN} 无法找到空闲 UDP 端口。"; return 1; }
     read -rp "UDP 端口 [回车使用 ${default_port}，范围 1024-65535]: " input_port
@@ -734,6 +1331,8 @@ deploy_hysteria2() {
     validate_user_port "$port" || { echo -e "${RED}[错误]${PLAIN} 端口无效。"; return 1; }
     port_in_use "$port" udp && { echo -e "${RED}[错误]${PLAIN} UDP 端口已被占用。"; return 1; }
     state_exists protocol_hy2 && { echo -e "${YELLOW}[提示]${PLAIN} Hysteria 2 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除指定协议”移除它，再重新部署；移除过程中服务会短暂重启，完成后需要重新导入新的节点链接。"; return 1; }
+    if [[ -z "${VPS_TOOL_PIPELINE:-}" ]]; then prompt_port_hopping 1; hop_range="${PORT_HOP_RANGE:-}"; else hop_range=""; fi
+    check_protocol_resources hy2 || return 1
 
     install_singbox || return 1
     prepare_protocol_state
@@ -811,13 +1410,27 @@ deploy_hysteria2() {
         echo -e "${RED}[错误]${PLAIN} Hysteria 2 启动失败，已仅恢复原协议配置。"
         return 1
     fi
+    if [[ -n "$hop_range" ]]; then
+        if ! setup_port_hopping hy2 "$hop_range" "$port"; then
+            remove_port_hopping hy2 || true
+            restore_protocol_fragment_transaction hy2 "$rollback_dir" "$had_fragment" >/dev/null
+            systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
+            systemctl reset-failed "$SERVICE_UNIT" >/dev/null 2>&1 || true
+            [[ -f "$CONF_FILE" ]] && systemctl start "$SERVICE_UNIT" >/dev/null 2>&1 || true
+            rm -rf "$rollback_dir"
+            echo -e "${RED}[错误]${PLAIN} Hysteria 2 端口跳跃设置失败，已回滚本次协议。"
+            return 1
+        fi
+    fi
     rm -rf "$rollback_dir"
 
     firewall_note "$port" udp
     state_set protocol_hy2 1
     state_set protocol_hy2_port "$port"
     local hy2_link
-    hy2_link="hysteria2://${password}@${server_ip}:${port}/?insecure=1&sni=${sni}#VPS-Tool-Hysteria2"
+    hy2_link="hysteria2://${password}@${server_ip}:${port}/?insecure=1&sni=${sni}"
+    [[ -n "$hop_range" ]] && hy2_link+="&mport=${hop_range}"
+    hy2_link+="#VPS-Tool-Hysteria2"
     if ! write_protocol_node_info hy2 "===================== 节点连接信息 =====================
 协议方案: Hysteria 2
 运行状态: $(protocol_status_text hy2)
@@ -825,6 +1438,7 @@ deploy_hysteria2() {
 UDP 端口: ${port}
 连接密码: ${password}
 SNI: ${sni}
+端口跳跃: ${hop_range:-未启用}
 说明: 使用本工具生成的自签名证书，因此客户端链接包含 insecure=1。
 
 【一键导入分享链接】:
@@ -835,6 +1449,7 @@ ${hy2_link}
     log_action "[可撤销] Hysteria2 UDP=${port}"
     [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
     cat "$(protocol_node_info_file hy2)"
+    display_protocol_qr hy2
     echo -e "\n${GREEN}[成功]${PLAIN} Hysteria 2 部署完成。"
 }
 
@@ -845,7 +1460,7 @@ deploy_tuic_v5() {
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${BLUE}[说明]${PLAIN} 面向游戏/实时 UDP 场景，使用原生 UDP 中继；0-RTT 默认关闭以避免重放风险。"
 
-    local default_port input_port port password uuid cert_file key_file server_ip sni="bing.com"
+    local default_port input_port port password uuid cert_file key_file server_ip sni="bing.com" hop_range=""
     local fragment rollback_dir had_fragment=0 fragment_json
     default_port=$(get_random_protocol_port udp) || { echo -e "${RED}[错误]${PLAIN} 无法找到空闲 UDP 端口。"; return 1; }
     read -rp "UDP 端口 [回车使用 ${default_port}，范围 1024-65535]: " input_port
@@ -853,6 +1468,8 @@ deploy_tuic_v5() {
     validate_user_port "$port" || { echo -e "${RED}[错误]${PLAIN} 端口无效。"; return 1; }
     port_in_use "$port" udp && { echo -e "${RED}[错误]${PLAIN} UDP 端口已被占用。"; return 1; }
     state_exists protocol_tuic && { echo -e "${YELLOW}[提示]${PLAIN} TUIC v5 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除指定协议”移除它，再重新部署；移除过程中服务会短暂重启，完成后需要重新导入新的节点链接。"; return 1; }
+    if [[ -z "${VPS_TOOL_PIPELINE:-}" ]]; then prompt_port_hopping 1; hop_range="${PORT_HOP_RANGE:-}"; else hop_range=""; fi
+    check_protocol_resources tuic || return 1
 
     install_singbox || return 1
     prepare_protocol_state
@@ -937,13 +1554,27 @@ deploy_tuic_v5() {
         echo -e "${RED}[错误]${PLAIN} sing-box 启动失败，已仅恢复原协议配置。"
         return 1
     fi
+    if [[ -n "$hop_range" ]]; then
+        if ! setup_port_hopping tuic "$hop_range" "$port"; then
+            remove_port_hopping tuic || true
+            restore_protocol_fragment_transaction tuic "$rollback_dir" "$had_fragment" >/dev/null
+            systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
+            systemctl reset-failed "$SERVICE_UNIT" >/dev/null 2>&1 || true
+            [[ -f "$CONF_FILE" ]] && systemctl start "$SERVICE_UNIT" >/dev/null 2>&1 || true
+            rm -rf "$rollback_dir"
+            echo -e "${RED}[错误]${PLAIN} TUIC 端口跳跃设置失败，已回滚本次协议。"
+            return 1
+        fi
+    fi
     rm -rf "$rollback_dir"
 
     firewall_note "$port" udp
     state_set protocol_tuic 1
     state_set protocol_tuic_port "$port"
     local tuic_link
-    tuic_link="tuic://${uuid}:${password}@${server_ip}:${port}/?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${sni}&allow_insecure=1#VPS-Tool-TUICv5"
+    tuic_link="tuic://${uuid}:${password}@${server_ip}:${port}/?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${sni}&allow_insecure=1"
+    [[ -n "$hop_range" ]] && tuic_link+="&mport=${hop_range}"
+    tuic_link+="#VPS-Tool-TUICv5"
     if ! write_protocol_node_info tuic "===================== 节点连接信息 =====================
 协议方案: TUIC v5
 运行状态: $(protocol_status_text tuic)
@@ -956,7 +1587,8 @@ UDP 中继: native（原生 UDP）
 0-RTT: 已关闭（避免重放风险）
 ALPN: h3
 SNI: ${sni}
-说明: 使用本工具生成的自签名证书，因此客户端链接包含 insecure=1。
+端口跳跃: ${hop_range:-未启用}
+说明: 使用本工具生成的自签名证书，因此客户端链接包含 allow_insecure=1。
 
 【一键导入分享链接】:
 ${tuic_link}
@@ -966,6 +1598,7 @@ ${tuic_link}
     log_action "[可撤销] TUICv5 UDP=${port}"
     [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
     cat "$(protocol_node_info_file tuic)"
+    display_protocol_qr tuic
     echo -e "\n${GREEN}[成功]${PLAIN} TUIC v5 部署完成。"
 }
 
@@ -1012,6 +1645,13 @@ remove_protocol() {
     fi
     rm -rf "$rollback_dir"
     remove_protocol_resources "$name"
+    if [[ -f "${CONF_DIR}/clash.yaml" ]]; then
+        if state_exists protocol_vless || state_exists protocol_hy2 || state_exists protocol_tuic; then
+            generate_clash_yaml >/dev/null 2>&1 || echo -e "${YELLOW}[提示]${PLAIN} Clash 配置已失效，请重新生成。"
+        else
+            if is_owned "${CONF_DIR}/clash.yaml"; then rm -f "${CONF_DIR}/clash.yaml"; unmark_owned "${CONF_DIR}/clash.yaml"; fi
+        fi
+    fi
     echo -e "${GREEN}[成功]${PLAIN} 已移除 ${name}，其他协议不受影响。"
 }
 
@@ -1033,6 +1673,255 @@ show_protocol_node_info() {
         fi
     done
     (( shown == 1 )) || echo "暂无已部署协议。"
+}
+
+show_protocol_node_info_menu() {
+    show_protocol_node_info
+    [[ -n "${VPS_TOOL_PIPELINE:-}" ]] && return 0
+    if [[ -t 0 ]]; then
+        local choice
+        if IFS= read -r -p "输入 y 重新显示节点二维码，直接回车返回：[y/N]: " choice; then
+            if [[ "$choice" =~ ^[Yy]$ ]]; then
+                show_protocol_qr_menu
+            fi
+        fi
+    fi
+}
+
+protocol_catalog_is_valid() {
+    local file="$1"
+    [[ -s "$file" ]] || return 1
+    jq -e '(.schema_version | type == "number") and (.tool_version | type == "string") and (.protocols | type == "array") and all(.protocols[]; (.id | type == "string") and (.name | type == "string") and (.adapter_version | type == "number") and (.status | type == "string") and (.implemented | type == "boolean"))' "$file" >/dev/null 2>&1
+}
+
+protocol_adapter_version_local() {
+    local id="$1" version=""
+    if protocol_catalog_is_valid "$PROTOCOL_CATALOG_FILE"; then
+        version=$(jq -r --arg id "$id" '.protocols[] | select(.id == $id and .implemented == true) | (.adapter_version | tostring)' "$PROTOCOL_CATALOG_FILE" | head -n1)
+        [[ -n "$version" && "$version" != "null" ]] && { echo "$version"; return 0; }
+    fi
+    case "$id" in
+        vless-reality) echo 1 ;;
+        hysteria2) echo 1 ;;
+        tuic-v5) echo 2 ;;
+        *) return 1 ;;
+    esac
+}
+
+protocol_local_id_exists() {
+    local id="$1"
+    if protocol_catalog_is_valid "$PROTOCOL_CATALOG_FILE"; then
+        jq -e --arg id "$id" '.protocols[] | select(.id == $id and .implemented == true)' "$PROTOCOL_CATALOG_FILE" >/dev/null 2>&1
+        return $?
+    fi
+    case "$id" in
+        vless-reality|hysteria2|tuic-v5) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+singbox_current_version() {
+    if ! resolve_singbox; then
+        return 1
+    fi
+    local output version
+    output=$("$SINGBOX_BIN" version 2>&1) || return 2
+    version=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?' <<<"$output" | head -n1 || true)
+    if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+        printf '%s\n' "$version"
+        return 0
+    fi
+    return 2
+}
+
+protocol_version_gt() {
+    local a="$1" b="$2" a1 a2 a3 b1 b2 b3
+    [[ "$a" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+    a1="${BASH_REMATCH[1]}"; a2="${BASH_REMATCH[2]}"; a3="${BASH_REMATCH[3]}"
+    [[ "$b" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+    b1="${BASH_REMATCH[1]}"; b2="${BASH_REMATCH[2]}"; b3="${BASH_REMATCH[3]}"
+    ((10#$a1 > 10#$b1)) && return 0
+    ((10#$a1 < 10#$b1)) && return 1
+    ((10#$a2 > 10#$b2)) && return 0
+    ((10#$a2 < 10#$b2)) && return 1
+    ((10#$a3 > 10#$b3))
+}
+
+protocol_update_check() {
+    local tmp remote_tool local_tool singbox_local singbox_latest
+    local new_protocols=() adapter_updates=() remote_id remote_name remote_ver local_ver
+    local has_update=0 singbox_update=0
+
+    command_exists curl || { echo -e "${RED}[错误]${PLAIN} 未找到 curl，无法检查协议更新。"; return 1; }
+    command_exists jq || { echo -e "${RED}[错误]${PLAIN} 未找到 jq，无法安全解析协议更新清单。"; return 1; }
+
+    tmp=$(make_temp_dir protocol-catalog)
+    if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --connect-timeout 5 --max-time 15 --retry 2 -o "${tmp}/remote.json" "$PROTOCOL_CATALOG_URL"; then
+        rm -rf "$tmp"
+        echo -e "${RED}[错误]${PLAIN} 无法取得远端协议更新清单。"
+        return 1
+    fi
+
+    if ! protocol_catalog_is_valid "${tmp}/remote.json"; then
+        rm -rf "$tmp"
+        echo -e "${RED}[错误]${PLAIN} 远端协议更新清单格式无效，已拒绝使用。"
+        return 1
+    fi
+
+    local_tool="$(cat "${VPS_TOOL_ROOT}/VERSION" 2>/dev/null || true)"
+    [[ -n "$local_tool" ]] || local_tool="unknown"
+    remote_tool=$(jq -r '.tool_version' "${tmp}/remote.json")
+
+    echo -e "${CYAN}[协议更新检查]${PLAIN} 当前工具：v${local_tool}，远端清单：v${remote_tool}"
+    local catalog_time
+    catalog_time=$(jq -r '.updated_at // empty' "${tmp}/remote.json")
+    [[ -n "$catalog_time" ]] && echo -e "${BLUE}[清单更新时间]${PLAIN} ${catalog_time}"
+
+    while IFS=$'\t' read -r remote_id remote_name remote_ver; do
+        [[ -n "$remote_id" ]] || continue
+        if ! protocol_local_id_exists "$remote_id"; then
+            new_protocols+=("${remote_name}|${remote_id}|v${remote_ver}")
+            has_update=1
+            continue
+        fi
+        local_ver=$(protocol_adapter_version_local "$remote_id" 2>/dev/null || true)
+        if [[ "$local_ver" =~ ^[0-9]+$ && "$remote_ver" =~ ^[0-9]+$ ]] && (( remote_ver > local_ver )); then
+            adapter_updates+=("${remote_name}|${remote_id}|v${local_ver}|v${remote_ver}")
+            has_update=1
+        fi
+    done < <(jq -r '.protocols[] | select(.status != "disabled") | [.id,.name,(.adapter_version | tostring)] | @tsv' "${tmp}/remote.json")
+
+    if [[ "$local_tool" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] && [[ "$remote_tool" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+        if protocol_version_gt "$remote_tool" "$local_tool"; then
+            echo -e "${YELLOW}[更新可用]${PLAIN} VPS-Tool 可更新：v${local_tool} → v${remote_tool}"
+            has_update=1
+        fi
+    fi
+
+    if singbox_local=$(singbox_current_version 2>/dev/null); then
+        if singbox_latest=$(latest_singbox_version 2>/dev/null); then
+            echo -e "${BLUE}[sing-box]${PLAIN} 当前：v${singbox_local}，最新稳定：v${singbox_latest}"
+            if [[ "$singbox_local" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] && [[ "$singbox_latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] && protocol_version_gt "$singbox_latest" "$singbox_local"; then
+                echo -e "${YELLOW}[更新可用]${PLAIN} sing-box 有新稳定版：v${singbox_local} → v${singbox_latest}"
+                singbox_update=1
+                has_update=1
+            fi
+        else
+            echo -e "${YELLOW}[提示]${PLAIN} 暂时无法取得 sing-box 最新稳定版本，本次跳过内核更新检查。"
+        fi
+    else
+        if resolve_singbox; then
+            echo -e "${YELLOW}[提示]${PLAIN} 已检测到 sing-box，但无法解析版本号；请手动执行 \`$SINGBOX_BIN version\` 查看。"
+        else
+            echo -e "${YELLOW}[提示]${PLAIN} 未检测到可执行的 sing-box，跳过内核更新检查。"
+        fi
+    fi
+
+    echo
+    if ((${#new_protocols[@]} > 0)); then
+        echo -e "${YELLOW}发现新协议/协议实现：${PLAIN}"
+        local item item_name item_id item_ver
+        for item in "${new_protocols[@]}"; do
+            IFS='|' read -r item_name item_id item_ver <<< "$item"
+            echo "  ★ ${item_name}（${item_id}，适配 ${item_ver}）"
+        done
+    fi
+    if ((${#adapter_updates[@]} > 0)); then
+        echo -e "${YELLOW}发现现有协议适配更新：${PLAIN}"
+        local update_name update_id update_old update_new
+        for item in "${adapter_updates[@]}"; do
+            IFS='|' read -r update_name update_id update_old update_new <<< "$item"
+            echo "  ↑ ${update_name}：${update_old} → ${update_new}"
+        done
+    fi
+
+    if (( has_update == 0 )); then
+        echo -e "${GREEN}[完成]${PLAIN} 当前协议适配与工具版本均未发现更新。"
+        rm -rf "$tmp"
+        return 0
+    fi
+
+    if ! protocol_version_gt "$remote_tool" "$local_tool" && ((${#new_protocols[@]} > 0 || ${#adapter_updates[@]} > 0)) && (( singbox_update == 0 )); then
+        echo -e "${YELLOW}[提示]${PLAIN} 远端协议清单已经变化，但工具版本号尚未提升；为避免覆盖同版本本地文件，本次只报告更新，不强制同步。"
+        rm -rf "$tmp"
+        return 0
+    fi
+
+    if (( singbox_update == 1 )) && ! protocol_version_gt "$remote_tool" "$local_tool" && ((${#new_protocols[@]} == 0 && ${#adapter_updates[@]} == 0)); then
+        echo -e "${YELLOW}[提示]${PLAIN} 检测到 sing-box 新版本。当前第 7 项先负责提示，尚未自动替换正在运行的 sing-box。"
+        echo -e "${BLUE}[建议]${PLAIN} 请先确认新版本与当前配置兼容，再单独执行内核升级。"
+        log_action "[协议更新检查] 检测到 sing-box 新版本：v${singbox_local} -> v${singbox_latest}"
+        rm -rf "$tmp"
+        return 0
+    fi
+
+    echo
+    echo -e "${CYAN}[说明]${PLAIN} 更新只会调用 VPS-Tool 自己的安全同步流程，不会执行远端清单中的任意代码或 URL。"
+    read -rp "是否立即更新 VPS-Tool 以获取最新协议适配？[y/N]: " confirm_update
+    if [[ ! "$confirm_update" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}[取消]${PLAIN} 本次未更新。"
+        rm -rf "$tmp"
+        return 0
+    fi
+
+    if [[ -x "${VPS_TOOL_ROOT}/install.sh" ]]; then
+        echo -e "${BLUE}[更新]${PLAIN} 正在通过现有安全更新流程同步最新版..."
+        if bash "${VPS_TOOL_ROOT}/install.sh" --update-return; then
+            echo -e "${GREEN}[成功]${PLAIN} 更新完成。请重新运行 ${CYAN}vps${PLAIN} 载入新版本模块。"
+            log_action "[协议更新] 用户在模块 2 中确认更新，已同步最新工具包"
+        else
+            echo -e "${RED}[错误]${PLAIN} 更新失败。"
+            rm -rf "$tmp"
+            return 1
+        fi
+    else
+        echo -e "${RED}[错误]${PLAIN} 找不到本地 VPS-Tool 更新入口：${VPS_TOOL_ROOT}/install.sh"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    rm -rf "$tmp"
+}
+
+disable_protocol_hopping_menu() {
+    local choices=() name idx choice
+    for name in $(protocol_fragment_names); do
+        [[ -n "$(state_get "$(protocol_hop_state_key "$name")" 2>/dev/null || true)" ]] && choices+=("$name")
+    done
+    if (( ${#choices[@]} == 0 )); then
+        echo -e "${YELLOW}[提示]${PLAIN} 当前没有启用端口跳跃。"
+        return 0
+    fi
+    echo -e "${CYAN}当前启用端口跳跃：${PLAIN}"
+    for idx in "${!choices[@]}"; do
+        name="${choices[$idx]}"
+        echo "  $((idx + 1)). ${name}（$(state_get "$(protocol_hop_state_key "$name")" 2>/dev/null || echo 未知)）"
+    done
+    echo "  0. 返回"
+    if ! IFS= read -r -p "请选择要关闭的协议 [0-${#choices[@]}]: " choice; then return 1; fi
+    [[ "$choice" =~ ^[0-9]+$ ]] || { echo -e "${RED}[错误]${PLAIN} 无效选项。"; return 1; }
+    (( choice == 0 )) && return 0
+    (( choice >= 1 && choice <= ${#choices[@]} )) || { echo -e "${RED}[错误]${PLAIN} 无效选项。"; return 1; }
+    name="${choices[$((choice - 1))]}"
+    echo -e "${BLUE}[处理]${PLAIN} 正在撤销 ${name} 的端口跳跃并恢复单端口监听……"
+    if ! remove_port_hopping "$name"; then
+        echo -e "${RED}[错误]${PLAIN} 端口跳跃撤销没有完全成功；状态记录被保留，请修复后重新执行。"
+        return 1
+    fi
+    systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
+    systemctl reset-failed "$SERVICE_UNIT" >/dev/null 2>&1 || true
+    if [[ -f "$CONF_FILE" ]]; then
+        if ! validate_singbox_config; then
+            echo -e "${RED}[错误]${PLAIN} 当前协议配置校验失败，未自动重启服务。"
+            return 1
+        fi
+        if ! restart_service_and_verify; then
+            echo -e "${RED}[错误]${PLAIN} 关闭端口跳跃后服务未能恢复，请查看上方 sing-box 日志。"
+            return 1
+        fi
+    fi
+    echo -e "${GREEN}[完成]${PLAIN} ${name} 已关闭端口跳跃并恢复单端口模式。"
 }
 
 remove_protocol_menu() {
@@ -1081,6 +1970,7 @@ uninstall_protocol_environment() {
         fi
     fi
     for name in $(protocol_fragment_names); do
+        remove_port_hopping "$name" || true
         file=$(protocol_fragment_file "$name") || continue
         if is_owned "$file"; then rm -f "$file"; unmark_owned "$file"; fi
         file=$(protocol_node_info_file "$name") || continue
@@ -1088,6 +1978,7 @@ uninstall_protocol_environment() {
         state_unset "protocol_${name}"
         state_unset "$(protocol_port_state_key "$name")"
     done
+    if is_owned "${CONF_DIR}/clash.yaml"; then rm -f "${CONF_DIR}/clash.yaml"; unmark_owned "${CONF_DIR}/clash.yaml"; fi
 
     if is_owned "$SERVICE_FILE"; then
         rm -f "$SERVICE_FILE"
@@ -1127,16 +2018,26 @@ protocol_menu() {
         echo "  4. 查看节点信息"
         echo "  5. 移除指定协议"
         echo "  6. 清理本工具创建的协议环境"
+        echo "  7. 检查协议更新 / 新协议"
+        echo "  8. 生成/查看 Clash / Mihomo 配置"
+        echo "  9. 显示节点二维码"
+        echo "  10. 协议诊断（只读）"
+        echo "  11. 关闭端口跳跃并恢复单端口"
         echo "  0. 返回"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请选择 [0-6]: " choice
+        read -rp "请选择 [0-11]: " choice
         case "$choice" in
             1) deploy_vless_reality || true; read -rp "按回车继续..." ;;
             2) deploy_hysteria2 || true; read -rp "按回车继续..." ;;
             3) deploy_tuic_v5 || true; read -rp "按回车继续..." ;;
-            4) show_protocol_node_info; read -rp "按回车继续..." ;;
+            4) show_protocol_node_info_menu; read -rp "按回车继续..." ;;
             5) remove_protocol_menu || true; read -rp "按回车继续..." ;;
             6) uninstall_protocol_environment || true; read -rp "按回车继续..." ;;
+            7) protocol_update_check || true; read -rp "按回车继续..." ;;
+            8) show_clash_yaml || true; read -rp "按回车继续..." ;;
+            9) show_protocol_qr_menu || true; read -rp "按回车继续..." ;;
+            10) protocol_diagnose || true; read -rp "按回车继续..." ;;
+            11) disable_protocol_hopping_menu || true; read -rp "按回车继续..." ;;
             0) break ;;
             *) echo -e "${RED}[错误]${PLAIN} 无效选项。"; sleep 1 ;;
         esac
