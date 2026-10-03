@@ -699,19 +699,30 @@ hop_range_conflicts() {
 }
 
 prompt_port_hopping() {
-    local choice range start end
+    local choice range start end blank_attempts=0
     PORT_HOP_RANGE=""
     PORT_HOP_ENABLED=0
     [[ "${1:-0}" == "1" ]] || return 0
-    read -rp "是否启用 UDP 端口跳跃？[y/N]: " choice
-    [[ "$choice" =~ ^[Yy]$ ]] || return 0
+    echo -e "${YELLOW}[说明]${PLAIN} 启用后，本机防火墙会为该范围每个 UDP 端口各加一条放行规则（最多 200 条）；关闭时会逐条收回。"
+    read -rp "是否启用 UDP 端口跳跃（可缓解晚高峰 UDP 限速）？[Y/n]: " choice
+    [[ "$choice" =~ ^[Nn]$ ]] && return 0
     while true; do
         read -rp "输入端口范围（例如 20000-20100，跨度 ≤ 200）：" range
+        if [[ -z "$range" ]]; then
+            ((blank_attempts += 1))
+            echo -e "${YELLOW}[提示]${PLAIN} 必须输入端口范围。"
+            if (( blank_attempts >= 3 )); then
+                echo -e "${YELLOW}[提示]${PLAIN} 连续 3 次未输入端口范围，已取消端口跳跃并继续部署。"
+                return 0
+            fi
+            continue
+        fi
         if ! validate_hop_range "$range"; then
             echo -e "${RED}[错误]${PLAIN} 范围必须为 1024-65535、起 < 止、跨度 ≤ 200。"
             continue
         fi
         start="${range%-*}"; end="${range#*-}"
+        echo -e "${YELLOW}[提醒]${PLAIN} 云平台安全组需放行整段 UDP ${start}-${end}，本工具只能管理本机防火墙。"
         if hop_range_conflicts "$start" "$end"; then
             echo -e "${RED}[错误]${PLAIN} 端口范围与现有监听/已部署协议存在冲突，请换一段范围。"
             continue
@@ -988,12 +999,66 @@ yaml_quote() {
     jq -Rn --arg v "$1" '$v'
 }
 
+install_qrencode_dependency() {
+    local install_output install_rc=0 choice
+    if command_exists qrencode; then
+        local qr_path qr_version
+        qr_path=$(command -v qrencode)
+        qr_version=$(qrencode --version 2>&1 | head -n1 || true)
+        if [[ -n "$qr_version" ]]; then
+            echo -e "${GREEN}[已安装]${PLAIN} qrencode 已安装：${qr_version}（${qr_path}）"
+        else
+            echo -e "${GREEN}[已安装]${PLAIN} qrencode 已安装：${qr_path}"
+        fi
+        return 0
+    fi
+
+    if [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || [[ ! -t 1 ]]; then
+        echo -e "${YELLOW}[提示]${PLAIN} 当前为非交互环境，已跳过二维码依赖安装。"
+        return 0
+    fi
+
+    echo -e "${YELLOW}[提示]${PLAIN} 显示二维码需要 qrencode，当前未安装。"
+    read -rp "是否现在安装？（约几百 KB，仅安装这一个包）[Y/n]: " choice
+    if [[ "$choice" =~ ^[Nn]$ ]]; then
+        echo -e "${YELLOW}[提示]${PLAIN} 已跳过安装。"
+        return 0
+    fi
+
+    if command_exists apt-get; then
+        install_output=$(DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode 2>&1) || install_rc=$?
+    elif command_exists dnf; then
+        install_output=$(dnf install -y qrencode 2>&1) || install_rc=$?
+    elif command_exists yum; then
+        install_output=$(yum install -y qrencode 2>&1) || install_rc=$?
+    else
+        install_rc=127
+        install_output="未找到 apt-get、dnf 或 yum。"
+    fi
+
+    if (( install_rc != 0 )) || ! command_exists qrencode; then
+        echo -e "${RED}[错误]${PLAIN} qrencode 安装失败。"
+        [[ -n "$install_output" ]] && echo "$install_output" | tail -n 8
+        if command_exists apt-get; then
+            echo "手动安装命令：apt install -y qrencode"
+        elif command_exists dnf; then
+            echo "手动安装命令：dnf install -y qrencode"
+        elif command_exists yum; then
+            echo "手动安装命令：yum install -y qrencode"
+        else
+            echo "手动安装命令：请使用当前发行版的软件包管理器安装 qrencode。"
+        fi
+        return 0
+    fi
+    echo -e "${GREEN}[成功]${PLAIN} qrencode 安装完成。"
+}
+
 display_protocol_qr() {
     local name="$1" file link
     [[ -n "${VPS_TOOL_PIPELINE:-}" ]] && return 0
     [[ -t 1 ]] || return 0
     if ! command_exists qrencode; then
-        echo -e "${YELLOW}[提示]${PLAIN} 未安装 qrencode，已跳过二维码；可执行 apt install qrencode 后重新查看。"
+        echo -e "${YELLOW}[提示]${PLAIN} 显示二维码需要 qrencode，当前未安装；请进入“其他与诊断 → 二维码”并执行第 1 项安装依赖。"
         return 0
     fi
     file=$(protocol_node_info_file "$name") || return 1
@@ -1002,6 +1067,41 @@ display_protocol_qr() {
     [[ -n "$link" ]] || { echo -e "${YELLOW}[提示]${PLAIN} ${name} 未找到可生成二维码的分享链接。"; return 0; }
     echo -e "${CYAN}[${name}] 节点二维码：${PLAIN}"
     printf '%s\n' "$link" | qrencode -t ANSIUTF8
+}
+
+qr_menu() {
+    local choice
+    while true; do
+        clear
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "${CYAN}                    二维码                         ${PLAIN}"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        if command_exists qrencode; then
+            echo -e "  当前状态：${GREEN}qrencode 已安装${PLAIN}"
+        else
+            echo -e "  当前状态：${YELLOW}qrencode 未安装${PLAIN}"
+        fi
+        echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e "  ${GREEN}1. 安装 / 检查二维码依赖（qrencode）${PLAIN}"
+        echo -e "  ${GREEN}2. 显示节点二维码${PLAIN}"
+        echo -e "  ${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e "  ${RED}0. 返回${PLAIN}"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        read -rp "请选择 [0-2]: " choice
+        case "$choice" in
+            1) install_qrencode_dependency; read -rp "按回车继续..." ;;
+            2)
+                if ! command_exists qrencode; then
+                    echo -e "${YELLOW}[提示]${PLAIN} 当前未安装 qrencode，请先执行第 1 项安装依赖。"
+                else
+                    show_protocol_qr_menu || true
+                fi
+                read -rp "按回车继续..."
+                ;;
+            0) return 0 ;;
+            *) echo -e "${RED}[错误]${PLAIN} 无效选项。"; sleep 1 ;;
+        esac
+    done
 }
 
 show_protocol_qr_menu() {
@@ -1229,7 +1329,7 @@ deploy_vless_reality() {
     fi
     validate_user_port "$port" || { echo -e "${RED}[错误]${PLAIN} 端口无效。"; return 1; }
     port_in_use "$port" tcp && { echo -e "${RED}[错误]${PLAIN} TCP 端口已被占用。"; return 1; }
-    state_exists protocol_vless && { echo -e "${YELLOW}[提示]${PLAIN} VLESS + Reality 已经部署。若需更换端口、SNI 或密钥，请先选择“5. 移除指定协议”移除它，再重新部署；移除过程中服务会短暂重启，完成后需要重新导入新的节点链接。"; return 1; }
+    state_exists protocol_vless && { echo -e "${YELLOW}[提示]${PLAIN} VLESS + Reality 已经部署。若需更换端口、SNI 或密钥，请先选择“5. 移除协议 / 清理全部”移除它，再重新部署；移除过程中服务会短暂重启，完成后需要重新导入新的节点链接。"; return 1; }
     check_protocol_resources vless || return 1
     vision_flow="xtls-rprx-vision"
     if [[ "$pipeline_mode" != "pipeline" && -z "${VPS_TOOL_PIPELINE:-}" ]]; then
@@ -1330,7 +1430,7 @@ deploy_hysteria2() {
     port="${input_port:-$default_port}"
     validate_user_port "$port" || { echo -e "${RED}[错误]${PLAIN} 端口无效。"; return 1; }
     port_in_use "$port" udp && { echo -e "${RED}[错误]${PLAIN} UDP 端口已被占用。"; return 1; }
-    state_exists protocol_hy2 && { echo -e "${YELLOW}[提示]${PLAIN} Hysteria 2 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除指定协议”移除它，再重新部署；移除过程中服务会短暂重启，完成后需要重新导入新的节点链接。"; return 1; }
+    state_exists protocol_hy2 && { echo -e "${YELLOW}[提示]${PLAIN} Hysteria 2 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除协议 / 清理全部”移除它，再重新部署；移除过程中服务会短暂重启，完成后需要重新导入新的节点链接。"; return 1; }
     if [[ -z "${VPS_TOOL_PIPELINE:-}" ]]; then prompt_port_hopping 1; hop_range="${PORT_HOP_RANGE:-}"; else hop_range=""; fi
     check_protocol_resources hy2 || return 1
 
@@ -1467,7 +1567,7 @@ deploy_tuic_v5() {
     port="${input_port:-$default_port}"
     validate_user_port "$port" || { echo -e "${RED}[错误]${PLAIN} 端口无效。"; return 1; }
     port_in_use "$port" udp && { echo -e "${RED}[错误]${PLAIN} UDP 端口已被占用。"; return 1; }
-    state_exists protocol_tuic && { echo -e "${YELLOW}[提示]${PLAIN} TUIC v5 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除指定协议”移除它，再重新部署；移除过程中服务会短暂重启，完成后需要重新导入新的节点链接。"; return 1; }
+    state_exists protocol_tuic && { echo -e "${YELLOW}[提示]${PLAIN} TUIC v5 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除协议 / 清理全部”移除它，再重新部署；移除过程中服务会短暂重启，完成后需要重新导入新的节点链接。"; return 1; }
     if [[ -z "${VPS_TOOL_PIPELINE:-}" ]]; then prompt_port_hopping 1; hop_range="${PORT_HOP_RANGE:-}"; else hop_range=""; fi
     check_protocol_resources tuic || return 1
 
@@ -1925,25 +2025,7 @@ disable_protocol_hopping_menu() {
 }
 
 remove_protocol_menu() {
-    local choices=() name idx choice
-    for name in $(protocol_fragment_names); do
-        state_exists "protocol_${name}" && choices+=("$name")
-    done
-    if (( ${#choices[@]} == 0 )); then
-        echo "暂无已部署协议。"
-        return 1
-    fi
-    echo -e "${CYAN}当前已部署协议：${PLAIN}"
-    for idx in "${!choices[@]}"; do
-        name="${choices[$idx]}"
-        echo "  $((idx + 1)). ${name}（$(protocol_status_text "$name")）"
-    done
-    echo "  0. 返回"
-    read -rp "请选择要移除的协议 [0-${#choices[@]}]: " choice
-    [[ "$choice" =~ ^[0-9]+$ ]] || { echo -e "${RED}[错误]${PLAIN} 无效选项。"; return 1; }
-    (( choice == 0 )) && return 0
-    (( choice >= 1 && choice <= ${#choices[@]} )) || { echo -e "${RED}[错误]${PLAIN} 无效选项。"; return 1; }
-    remove_protocol "${choices[$((choice - 1))]}"
+    remove_or_clean_menu
 }
 
 uninstall_protocol_environment() {
@@ -2003,41 +2085,97 @@ uninstall_protocol_environment() {
     log_action "[已撤销] 清理本工具创建的 sing-box 服务、协议片段、配置和凭据"
 }
 
+
+remove_or_clean_menu() {
+    local names=(vless hy2 tuic) name idx choice max
+    clear
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${CYAN}        移除协议 / 清理全部                       ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "  ${GREEN}1. 清理全部协议与协议环境（移除本工具创建的所有协议）${PLAIN}"
+    echo -e "  ${CYAN}----------------------------------------------------${PLAIN}"
+    for idx in "${!names[@]}"; do
+        name="${names[$idx]}"
+        echo -e "  ${GREEN}$((idx + 2)). ${name}（$(protocol_status_text "$name")）${PLAIN}"
+    done
+    max=$(( ${#names[@]} + 1 ))
+    echo -e "  ${CYAN}----------------------------------------------------${PLAIN}"
+    echo -e "  ${RED}0. 返回${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    read -rp "请选择 [0-${max}]: " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] || { echo -e "${RED}[错误]${PLAIN} 无效选项。"; return 0; }
+    (( choice == 0 )) && return 0
+    if (( choice == 1 )); then
+        uninstall_protocol_environment || true
+        return 0
+    fi
+    if (( choice >= 2 && choice <= max )); then
+        name="${names[$((choice - 2))]}"
+        if ! state_exists "protocol_${name}"; then
+            echo -e "${YELLOW}[提示]${PLAIN} 该协议当前未部署。"
+            return 0
+        fi
+        remove_protocol "$name" || true
+        return 0
+    fi
+    echo -e "${RED}[错误]${PLAIN} 无效选项。"
+}
+
+other_and_diagnose_menu() {
+    local choice
+    while true; do
+        clear
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "${CYAN}              其他与诊断                         ${PLAIN}"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "  ${YELLOW}1. 二维码（显示 / 安装依赖）${PLAIN}"
+        echo -e "  ${YELLOW}2. 生成 / 查看 Clash / Mihomo 配置${PLAIN}"
+        echo -e "  ${YELLOW}3. 协议诊断（只读）${PLAIN}"
+        echo -e "  ${YELLOW}4. 关闭端口跳跃并恢复单端口${PLAIN}"
+        echo -e "  ${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e "  ${RED}0. 返回${PLAIN}"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        read -rp "请选择 [0-4]: " choice
+        case "$choice" in
+            1) qr_menu ;;
+            2) show_clash_yaml || true; read -rp "按回车继续..." ;;
+            3) protocol_diagnose || true; read -rp "按回车继续..." ;;
+            4) disable_protocol_hopping_menu || true; read -rp "按回车继续..." ;;
+            0) return 0 ;;
+            *) echo -e "${RED}[错误]${PLAIN} 无效选项。"; sleep 1 ;;
+        esac
+    done
+}
+
 protocol_menu() {
     while true; do
         clear
-        local status_text
+        local status_text choice
         systemctl is-active --quiet "$SERVICE_UNIT" 2>/dev/null && status_text="${GREEN}运行中${PLAIN}" || status_text="${RED}未运行/未配置${PLAIN}"
         echo -e "${CYAN}====================================================${PLAIN}"
         echo -e "${CYAN}              [模块 2] 网络协议配置                ${PLAIN}"
         echo -e "服务：${status_text}"
         echo -e "${CYAN}====================================================${PLAIN}"
-        echo "  1. VLESS + Reality"
-        echo "  2. Hysteria 2"
-        echo "  3. TUIC v5（游戏/实时 UDP）"
-        echo "  4. 查看节点信息"
-        echo "  5. 移除指定协议"
-        echo "  6. 清理本工具创建的协议环境"
-        echo "  7. 检查协议更新 / 新协议"
-        echo "  8. 生成/查看 Clash / Mihomo 配置"
-        echo "  9. 显示节点二维码"
-        echo "  10. 协议诊断（只读）"
-        echo "  11. 关闭端口跳跃并恢复单端口"
-        echo "  0. 返回"
+        echo -e "  ${GREEN}1. VLESS + Reality${PLAIN}"
+        echo -e "  ${GREEN}2. Hysteria 2（支持端口跳跃）${PLAIN}"
+        echo -e "  ${GREEN}3. TUIC v5（游戏/实时 UDP）${PLAIN}"
+        echo -e "  ${GREEN}4. 查看节点信息${PLAIN}"
+        echo -e "  ${GREEN}5. 移除协议 / 清理全部${PLAIN}"
+        echo -e "  ${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e "  ${YELLOW}6. 检查协议更新 / 新协议${PLAIN}"
+        echo -e "  ${YELLOW}7. 其他与诊断${PLAIN}"
+        echo -e "  ${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e "  ${RED}0. 退出${PLAIN}"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请选择 [0-11]: " choice
+        read -rp "请选择 [0-7]: " choice
         case "$choice" in
             1) deploy_vless_reality || true; read -rp "按回车继续..." ;;
             2) deploy_hysteria2 || true; read -rp "按回车继续..." ;;
             3) deploy_tuic_v5 || true; read -rp "按回车继续..." ;;
             4) show_protocol_node_info_menu; read -rp "按回车继续..." ;;
-            5) remove_protocol_menu || true; read -rp "按回车继续..." ;;
-            6) uninstall_protocol_environment || true; read -rp "按回车继续..." ;;
-            7) protocol_update_check || true; read -rp "按回车继续..." ;;
-            8) show_clash_yaml || true; read -rp "按回车继续..." ;;
-            9) show_protocol_qr_menu || true; read -rp "按回车继续..." ;;
-            10) protocol_diagnose || true; read -rp "按回车继续..." ;;
-            11) disable_protocol_hopping_menu || true; read -rp "按回车继续..." ;;
+            5) remove_or_clean_menu; read -rp "按回车继续..." ;;
+            6) protocol_update_check || true; read -rp "按回车继续..." ;;
+            7) other_and_diagnose_menu ;;
             0) break ;;
             *) echo -e "${RED}[错误]${PLAIN} 无效选项。"; sleep 1 ;;
         esac
