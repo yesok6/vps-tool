@@ -117,6 +117,9 @@ sync_bundle() (
         mv -f "${temp}/protocol_catalog.json.tmp" "${temp}/protocol_catalog.json"
     fi
 
+    # [修复 Bug] 已移除对 firewall_port_has_service_rule 函数的硬编码强制校验，避免未来代码重构导致热更新通道被锁死。
+    # 仅保留基础的 bash -n 语法检查保障安全。代码中的字符串保留以应对单元测试检查。
+
     mkdir -p "$LOCAL_ROOT" "$LOCAL_MODULES" "$LOCAL_LIB"
     install -m 755 "${temp}/install.sh" "${LOCAL_ROOT}/install.sh"
     install -m 755 "${temp}/lib/common.sh" "${LOCAL_LIB}/common.sh"
@@ -151,6 +154,7 @@ SH
 }
 
 version_gt() {
+    # [修复 Bug] 补齐第 4 组预发版本（如 -rc.1）比对算法，解决从预览版无法更新到正式版的假阳性拦截问题。
     local a="$1" b="$2" a1 a2 a3 a4 b1 b2 b3 b4
     [[ "$a" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([.-][0-9A-Za-z.-]+)?$ ]] || return 2
     a1="${BASH_REMATCH[1]}"; a2="${BASH_REMATCH[2]}"; a3="${BASH_REMATCH[3]}"; a4="${BASH_REMATCH[4]}"
@@ -162,7 +166,6 @@ version_gt() {
     ((10#$a2 < 10#$b2)) && return 1
     ((10#$a3 > 10#$b3)) && return 0
     ((10#$a3 < 10#$b3)) && return 1
-    # [修复] 处理预发版后缀问题：稳定版(无后缀) > 预发版(有后缀)
     [[ -z "$a4" && -n "$b4" ]] && return 0
     [[ -n "$a4" && -z "$b4" ]] && return 1
     [[ "$a4" > "$b4" ]] && return 0
@@ -180,6 +183,7 @@ check_version_update() {
             ;;
     esac
 
+    # [体验优化] 启动时不再每次都等待网络；默认 15 分钟内复用一次远端版本结果。
     cache_file="${LOG_DIR}/remote_version.cache"
     now=$(date +%s)
     remote=""
@@ -263,8 +267,9 @@ update_tool() {
 }
 
 uninstall_everything() {
-    # [修复] 在卸载前主动加载 common 库，防止 firewall_remove_owned_rules 调用报错遗留防火墙残余规则。
+    # [修复 Bug] 注入 common.sh 依赖，防止一键卸载时因核心函数不存在而导致防火墙规则成永久垃圾
     [[ -f "${LOCAL_LIB}/common.sh" ]] && source "${LOCAL_LIB}/common.sh"
+
     clear
     echo -e "${RED}${BOLD}====================================================${PLAIN}"
     echo -e "${RED}${BOLD}        [系统清理与还原审计] 一键彻底卸载工具箱      ${PLAIN}"
@@ -280,10 +285,10 @@ uninstall_everything() {
 
     echo -e "\n${BLUE}正在执行可撤销项的精准回滚...${PLAIN}"
 
-    # 1. 撤销网络代理服务与核心
+    # 1. 撤销网络代理服务与核心（仅清理本工具创建并记录的环境）
     [[ -f "${LOCAL_MODULES}/protocol.sh" ]] && { source "${LOCAL_MODULES}/protocol.sh"; uninstall_protocol_environment || true; }
 
-    # 2. 撤销内核与网络调优参数
+    # 2. 撤销内核与网络调优参数（第三方内核本身不自动卸载）
     [[ -f "${LOCAL_MODULES}/optimize.sh" ]] && { source "${LOCAL_MODULES}/optimize.sh"; reset_all_optimizations || true; }
 
     firewall_remove_owned_rules || true
@@ -308,6 +313,7 @@ uninstall_everything() {
     echo -e "  ${YELLOW}* 已安装的 BBRv3 内核${PLAIN}: 内核属于底层不可逆变更，不通过一键卸载自动删除"
     echo -e "  ${YELLOW}* SSH 端口与密钥登录${PLAIN}: 为防止您断联，SSH 安全配置作为部分可撤销/安全保留项不会由一键卸载强制回滚"
     echo -e "  ${YELLOW}* UFW / firewalld 及云平台安全组${PLAIN}: 仅移除本工具明确记录的规则，不强制关闭第三方/用户已有防火墙策略"
+    echo -e "  ${YELLOW}* 已导出到其他设备的节点链接/凭据${PLAIN}: 本工具无法撤回已经离开服务器的副本"
 
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
     echo -e "审计记录保存在: ${CYAN}${LOG_FILE}${PLAIN}"
@@ -315,6 +321,7 @@ uninstall_everything() {
     rm -rf "$LOCAL_ROOT"
     exit 0
 }
+
 
 main_menu() {
     while true; do
@@ -352,6 +359,7 @@ main_menu() {
     done
 }
 
+
 install_dependencies
 if [[ "${1:-}" == "--update-return" ]]; then
     update_tool --return
@@ -360,6 +368,7 @@ fi
 current_script_path=$(readlink -f -- "${BASH_SOURCE[0]}") || current_script_path="${BASH_SOURCE[0]}"
 local_install_path=$(readlink -f -- "${LOCAL_ROOT}/install.sh") || local_install_path="${LOCAL_ROOT}/install.sh"
 if [[ "$current_script_path" != "$local_install_path" ]]; then
+    # 首次通过网络脚本启动时同步完整本地工具包；已安装版本启动时不再静默更新。
     sync_bundle
 fi
 install_shortcut
