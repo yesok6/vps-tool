@@ -26,22 +26,122 @@ resolve_singbox() {
     return 1
 }
 
+github_release_api_json() {
+    local endpoint="$1"
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --connect-timeout 10 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        "https://api.github.com/repos/SagerNet/sing-box/${endpoint}"
+}
+
 latest_singbox_version() {
-    local tag
-    tag=$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 \
-        https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name')
-    [[ -n "$tag" && "$tag" != "null" ]] || return 1
-    printf '%s' "${tag#v}"
+    local arch releases_json
+    case "$(uname -m)" in
+        x86_64) arch=amd64 ;;
+        aarch64) arch=arm64 ;;
+        *) return 1 ;;
+    esac
+
+    releases_json=$(github_release_api_json 'releases?per_page=100') || return 1
+    jq -er --arg arch "$arch" '
+        .[]
+        | select((.draft // false) == false and (.prerelease // false) == false)
+        | .tag_name as $tag
+        | select($tag != null and ($tag | startswith("v")))
+        | select(any(.assets[]?; .name == ("sing-box-" + ($tag | sub("^v"; "")) + "-linux-" + $arch + ".tar.gz")))
+        | ($tag | sub("^v"; ""))
+    ' <<<"$releases_json" | sed -n '1p'
+}
+
+fetch_release_asset_digest() {
+    local version="$1" asset="$2" release_json checksum
+    release_json=$(github_release_api_json "releases/tags/v${version}") || return 1
+    checksum=$(jq -r --arg name "$asset" '
+        .assets[]?
+        | select(.name == $name)
+        | (.digest // empty)
+    ' <<<"$release_json" | sed -n '1p' )
+    checksum="${checksum#sha256:}"
+    [[ "$checksum" =~ ^[A-Fa-f0-9]{64}$ ]] || return 1
+    printf '%s\n' "$checksum"
 }
 
 fetch_checksums_file() {
-    local version="$1" out="$2" name url
-    for name in sha256sums.txt sha256sums SHA256SUMS checksums.txt; do
+    local version="$1" out="$2" name url asset
+    asset="${SINGBOX_CHECKSUM_ASSET:-sing-box-${version}-linux-amd64.tar.gz}"
+    for name in \
+        sha256sums.txt \
+        sha256sums \
+        SHA256SUMS \
+        checksums.txt \
+        checksums.sha256 \
+        "${asset}.sha256" \
+        "${asset}.sha256.txt"; do
         url="https://github.com/SagerNet/sing-box/releases/download/v${version}/${name}"
-        if curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 -o "$out" "$url"; then
+        rm -f "$out"
+        if curl --fail --silent --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 30 -o "$out" "$url"; then
             [[ -s "$out" ]] && return 0
         fi
     done
+    return 1
+}
+
+extract_singbox_checksum() {
+    local file="$1" asset="$2"
+    awk -v asset="$asset" '
+        function valid_hash(s) {
+            return length(s) == 64 && s !~ /[^0-9A-Fa-f]/
+        }
+        {
+            # GNU coreutils 风格：<hash>  <filename> 或 <hash> *<filename>
+            hash=$1
+            name=$2
+            sub(/^\*/, "", name)
+            if (valid_hash(hash) && name == asset) {
+                print hash
+                exit
+            }
+
+            # BSD 风格：SHA256 (filename) = <hash>
+            prefix="SHA256 (" asset ") = "
+            if (index($0, prefix) == 1) {
+                hash=substr($0, length(prefix) + 1)
+                if (valid_hash(hash)) {
+                    print hash
+                    exit
+                }
+            }
+        }
+    ' "$file"
+}
+
+resolve_singbox_checksum() {
+    local version="$1" asset="$2" checksum_file="$3" checksum
+    local SINGBOX_CHECKSUM_ASSET="$asset"
+
+    if [[ "${VPS_TOOL_SKIP_SINGBOX_VERIFY:-0}" == "1" ]]; then
+        echo -e "${YELLOW}[警告]${PLAIN} VPS_TOOL_SKIP_SINGBOX_VERIFY=1：已跳过 sing-box SHA-256 校验，仅适用于明确完成人工核验的应急场景。" >&2
+        return 0
+    fi
+
+    if checksum=$(fetch_release_asset_digest "$version" "$asset"); then
+        printf '%s\n' "$checksum"
+        return 0
+    fi
+
+    if fetch_checksums_file "$version" "$checksum_file"; then
+        checksum=$(extract_singbox_checksum "$checksum_file" "$asset")
+        if [[ "$checksum" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+            printf '%s\n' "$checksum"
+            return 0
+        fi
+    fi
+
+    echo -e "${RED}[错误]${PLAIN} 上游 v${version} 未提供可用校验值（已尝试 GitHub Release API 的 digest 与 7 种校验文件名），拒绝安装未经校验的 sing-box。" >&2
+    echo -e "${YELLOW}[提示]${PLAIN} 可到 https://github.com/SagerNet/sing-box/releases/tag/v${version} 人工核验对应 ${asset} 的 SHA-256。" >&2
+    echo -e "${YELLOW}[提示]${PLAIN} 如确认需要应急跳过，可显式设置 VPS_TOOL_SKIP_SINGBOX_VERIFY=1；默认不会跳过校验。" >&2
     return 1
 }
 
@@ -66,20 +166,18 @@ install_singbox() {
             rm -rf "$tmp"
             return 1
         fi
-        if ! fetch_checksums_file "$version" "${tmp}/checksums.txt"; then
+        if checksum=$(resolve_singbox_checksum "$version" "$asset" "${tmp}/checksums.txt"); then
+            if [[ -n "$checksum" ]]; then
+                if ! echo "${checksum}  ${tmp}/${asset}" | sha256sum -c - >/dev/null; then
+                    rm -rf "$tmp"
+                    echo -e "${RED}[错误]${PLAIN} sing-box SHA-256 校验失败，已拒绝安装。"
+                    return 1
+                fi
+            else
+                echo -e "${YELLOW}[警告]${PLAIN} 本次未执行 sing-box SHA-256 校验。"
+            fi
+        else
             rm -rf "$tmp"
-            echo -e "${RED}[错误]${PLAIN} 无法取得官方校验文件，拒绝安装未经校验的二进制。"
-            return 1
-        fi
-        checksum=$(grep -F -- "$asset" "${tmp}/checksums.txt" | awk '{print $1}' | head -n1)
-        if [[ ! "$checksum" =~ ^[A-Fa-f0-9]{64}$ ]]; then
-            rm -rf "$tmp"
-            echo -e "${RED}[错误]${PLAIN} 校验文件中找不到 ${asset} 的 SHA-256。"
-            return 1
-        fi
-        if ! echo "${checksum}  ${tmp}/${asset}" | sha256sum -c - >/dev/null; then
-            rm -rf "$tmp"
-            echo -e "${RED}[错误]${PLAIN} sing-box SHA-256 校验失败，已拒绝安装。"
             return 1
         fi
 
