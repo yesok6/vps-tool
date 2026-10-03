@@ -82,7 +82,9 @@ grep -q 'rm -rf "$action_dir"' "$ROOT/modules/security.sh"
 ! grep -q 'after_service_install' "$ROOT/modules/protocol.sh"
 ! grep -q 'checksum_file' "$ROOT/modules/protocol.sh"
 grep -q 'local confirm' "$ROOT/lib/common.sh"
-grep -q 'grep -F -- "$asset"' "$ROOT/modules/protocol.sh"
+grep -q '^extract_singbox_checksum()' "$ROOT/modules/protocol.sh"
+grep -q 'github_release_api_json' "$ROOT/modules/protocol.sh"
+! grep -q 'for name in sha256sums.txt sha256sums SHA256SUMS checksums.txt' "$ROOT/modules/protocol.sh"
 
 # 14. 关键回滚路径不能因 set -e 意外中断。
 grep -qF 'restore_runtime_values || true' "$ROOT/modules/optimize.sh"
@@ -230,8 +232,8 @@ grep -qF '[取消]${PLAIN} 未执行第三方脚本。' "$ROOT/modules/ip_test.s
 grep -qF 'return 1' "$ROOT/modules/ip_test.sh"
 
 
-# 24. round21 补丁：版本号提升到 2.3.0；协议监听优先取 config.json，且不依赖 ss 固定字段号。
-grep -q '^CURRENT_VERSION="2.3.0"$' "$ROOT/install.sh"
+# 24. round22 补丁：版本号提升到 2.4.0；协议监听优先取 config.json，且不依赖 ss 固定字段号。
+grep -q '^CURRENT_VERSION="2.4.0"$' "$ROOT/install.sh"
 grep -qF 'port=$(jq -r --arg tag "${name}-in"' "$ROOT/modules/protocol.sh"
 grep -qF 'for (i = 1; i <= NF; i++)' "$ROOT/modules/protocol.sh"
 ! grep -qF '$5 ~ p' "$ROOT/modules/protocol.sh"
@@ -799,3 +801,105 @@ grep -q 'Debian/Ubuntu 为全量升级' "$ROOT/lib/common.sh"
 grep -q 'openssh-server/内核' "$ROOT/lib/common.sh"
 
 echo 'smoke tests: OK' 
+
+
+# 56. 增项 10：sing-box 校验使用 Release API digest 主路径，校验文件兜底，双路径失败拒绝，以及显式跳过开关。
+(
+    source "$ROOT/modules/protocol.sh"
+    fake_digest="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    fake_fallback="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    fake_curl() {
+        local out="" url=""
+        while (($#)); do
+            case "$1" in
+                -o) out="$2"; shift 2 ;;
+                http*) url="$1"; shift ;;
+                *) shift ;;
+            esac
+        done
+        if [[ "$url" == *"/releases/tags/v1.14.2" ]]; then
+            printf '{"tag_name":"v1.14.2","assets":[{"name":"sing-box-1.14.2-linux-amd64.tar.gz","digest":"sha256:%s"}]}' "$fake_digest"
+            return 0
+        fi
+        if [[ "$url" == *"/releases?per_page=100" ]]; then
+            printf '%s' '[
+              {"tag_name":"v9.9.9","draft":false,"prerelease":false,"assets":[{"name":"sing-box-9.9.9-linux-arm64.tar.gz"}]},
+              {"tag_name":"v1.14.1","draft":false,"prerelease":false,"assets":[{"name":"sing-box-1.14.1-linux-amd64.tar.gz"}]},
+              {"tag_name":"v1.14.0-rc.1","draft":false,"prerelease":true,"assets":[{"name":"sing-box-1.14.0-rc.1-linux-amd64.tar.gz"}]}
+            ]'
+            return 0
+        fi
+        if [[ "$url" == *"/checksums.sha256" ]]; then
+            [[ -n "$out" ]] || return 22
+            printf 'SHA256 (sing-box-1.14.2-linux-amd64.tar.gz) = %s\n' "$fake_fallback" > "$out"
+            return 0
+        fi
+        return 22
+    }
+    curl() { fake_curl "$@"; }
+
+    got=$(fetch_release_asset_digest 1.14.2 sing-box-1.14.2-linux-amd64.tar.gz)
+    [[ "$got" == "$fake_digest" ]]
+
+    [[ "$(latest_singbox_version)" == "1.14.1" ]]
+
+    fallback_json='{"tag_name":"v1.14.2","assets":[{"name":"sing-box-1.14.2-linux-amd64.tar.gz","digest":null}]}'
+    fake_curl() {
+        local out="" url=""
+        while (($#)); do
+            case "$1" in
+                -o) out="$2"; shift 2 ;;
+                http*) url="$1"; shift ;;
+                *) shift ;;
+            esac
+        done
+        if [[ "$url" == *"/releases/tags/v1.14.2" ]]; then
+            printf '%s' "$fallback_json"
+            return 0
+        fi
+        if [[ "$url" == *"/checksums.sha256" ]]; then
+            printf 'SHA256 (sing-box-1.14.2-linux-amd64.tar.gz) = %s\n' "$fake_fallback" > "$out"
+            return 0
+        fi
+        return 22
+    }
+    curl() { fake_curl "$@"; }
+    tmp_checksum=$(mktemp)
+    got=$(resolve_singbox_checksum 1.14.2 sing-box-1.14.2-linux-amd64.tar.gz "$tmp_checksum")
+    [[ "$got" == "$fake_fallback" ]]
+    rm -f "$tmp_checksum"
+
+    fake_curl() {
+        local out="" url=""
+        while (($#)); do
+            case "$1" in
+                -o) out="$2"; shift 2 ;;
+                http*) url="$1"; shift ;;
+                *) shift ;;
+            esac
+        done
+        if [[ "$url" == *"/releases/tags/v1.14.2" ]]; then
+            printf '%s' "$fallback_json"
+            return 0
+        fi
+        return 22
+    }
+    curl() { fake_curl "$@"; }
+    tmp_checksum=$(mktemp)
+    if error_text=$(resolve_singbox_checksum 1.14.2 sing-box-1.14.2-linux-amd64.tar.gz "$tmp_checksum" 2>&1); then
+        echo "resolve_singbox_checksum unexpectedly succeeded without a digest" >&2
+        exit 1
+    fi
+    grep -q '未提供可用校验值' <<<"$error_text"
+    rm -f "$tmp_checksum"
+
+    export VPS_TOOL_SKIP_SINGBOX_VERIFY=1
+    tmp_checksum=$(mktemp)
+    if ! warning_text=$(resolve_singbox_checksum 1.14.2 sing-box-1.14.2-linux-amd64.tar.gz "$tmp_checksum" 2>&1); then
+        echo "skip verification unexpectedly failed" >&2
+        exit 1
+    fi
+    grep -q 'VPS_TOOL_SKIP_SINGBOX_VERIFY=1' <<<"$warning_text"
+    rm -f "$tmp_checksum"
+    unset VPS_TOOL_SKIP_SINGBOX_VERIFY
+)
