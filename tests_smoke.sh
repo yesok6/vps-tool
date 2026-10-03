@@ -233,10 +233,11 @@ grep -qF 'return 1' "$ROOT/modules/ip_test.sh"
 
 
 # 24. round22 补丁：版本号提升到 2.4.0；协议监听优先取 config.json，且不依赖 ss 固定字段号。
-grep -q '^CURRENT_VERSION="2.6.0"$' "$ROOT/install.sh"
+grep -q '^CURRENT_VERSION="2.9.1"$' "$ROOT/install.sh"
 
 # Round26: v2rayN TUIC share-link compatibility.
-grep -q 'tuic_link="tuic://.*sni=\${sni}&allow_insecure=1#VPS-Tool-TUICv5"' "$ROOT/modules/protocol.sh"
+grep -q 'tuic_link="tuic://.*sni=\${sni}&allow_insecure=1' "$ROOT/modules/protocol.sh"
+grep -q 'tuic_link+="#VPS-Tool-TUICv5"' "$ROOT/modules/protocol.sh"
 grep -q 'congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=\${sni}&allow_insecure=1' "$ROOT/modules/protocol.sh"
 if grep -q 'tuic_link="tuic://.*&insecure=1&sni=' "$ROOT/modules/protocol.sh"; then
     echo "legacy TUIC insecure=1 link format must not be generated" >&2
@@ -829,7 +830,7 @@ echo 'smoke tests: OK'
             printf '{"tag_name":"v1.14.2","assets":[{"name":"sing-box-1.14.2-linux-amd64.tar.gz","digest":"sha256:%s"}]}' "$fake_digest"
             return 0
         fi
-        if [[ "$url" == *"/releases?per_page=100" ]]; then
+        if [[ "$url" == *"/releases?per_page=10" ]]; then
             printf '%s' '[
               {"tag_name":"v9.9.9","draft":false,"prerelease":false,"assets":[{"name":"sing-box-9.9.9-linux-arm64.tar.gz"}]},
               {"tag_name":"v1.14.1","draft":false,"prerelease":false,"assets":[{"name":"sing-box-1.14.1-linux-amd64.tar.gz"}]},
@@ -928,7 +929,7 @@ grep -q '^chmod 711 "$LOG_DIR" || true$' "$ROOT/install.sh"
 # 59. Round25：同步包不得重新安装明显过旧的 security.sh。
 grep -q 'firewall_port_has_service_rule' "$ROOT/modules/security.sh"
 grep -q '\[P0 安全闸门\]' "$ROOT/modules/security.sh"
-grep -q '下载到的 modules/security.sh 不是当前兼容版本' "$ROOT/install.sh"
+grep -q '下载到的 modules/security.sh 缺少关键防火墙归属函数' "$ROOT/install.sh"
 
 # 60. Round25：真实启动失败必须输出 journalctl 排障命令。
 grep -q 'journalctl -u "\$SERVICE_UNIT" -n 20 --no-pager -l' "$ROOT/modules/protocol.sh"
@@ -943,3 +944,303 @@ grep -q 'sleep 0.5' "$ROOT/modules/protocol.sh"
 grep -q 'systemctl stop "\$SERVICE_UNIT"' "$ROOT/modules/protocol.sh"
 grep -q 'systemctl reset-failed "\$SERVICE_UNIT"' "$ROOT/modules/protocol.sh"
 ! grep -q 'systemctl restart "\$SERVICE_UNIT" >/dev/null 2>&1 || true' "$ROOT/modules/protocol.sh"
+
+# 63. Round27：模块 2 增加协议/新协议更新检查，清单必须是结构化数据且不执行其中任何代码。
+grep -q '^protocol_update_check()' "$ROOT/modules/protocol.sh"
+grep -q '检查协议更新 / 新协议' "$ROOT/modules/protocol.sh"
+grep -q 'protocol_catalog.json' "$ROOT/modules/protocol.sh"
+grep -q -- '--update-return' "$ROOT/modules/protocol.sh"
+grep -q -- '--update-return' "$ROOT/install.sh"
+grep -q 'download_one "protocol_catalog.json"' "$ROOT/install.sh"
+grep -q 'install -m 644 "${temp}/protocol_catalog.json"' "$ROOT/install.sh"
+
+jq -e '(.schema_version | type == "number") and (.tool_version | type == "string") and (.protocols | type == "array") and all(.protocols[]; (.id | type == "string") and (.name | type == "string") and (.adapter_version | type == "number") and (.status | type == "string") and (.implemented | type == "boolean"))' "$ROOT/protocol_catalog.json" >/dev/null
+[[ "$(jq -r '.tool_version' "$ROOT/protocol_catalog.json")" == "2.9.1" ]]
+[[ "$(jq -r '.protocols | length' "$ROOT/protocol_catalog.json")" -eq 3 ]]
+[[ "$(jq -r '.protocols[] | select(.id == "tuic-v5") | .adapter_version' "$ROOT/protocol_catalog.json")" == "2" ]]
+
+# 63a. 远端只返回清单数据时，能发现新协议；坏 JSON 必须拒绝。
+update_check_capture="$TEST_STATE_ROOT/protocol-update-check.txt"
+VPS_TOOL_ROOT="$TEST_STATE_ROOT/protocol-root" bash -c '
+  source "$1/modules/protocol.sh"
+  mkdir -p "$VPS_TOOL_ROOT"
+  printf "2.9.1\n" > "$VPS_TOOL_ROOT/VERSION"
+  curl() {
+    local out=""
+    while (($#)); do
+      case "$1" in
+        -o) out="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    cat > "$out" <<"JSON"
+{"schema_version":1,"tool_version":"2.9.1","updated_at":"2026-10-03","protocols":[{"id":"vless-reality","name":"VLESS + Reality","status":"stable","implemented":true,"adapter_version":1},{"id":"hysteria2","name":"Hysteria 2","status":"stable","implemented":true,"adapter_version":1},{"id":"tuic-v5","name":"TUIC v5","status":"stable","implemented":true,"adapter_version":2},{"id":"new-protocol","name":"New Protocol","status":"stable","implemented":true,"adapter_version":1}]}
+JSON
+  }
+  protocol_update_check
+' _ "$ROOT" > "$update_check_capture" 2>&1
+grep -q '发现新协议/协议实现' "$update_check_capture"
+grep -q 'New Protocol' "$update_check_capture"
+grep -q '本次只报告更新，不强制同步' "$update_check_capture"
+
+VPS_TOOL_ROOT="$TEST_STATE_ROOT/protocol-root-bad" bash -c '
+  source "$1/modules/protocol.sh"
+  mkdir -p "$VPS_TOOL_ROOT"
+  curl() {
+    local out=""
+    while (($#)); do
+      case "$1" in
+        -o) out="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf "not-json" > "$out"
+  }
+  if protocol_update_check; then exit 1; fi
+' _ "$ROOT" >/dev/null 2>&1
+
+# 63b. 更新路径必须复用现有 install.sh --update-return，不接受协议清单提供的任意下载 URL。
+! grep -Eq 'curl.*PROTOCOL_CATALOG_URL.*\$|curl.*remote.*url' "$ROOT/modules/protocol.sh"
+grep -q 'bash "${VPS_TOOL_ROOT}/install.sh" --update-return' "$ROOT/modules/protocol.sh"
+
+echo 'round27 protocol update checks: OK'
+
+# 63d. Round28：模块 2 的协议更新检查同时检测本机 sing-box 与最新稳定版。
+grep -q '^singbox_current_version()' "$ROOT/modules/protocol.sh"
+grep -q 'sing-box 有新稳定版' "$ROOT/modules/protocol.sh"
+
+singbox_update_capture="$TEST_STATE_ROOT/singbox-update-check.txt"
+VPS_TOOL_ROOT="$TEST_STATE_ROOT/protocol-root-singbox" bash -c '
+  source "$1/modules/protocol.sh"
+  mkdir -p "$VPS_TOOL_ROOT"
+  printf "2.9.1\n" > "$VPS_TOOL_ROOT/VERSION"
+  fake="$VPS_TOOL_ROOT/fake-sing-box"
+  cat > "$fake" <<"EOF"
+#!/usr/bin/env bash
+echo "sing-box version 1.14.2"
+EOF
+  chmod +x "$fake"
+  resolve_singbox() { SINGBOX_BIN="$fake"; return 0; }
+  latest_singbox_version() { echo "1.15.0"; }
+  curl() {
+    local out=""
+    while (($#)); do
+      case "$1" in
+        -o) out="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    cat > "$out" <<"JSON"
+{"schema_version":1,"tool_version":"2.9.1","updated_at":"2026-10-03","protocols":[{"id":"vless-reality","name":"VLESS + Reality","status":"stable","implemented":true,"adapter_version":1},{"id":"hysteria2","name":"Hysteria 2","status":"stable","implemented":true,"adapter_version":1},{"id":"tuic-v5","name":"TUIC v5","status":"stable","implemented":true,"adapter_version":2}]}
+JSON
+  }
+  protocol_update_check
+' _ "$ROOT" > "$singbox_update_capture" 2>&1
+
+grep -q 'sing-box 有新稳定版：v1.14.2 → v1.15.0' "$singbox_update_capture"
+grep -q '当前第 7 项先负责提示' "$singbox_update_capture"
+grep -q '请先确认新版本与当前配置兼容' "$singbox_update_capture"
+
+echo 'round28 sing-box update detection: OK'
+
+# 63c. Round27：协议模块函数名不得因新增菜单逻辑发生碰撞/截断。
+[[ "$(grep -E '^[a-zA-Z_][a-zA-Z0-9_]*\(\) \{' "$ROOT/modules/protocol.sh" | sed 's/(.*//' | sort | uniq -d | wc -l)" -eq 0 ]]
+
+echo 'round27 function-name guard: OK'
+# 63b. Round30：端口跳跃失败回滚、路径统一、key 字面量匹配、全量端口冲突检查。
+grep -q 'dir="\${VPS_TOOL_ETC}/port-hop"' "$ROOT/modules/protocol.sh"
+grep -q 'file="\${VPS_TOOL_ETC}/port-hop/\${name}.nft"' "$ROOT/modules/protocol.sh"
+grep -q 'file="\${VPS_TOOL_ETC}/port-hop/\${name}.iptables"' "$ROOT/modules/protocol.sh"
+grep -q 'awk -v k="\$key"' "$ROOT/modules/protocol.sh"
+grep -q '用户 ID (UUID)' "$ROOT/modules/protocol.sh"
+! grep -q '用户 ID \\(UUID\\)' "$ROOT/modules/protocol.sh"
+grep -q '正在回滚本次端口跳跃' "$ROOT/modules/protocol.sh"
+
+hop_probe_dir="$TEST_STATE_ROOT/hop-probe-bin"
+mkdir -p "$hop_probe_dir"
+cat > "$hop_probe_dir/ss" <<'EOF_SS'
+#!/usr/bin/env bash
+# ss -H -lun: local address is field 5.
+printf '%s\n' \
+  'UNCONN 0 0 0.0.0.0:20055 0.0.0.0:*' \
+  'UNCONN 0 0 0.0.0.0:31000 0.0.0.0:*'
+EOF_SS
+chmod +x "$hop_probe_dir/ss"
+PATH="$hop_probe_dir:$PATH" VPS_TOOL_ROOT="$TEST_STATE_ROOT/hop-probe-root" bash -c '
+  source "$1/modules/protocol.sh"
+  if hop_range_conflicts 20000 20100; then exit 0; else exit 1; fi
+' _ "$ROOT"
+PATH="$hop_probe_dir:$PATH" VPS_TOOL_ROOT="$TEST_STATE_ROOT/hop-probe-root2" bash -c '
+  source "$1/modules/protocol.sh"
+  if hop_range_conflicts 30000 30050; then exit 1; else exit 0; fi
+' _ "$ROOT"
+
+# 63c. Round30：端口跳跃防火墙中途失败必须自动回滚已创建的状态与规则。
+hop_rollback_dir="$TEST_STATE_ROOT/hop-rollback-bin"
+mkdir -p "$hop_rollback_dir"
+cat > "$hop_rollback_dir/nft" <<'EOF_NFT'
+#!/usr/bin/env bash
+exit 0
+EOF_NFT
+chmod +x "$hop_rollback_dir/nft"
+PATH="$hop_rollback_dir:$PATH" VPS_TOOL_ROOT="$TEST_STATE_ROOT/hop-rollback-root" bash -c '
+  source "$1/modules/protocol.sh"
+  mkdir -p "$VPS_TOOL_ROOT" "$VPS_TOOL_ETC" "$VPS_TOOL_STATE" "$VPS_TOOL_BACKUPS"
+  firewall_calls="$VPS_TOOL_ROOT/firewall-calls"
+  firewall_allow(){
+    printf "allow %s/%s\n" "$1" "$2" >> "$firewall_calls"
+    [[ "$1" != "20001" ]]
+  }
+  firewall_remove_owned_rules(){
+    printf "remove %s/%s\n" "$1" "$2" >> "$firewall_calls"
+    return 0
+  }
+  if setup_port_hopping hy2 20000-20002 20000; then
+    exit 1
+  fi
+  ! state_exists "$(protocol_hop_state_key hy2)"
+  grep -q "remove 20000/udp" "$firewall_calls"
+' _ "$ROOT"
+
+# 63d. Round30：node_info_value 使用字面量 key，不把正则元字符当成模式。
+VPS_TOOL_ROOT="$TEST_STATE_ROOT/node-key-root" bash -c '
+  source "$1/modules/protocol.sh"
+  mkdir -p "$VPS_TOOL_ROOT"
+  f="$VPS_TOOL_ROOT/node.txt"
+  printf "%s\n" "a.b: literal" "aXb: wrong" > "$f"
+  [[ "$(node_info_value "$f" "a.b")" == "literal" ]]
+' _ "$ROOT"
+
+echo 'round30 targeted defect checks: OK'
+
+# 64. Round29：当前缺陷修复与新增功能的静态/单元验收。
+grep -q '因此客户端链接包含 allow_insecure=1' "$ROOT/modules/protocol.sh"
+grep -q '因此客户端链接包含 insecure=1' "$ROOT/modules/protocol.sh"
+grep -q "releases?per_page=10" "$ROOT/modules/protocol.sh"
+grep -q '本次跳过了 sing-box SHA-256 校验' "$ROOT/modules/protocol.sh"
+grep -q '下载到的 protocol_catalog.json 格式无效，已拒绝更新' "$ROOT/install.sh"
+grep -q '^check_protocol_resources()' "$ROOT/modules/protocol.sh"
+grep -q '^generate_clash_yaml()' "$ROOT/modules/protocol.sh"
+grep -q '^display_protocol_qr()' "$ROOT/modules/protocol.sh"
+grep -q '^protocol_diagnose()' "$ROOT/modules/protocol.sh"
+grep -q '^setup_port_hopping()' "$ROOT/modules/protocol.sh"
+grep -q '^remove_port_hopping()' "$ROOT/modules/protocol.sh"
+grep -q 'VPS_TOOL_FORCE_DEPLOY' "$ROOT/modules/protocol.sh"
+grep -q '10. 协议诊断（只读）' "$ROOT/modules/protocol.sh"
+grep -q '8. 生成/查看 Clash / Mihomo 配置' "$ROOT/modules/protocol.sh"
+grep -q '9. 显示节点二维码' "$ROOT/modules/protocol.sh"
+grep -q '11. 关闭端口跳跃并恢复单端口' "$ROOT/modules/protocol.sh"
+! grep -q '^SECURITY_MODULE_REV=' "$ROOT/install.sh" || true
+
+# 64a. 资源预检阈值、流水线和强制继续行为。
+resource_capture="$TEST_STATE_ROOT/resource-check.txt"
+VPS_TOOL_ROOT="$TEST_STATE_ROOT/resource-root" bash -c '
+  source "$1/modules/protocol.sh"
+  get_mem_available_mb(){ echo 110; }
+  get_root_free_mb(){ echo 600; }
+  current_swap_mb(){ echo 0; }
+  read(){ return 1; }
+  if check_protocol_resources vless; then echo "rc=0"; else echo "rc=1"; fi
+' _ "$ROOT" > "$resource_capture" 2>&1
+ grep -q '处于警告区' "$resource_capture"
+grep -q 'rc=1' "$resource_capture"
+
+resource_yes="$TEST_STATE_ROOT/resource-check-yes.txt"
+VPS_TOOL_ROOT="$TEST_STATE_ROOT/resource-root-yes" bash -c '
+  source "$1/modules/protocol.sh"
+  get_mem_available_mb(){ echo 110; }
+  get_root_free_mb(){ echo 600; }
+  current_swap_mb(){ echo 0; }
+  printf "y\n" | check_protocol_resources vless
+' _ "$ROOT" > "$resource_yes" 2>&1
+grep -q '\[通过\]' "$resource_yes"
+
+VPS_TOOL_PIPELINE=1 VPS_TOOL_ROOT="$TEST_STATE_ROOT/resource-root-pipeline" bash -c '
+  source "$1/modules/protocol.sh"
+  get_mem_available_mb(){ echo 110; }
+  get_root_free_mb(){ echo 600; }
+  current_swap_mb(){ echo 0; }
+  read(){ echo "READ_SHOULD_NOT_RUN" >&2; return 1; }
+  check_protocol_resources vless
+' _ "$ROOT" > /dev/null 2>&1
+
+VPS_TOOL_FORCE_DEPLOY=1 VPS_TOOL_ROOT="$TEST_STATE_ROOT/resource-root-force" bash -c '
+  source "$1/modules/protocol.sh"
+  get_mem_available_mb(){ echo 90; }
+  get_root_free_mb(){ echo 200; }
+  current_swap_mb(){ echo 0; }
+  check_protocol_resources vless
+' _ "$ROOT" > "$TEST_STATE_ROOT/resource-force.txt" 2>&1
+grep -q '已按用户要求强制继续' "$TEST_STATE_ROOT/resource-force.txt"
+
+# 64b. 端口跳跃范围校验。
+VPS_TOOL_ROOT="$TEST_STATE_ROOT/hop-root" bash -c '
+  source "$1/modules/protocol.sh"
+  validate_hop_range 20000-20100
+  ! validate_hop_range 100-200
+  ! validate_hop_range 20000-100
+  ! validate_hop_range 20000-20500
+' _ "$ROOT"
+
+# 64c. QR 可选依赖：调用被 command_exists 包裹，非交互/流水线模式不会阻塞。
+grep -q 'if ! command_exists qrencode' "$ROOT/modules/protocol.sh"
+grep -q 'qrencode -t ANSIUTF8' "$ROOT/modules/protocol.sh"
+grep -q 'VPS_TOOL_PIPELINE' "$ROOT/modules/protocol.sh"
+
+# 64d. Clash YAML：三协议节点都有时必须输出三个 server。
+clash_root="$TEST_STATE_ROOT/clash-root"
+mkdir -p "$clash_root/root" "$clash_root/etc/state" "$clash_root/etc/backups" "$clash_root/etc/sing-box"
+cat > "$clash_root/node_setup.sh" <<'EOF_CLASH'
+EOF_CLASH
+VPS_TOOL_ROOT="$clash_root/root" VPS_TOOL_ETC="$clash_root/etc" VPS_TOOL_STATE="$clash_root/etc/state" VPS_TOOL_BACKUPS="$clash_root/etc/backups" bash -c '
+  source "$1/modules/protocol.sh"
+  CONF_DIR="$VPS_TOOL_ETC/sing-box"; PROTOCOL_NODE_INFO_DIR="$CONF_DIR"
+  state_set protocol_vless 1; state_set protocol_vless_port 12345
+  state_set protocol_hy2 1; state_set protocol_hy2_port 23456
+  state_set protocol_tuic 1; state_set protocol_tuic_port 34567
+  for p in vless hy2 tuic; do :; done
+  cat > "$CONF_DIR/node_info_vless.txt" <<EOF_V
+服务器地址: 203.0.113.10
+连接端口: 12345
+用户 ID (UUID): uuid-v
+流控: xtls-rprx-vision
+SNI: addons.mozilla.org
+PublicKey: public-v
+ShortId: deadbeef
+EOF_V
+  cat > "$CONF_DIR/node_info_hy2.txt" <<EOF_H
+服务器地址: 203.0.113.10
+UDP 端口: 23456
+连接密码: pass-h
+SNI: bing.com
+EOF_H
+  cat > "$CONF_DIR/node_info_tuic.txt" <<EOF_T
+服务器地址: 203.0.113.10
+UDP 端口: 34567
+用户 ID (UUID): uuid-t
+连接密码: pass-t
+SNI: bing.com
+EOF_T
+  generate_clash_yaml >/dev/null
+' _ "$ROOT"
+[[ "$(grep -c '^    server:' "$clash_root/etc/sing-box/clash.yaml")" -eq 3 ]]
+[[ "$(stat -c '%a' "$clash_root/etc/sing-box/clash.yaml")" == 600 ]]
+
+# 64e. 协议诊断只读约束。
+awk '/^protocol_diagnose\(\)/,/^}/ {print}' "$ROOT/modules/protocol.sh" > "$TEST_STATE_ROOT/diagnose-body.txt"
+! grep -q 'state_set' "$TEST_STATE_ROOT/diagnose-body.txt"
+! grep -q 'systemctl restart' "$TEST_STATE_ROOT/diagnose-body.txt"
+! grep -qE '> *[^>]*(config\.json)' "$TEST_STATE_ROOT/diagnose-body.txt"
+
+# 64f. 端口跳跃关闭入口必须调用精确撤销函数而不是 flush 全表。
+grep -q '^disable_protocol_hopping_menu()' "$ROOT/modules/protocol.sh"
+grep -q 'remove_port_hopping "$name"' "$ROOT/modules/protocol.sh"
+grep -q 'VPS_TOOL_HOP_' "$ROOT/modules/protocol.sh"
+! grep -q 'nft flush table' "$ROOT/modules/protocol.sh"
+
+# 64g. security.sh 兼容守卫不再依赖中文注释文本。
+grep -q 'firewall_port_has_service_rule' "$ROOT/install.sh"
+! grep -q '\\[P0 安全闸门\\]' "$ROOT/install.sh" || true
+
+echo 'round29 defects-and-features: OK'
+
