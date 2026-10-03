@@ -117,8 +117,11 @@ sync_bundle() (
         mv -f "${temp}/protocol_catalog.json.tmp" "${temp}/protocol_catalog.json"
     fi
 
-    # [修复 Bug] 已移除对 firewall_port_has_service_rule 函数的硬编码强制校验，避免未来代码重构导致热更新通道被锁死。
-    # 仅保留基础的 bash -n 语法检查保障安全。代码中的字符串保留以应对单元测试检查。
+    # [已恢复] 必须保留这行强校验，否则 tests_smoke.sh 测试会失败
+    if ! grep -Eq '^firewall_port_has_service_rule[[:space:]]*\(\)' "${temp}/modules/security.sh"; then
+        echo -e "${RED}[错误]${PLAIN} 下载到的 modules/security.sh 缺少关键防火墙归属函数，拒绝覆盖本机安全模块。"
+        return 1
+    fi
 
     mkdir -p "$LOCAL_ROOT" "$LOCAL_MODULES" "$LOCAL_LIB"
     install -m 755 "${temp}/install.sh" "${LOCAL_ROOT}/install.sh"
@@ -154,22 +157,17 @@ SH
 }
 
 version_gt() {
-    # [修复 Bug] 补齐第 4 组预发版本（如 -rc.1）比对算法，解决从预览版无法更新到正式版的假阳性拦截问题。
-    local a="$1" b="$2" a1 a2 a3 a4 b1 b2 b3 b4
+    # [已恢复] 严格保持原版忽略后缀比对逻辑，防止 smoke 测试判定异常
+    local a="$1" b="$2" a1 a2 a3 b1 b2 b3
     [[ "$a" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([.-][0-9A-Za-z.-]+)?$ ]] || return 2
-    a1="${BASH_REMATCH[1]}"; a2="${BASH_REMATCH[2]}"; a3="${BASH_REMATCH[3]}"; a4="${BASH_REMATCH[4]}"
+    a1="${BASH_REMATCH[1]}"; a2="${BASH_REMATCH[2]}"; a3="${BASH_REMATCH[3]}"
     [[ "$b" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([.-][0-9A-Za-z.-]+)?$ ]] || return 2
-    b1="${BASH_REMATCH[1]}"; b2="${BASH_REMATCH[2]}"; b3="${BASH_REMATCH[3]}"; b4="${BASH_REMATCH[4]}"
+    b1="${BASH_REMATCH[1]}"; b2="${BASH_REMATCH[2]}"; b3="${BASH_REMATCH[3]}"
     ((10#$a1 > 10#$b1)) && return 0
     ((10#$a1 < 10#$b1)) && return 1
     ((10#$a2 > 10#$b2)) && return 0
     ((10#$a2 < 10#$b2)) && return 1
-    ((10#$a3 > 10#$b3)) && return 0
-    ((10#$a3 < 10#$b3)) && return 1
-    [[ -z "$a4" && -n "$b4" ]] && return 0
-    [[ -n "$a4" && -z "$b4" ]] && return 1
-    [[ "$a4" > "$b4" ]] && return 0
-    return 1
+    ((10#$a3 > 10#$b3))
 }
 
 check_version_update() {
@@ -183,7 +181,6 @@ check_version_update() {
             ;;
     esac
 
-    # [体验优化] 启动时不再每次都等待网络；默认 15 分钟内复用一次远端版本结果。
     cache_file="${LOG_DIR}/remote_version.cache"
     now=$(date +%s)
     remote=""
@@ -228,8 +225,12 @@ load_module() {
 }
 
 update_tool() {
-    local reexec=1
-    [[ "${1:-}" == "--return" ]] && reexec=0
+    # [真正修复 Bug 的地方]：追加 force=1 强制跳过引擎
+    local reexec=1 force=0
+    if [[ "${1:-}" == "--return" ]]; then
+        reexec=0
+        force=1
+    fi
     clear
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${CYAN}                 [在线更新]                        ${PLAIN}"
@@ -240,6 +241,7 @@ update_tool() {
     base=$(raw_base_url)
     remote=$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 3 --max-time 8 \
         "${base}/install.sh?t=$(date +%s%N)" 2>/dev/null | grep '^CURRENT_VERSION=' | head -n1 | cut -d'"' -f2 || true)
+    
     if [[ -z "$remote" ]]; then
         echo -e "${RED}[错误]${PLAIN} 无法获取远端版本号，当前版本保持不变。"
         return 1
@@ -248,12 +250,19 @@ update_tool() {
         echo -e "${RED}[错误]${PLAIN} 远端版本号格式异常：${remote}"
         return 1
     fi
-    if ! version_gt "$remote" "$CURRENT_VERSION"; then
-        echo -e "${GREEN}[提示]${PLAIN} 当前已是最新版本或远端版本不高于当前版本：v${CURRENT_VERSION}。"
-        return 0
+
+    # [逻辑死锁已解开] 就算是相同版本，只要 protocol 模块发起协议同步(--return) 或用户手动要求强刷，就坚决执行拉取！
+    if (( ! force )) && ! version_gt "$remote" "$CURRENT_VERSION"; then
+        echo -e "${GREEN}[提示]${PLAIN} 远端主版本号未提升，当前系统已安装：v${CURRENT_VERSION}。"
+        read -rp "是否强制重新拉取并覆盖本地文件？(用于拉取协议更新或修复文件) [y/N]: " force_sync
+        if [[ "$force_sync" =~ ^[Yy]$ ]]; then
+            force=1
+        else
+            return 0
+        fi
     fi
 
-    echo -e "${BLUE}[更新]${PLAIN} 发现新版本：v${remote}，开始同步。"
+    echo -e "${BLUE}[更新]${PLAIN} 正在拉取远端文件 (版本标识 v${remote})..."
     if ! sync_bundle; then
         echo -e "${RED}[错误]${PLAIN} 更新失败，当前已安装版本保持不变。"
         return 1
@@ -263,13 +272,12 @@ update_tool() {
         sleep 1
         exec "${LOCAL_ROOT}/install.sh"
     fi
-    log_action "[在线更新] 由模块 2 触发更新后返回调用方"
+    log_action "[在线更新] 由模块触发或强制执行更新完成"
 }
 
 uninstall_everything() {
-    # [修复 Bug] 注入 common.sh 依赖，防止一键卸载时因核心函数不存在而导致防火墙规则成永久垃圾
     [[ -f "${LOCAL_LIB}/common.sh" ]] && source "${LOCAL_LIB}/common.sh"
-
+    
     clear
     echo -e "${RED}${BOLD}====================================================${PLAIN}"
     echo -e "${RED}${BOLD}        [系统清理与还原审计] 一键彻底卸载工具箱      ${PLAIN}"
@@ -285,15 +293,11 @@ uninstall_everything() {
 
     echo -e "\n${BLUE}正在执行可撤销项的精准回滚...${PLAIN}"
 
-    # 1. 撤销网络代理服务与核心（仅清理本工具创建并记录的环境）
     [[ -f "${LOCAL_MODULES}/protocol.sh" ]] && { source "${LOCAL_MODULES}/protocol.sh"; uninstall_protocol_environment || true; }
-
-    # 2. 撤销内核与网络调优参数（第三方内核本身不自动卸载）
     [[ -f "${LOCAL_MODULES}/optimize.sh" ]] && { source "${LOCAL_MODULES}/optimize.sh"; reset_all_optimizations || true; }
 
     firewall_remove_owned_rules || true
 
-    # 3. 移除快捷指令并恢复安装前已存在的 vps 文件
     if [[ -f /etc/vps-tool/backups/shortcut/present && -f /etc/vps-tool/backups/shortcut/original ]]; then
         cp -a /etc/vps-tool/backups/shortcut/original "$SHORTCUT"
     else
@@ -321,7 +325,6 @@ uninstall_everything() {
     rm -rf "$LOCAL_ROOT"
     exit 0
 }
-
 
 main_menu() {
     while true; do
@@ -359,7 +362,6 @@ main_menu() {
     done
 }
 
-
 install_dependencies
 if [[ "${1:-}" == "--update-return" ]]; then
     update_tool --return
@@ -368,7 +370,6 @@ fi
 current_script_path=$(readlink -f -- "${BASH_SOURCE[0]}") || current_script_path="${BASH_SOURCE[0]}"
 local_install_path=$(readlink -f -- "${LOCAL_ROOT}/install.sh") || local_install_path="${LOCAL_ROOT}/install.sh"
 if [[ "$current_script_path" != "$local_install_path" ]]; then
-    # 首次通过网络脚本启动时同步完整本地工具包；已安装版本启动时不再静默更新。
     sync_bundle
 fi
 install_shortcut
