@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # 系统与高亮配色配置
 # ========================================================
 export LANG="${LANG:-C.UTF-8}"
-CURRENT_VERSION="2.4.0"
+CURRENT_VERSION="2.5.0"
 # GitHub 仓库配置
 GITHUB_USER="yesok6"
 GITHUB_REPO="vps-tool"
@@ -24,7 +24,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; CY
 [[ ${EUID} -eq 0 ]] || { echo -e "${RED}[错误]${PLAIN} 请使用 root 权限运行。"; exit 1; }
 
 mkdir -p "$LOG_DIR" "$LOCAL_ROOT" "$LOCAL_MODULES" "$LOCAL_LIB"
-chmod 700 "$LOG_DIR" || true
+chmod 711 "$LOG_DIR" || true
 
 log_action() {
     local action="${1:-}"
@@ -97,6 +97,14 @@ sync_bundle() (
     for file in "${temp}/install.sh" "${temp}/lib/common.sh" "${temp}"/modules/*.sh; do
         bash -n "$file"
     done
+
+    # 防止“版本号正确但关键 security.sh 实际仍是旧版”再次进入本机。
+    # 当前版本的安全模块必须包含 round19+ 的 P0 防失联闸门与精确规则判断。
+    if ! grep -q 'firewall_port_has_service_rule' "${temp}/modules/security.sh" || \
+       ! grep -q '\[P0 安全闸门\]' "${temp}/modules/security.sh"; then
+        echo -e "${RED}[错误]${PLAIN} 下载到的 modules/security.sh 不是当前兼容版本，拒绝覆盖本机安全模块。"
+        return 1
+    fi
 
     remote_version=$(grep '^CURRENT_VERSION=' "${temp}/install.sh" | head -n1 | cut -d'"' -f2 || true)
     [[ -n "$remote_version" ]] || { echo -e "${RED}[错误]${PLAIN} 下载的主程序缺少版本号。"; return 1; }
