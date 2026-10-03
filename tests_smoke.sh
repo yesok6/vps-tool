@@ -105,10 +105,9 @@ fi
 
 # 19a. 模块菜单取消必须停留在当前模块，不能因 set -e 直接退出模块子进程。
 # 19b. 四个交互模块的菜单调用必须吞掉“用户取消/操作失败”的非零返回，避免 set -e 退出整个模块。
-grep -qF '1) change_ssh_port 1 || true;' "$ROOT/modules/security.sh"
-grep -qF '2) change_ssh_port 2 || true;' "$ROOT/modules/security.sh"
-grep -qF '3) remove_old_ssh_port || true;' "$ROOT/modules/security.sh"
-grep -qF '4) cancel_ssh_port_migration || true;' "$ROOT/modules/security.sh"
+grep -qF '1) change_ssh_port || true;' "$ROOT/modules/security.sh"
+grep -qF '2) remove_old_ssh_port || true;' "$ROOT/modules/security.sh"
+grep -qF '3) cancel_ssh_port_migration || true;' "$ROOT/modules/security.sh"
 grep -qF '1) apply_production_tune || true;' "$ROOT/modules/optimize.sh"
 grep -qF '1) deploy_vless_reality || true;' "$ROOT/modules/protocol.sh"
 grep -qF '1) run_test_ipquality || true;' "$ROOT/modules/ip_test.sh"
@@ -188,108 +187,18 @@ normalized_root=$(readlink -f -- "$ROOT/install.sh")
 [[ "$normalized_link" == "$normalized_root" ]]
 
 
-# 27. SSH 端口迁移必须提供四种模式，并要求自动/手动删除使用真实新会话验证。
-grep -q '修改 SSH 端口（保留旧端口）' "$ROOT/modules/security.sh"
-grep -q '新端口真实登录后自动删除旧端口' "$ROOT/modules/security.sh"
-grep -q '删除已验证的旧 SSH 端口' "$ROOT/modules/security.sh"
-grep -q 'cancel_ssh_port_migration' "$ROOT/modules/security.sh"
-grep -q 'current_ssh_session_uses_port' "$ROOT/modules/security.sh"
-grep -q 'wait_for_new_ssh_session' "$ROOT/modules/security.sh"
+# 27. SSH 端口迁移只保留“保留旧端口 / 手动删除旧端口 / 回退”三种操作。
+grep -qF '1) change_ssh_port || true;' "$ROOT/modules/security.sh"
+grep -qF '2) remove_old_ssh_port || true;' "$ROOT/modules/security.sh"
+grep -qF '3) cancel_ssh_port_migration || true;' "$ROOT/modules/security.sh"
+! grep -qF 'change_ssh_port 2' "$ROOT/modules/security.sh"
+! grep -qF 'wait_for_new_ssh_session' "$ROOT/modules/security.sh"
+! grep -qF '新端口真实登录后自动删除旧端口' "$ROOT/modules/security.sh"
 
-# 28. 当前会话端口识别必须来自 SSH_CONNECTION；自动删除不得只看监听状态。
+# 28. 当前会话端口识别必须来自 SSH_CONNECTION。
 SSH_CONNECTION='198.51.100.20 54321 192.0.2.10 34567' bash -c 'source "$1"; [[ "$(current_ssh_session_port)" == "34567" ]]; current_ssh_session_uses_port 34567' _ "$ROOT/modules/security.sh"
 
-# 29. 实际新 SSH 会话检测要求目标端口 + 当前来源地址同时匹配。
-ssh_stub_dir="$TEST_STATE_ROOT/ssh-stub"
-mkdir -p "$ssh_stub_dir"
-cat > "$ssh_stub_dir/ss" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' 'ESTAB 0 0 192.0.2.10:34567 198.51.100.20:54322'
-EOF
-chmod +x "$ssh_stub_dir/ss"
-PATH="$ssh_stub_dir:$PATH" SSH_CONNECTION='198.51.100.20 54321 192.0.2.10 22' bash -c 'source "$1"; ssh_new_session_detected 34567' _ "$ROOT/modules/security.sh"
-# 自动迁移超时路径必须真的触发回退，而不是仅返回失败。这里用依赖替身运行 change_ssh_port 进行快速行为测试。
-rollback_marker="$TEST_STATE_ROOT/ssh-timeout-rollback"
-export ROLLBACK_MARKER="$rollback_marker"
-if ! printf '2222\n' | bash -c '
-    set -Eeuo pipefail
-    source "$1"
-    confirm_safety_prompt(){ return 0; }
-    check_os(){ return 0; }
-    get_current_ssh_port(){ echo 22; }
-    current_ssh_session_port(){ echo 22; }
-    active_ssh_socket(){ return 1; }
-    state_exists(){ return 1; }
-    validate_port(){ [[ "$1" == 2222 ]]; }
-    port_in_use(){ return 1; }
-    backup_current_ssh_files(){ return 0; }
-    backup_file_once(){ return 0; }
-    set_sshd_ports_global(){ return 0; }
-    validate_sshd_config(){ return 0; }
-    firewall_allow(){ return 0; }
-    restart_or_reload_ssh(){ return 0; }
-    ssh_port_listening(){ return 0; }
-    state_set(){ :; }
-    log_action(){ :; }
-    wait_for_new_ssh_session(){ return 1; }
-    cancel_ssh_port_migration(){ printf 'rollback\n' > "$ROLLBACK_MARKER"; return 0; }
-    change_ssh_port 2
-' _ "$ROOT/modules/security.sh"; then
-    :
-fi
-# change_ssh_port 需要把回退目标作为参数传给测试替身；若未生成标记则说明超时未触发自动回退。
-[[ -f "$rollback_marker" ]] && grep -q 'rollback' "$rollback_marker"
-
-
-# 30. 自动回退模式必须跳过人工确认，并恢复旧端口防火墙、清理新端口规则与迁移 state。
-auto_cancel_marker="$TEST_STATE_ROOT/auto-cancel-marker"
-export AUTO_CANCEL_MARKER="$auto_cancel_marker"
-auto_backup_dir="$TEST_STATE_ROOT/auto-cancel-backup/ssh_migration_sshd_config"
-mkdir -p "$auto_backup_dir"
-printf '1\n' > "$auto_backup_dir/present"
-printf 'Port 22\n' > "$auto_backup_dir/original"
-if bash -c '
-    set -Eeuo pipefail
-    source "$1"
-    VPS_TOOL_BACKUPS="$2"
-    state_get(){ case "$1" in ssh_migration_old_port) echo 22;; ssh_migration_new_port) echo 34567;; *) return 1;; esac; }
-    validate_ssh_port(){ [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
-    current_ssh_session_port(){ echo 22; }
-    make_temp_dir(){ mktemp -d; }
-    backup_current_ssh_files(){ return 0; }
-    restore_file_backup(){ return 0; }
-    validate_sshd_config(){ return 0; }
-    restart_or_reload_ssh(){ return 0; }
-    firewall_remove_owned_rules(){ printf "remove:%s/%s\n" "$1" "$2" >> "$AUTO_CANCEL_MARKER"; return 0; }
-    firewall_backend(){ echo ufw; }
-    firewall_allow(){ printf "allow:%s/%s\n" "$1" "$2" >> "$AUTO_CANCEL_MARKER"; return 0; }
-    state_unset(){ printf "unset:%s\n" "$1" >> "$AUTO_CANCEL_MARKER"; }
-    log_action(){ :; }
-    confirm_safety_prompt(){ echo confirm_called >> "$AUTO_CANCEL_MARKER"; return 1; }
-    cancel_ssh_port_migration 1
-' _ "$ROOT/modules/security.sh" "$TEST_STATE_ROOT/auto-cancel-backup"; then
-    :
-else
-    echo 'automatic cancel rollback failed' >&2
-    exit 1
-fi
-if grep -q '^confirm_called$' "$auto_cancel_marker"; then
-    echo 'automatic rollback unexpectedly prompted for confirmation' >&2
-    exit 1
-fi
-for expected_marker in \
-    'remove:34567/tcp' \
-    'allow:22/tcp' \
-    'unset:ssh_migration_old_port' \
-    'unset:ssh_migration_new_port' \
-    'unset:ssh_migration_mode'; do
-    if ! grep -qF -- "$expected_marker" "$auto_cancel_marker"; then
-        echo "automatic rollback test missing marker: $expected_marker" >&2
-        exit 1
-    fi
-done
-
-# 31. SSH 双端口配置必须保留原有其它全局 Port，并保留 Match 块。
+# 29. SSH 双端口配置必须保留原有其它全局 Port，并保留 Match 块。
 ssh_cfg="$TEST_STATE_ROOT/sshd_config.test"
 cat > "$ssh_cfg" <<'EOF'
 Port 22
@@ -301,45 +210,7 @@ Match User test
 EOF
 bash -c 'source "$1"; SSHD_CONFIG="$2"; set_sshd_ports_global 22 34567; grep -qx "Port 22" "$SSHD_CONFIG"; grep -qx "Port 34567" "$SSHD_CONFIG"; grep -qx "Port 2200" "$SSHD_CONFIG"; grep -q "^Match User test$" "$SSHD_CONFIG"; grep -q "^    Port 2201$" "$SSHD_CONFIG"' _ "$ROOT/modules/security.sh" "$ssh_cfg"
 
-
-# 31. 自动删除模式必须依赖“真实新会话已检测到”，而不能要求当前脚本会话已经切到新端口；手动模式则相反。
-SSH_CONNECTION='198.51.100.20 54321 192.0.2.10 22' bash -c '
-    source "$1"
-    state_set ssh_migration_old_port 22
-    state_set ssh_migration_new_port 34567
-    ssh_new_session_detected() { return 0; }
-    current_ssh_session_uses_port() { return 1; }
-    sshd_has_port() { return 0; }
-    FAKE_OLD_REMOVED=0
-    ssh_port_listening() { if [[ "$1" == "22" && "$FAKE_OLD_REMOVED" == "1" ]]; then return 1; fi; return 0; }
-    backup_current_ssh_files() { mkdir -p "$1"; printf "missing\\n" > "$1/authorized_keys.state"; }
-    remove_sshd_port_global() { FAKE_OLD_REMOVED=1; return 0; }
-    validate_sshd_config() { return 0; }
-    restart_or_reload_ssh() { return 0; }
-    firewall_backend() { echo none; }
-    log_action() { :; }
-    make_temp_dir() { mktemp -d "'"$TEST_STATE_ROOT"'/auto-remove.XXXXXX"; }
-    remove_old_ssh_port 22 34567 1
-    [[ ! -f "'"$VPS_TOOL_STATE"'/ssh_migration_old_port" ]] && [[ ! -f "'"$VPS_TOOL_STATE"'/ssh_migration_new_port" ]]
-' _ "$ROOT/modules/security.sh"
-
-if SSH_CONNECTION='198.51.100.20 54321 192.0.2.10 22' bash -c '
-    source "$1"
-    state_set ssh_migration_old_port 22
-    state_set ssh_migration_new_port 34567
-    ssh_new_session_detected() { return 0; }
-    current_ssh_session_uses_port() { return 1; }
-    sshd_has_port() { return 0; }
-    ssh_port_listening() { return 0; }
-    remove_old_ssh_port 22 34567 0
-' _ "$ROOT/modules/security.sh"; then
-    echo 'manual old-port deletion unexpectedly accepted an old-port session' >&2
-    exit 1
-fi
-state_unset ssh_migration_old_port
-state_unset ssh_migration_new_port
-
-# 32. SSH Port 指令的空格/等号两种写法都必须被规范化，避免留下脏的 Port= 配置。
+# 30. SSH Port 指令的空格/等号两种写法都必须被规范化，避免留下脏的 Port= 配置。
 ssh_cfg_eq="$TEST_STATE_ROOT/sshd_config.port-equals.test"
 cat > "$ssh_cfg_eq" <<'EOF'
 Port=22
@@ -351,13 +222,10 @@ Match User test
 EOF
 bash -c 'source "$1"; SSHD_CONFIG="$2"; set_sshd_ports_global 22 34567; grep -qx "Port 22" "$SSHD_CONFIG"; grep -qx "Port 34567" "$SSHD_CONFIG"; grep -qx "Port 2200" "$SSHD_CONFIG"; ! grep -qE "^[[:space:]]*Port[[:space:]]*=" "$SSHD_CONFIG"; grep -q "^Match User test$" "$SSHD_CONFIG"; grep -q "^    Port=2201$" "$SSHD_CONFIG"' _ "$ROOT/modules/security.sh" "$ssh_cfg_eq"
 
-# 33. 自动删除的二次检测必须存在，避免第一次发现后瞬时状态变化造成假失败。
-grep -q '^confirm_new_ssh_session()' "$ROOT/modules/security.sh"
-grep -qF 'confirm_new_ssh_session "$new_port" 10' "$ROOT/modules/security.sh"
-
-# 34. SSH 迁移必须提供安全回退菜单项。
+# 31. SSH 迁移必须提供安全回退菜单项，且不再保留自动删除旧端口的实现。
 grep -q '放弃本次迁移并恢复原 SSH 端口' "$ROOT/modules/security.sh"
 grep -q '^cancel_ssh_port_migration()' "$ROOT/modules/security.sh"
+! grep -qF 'cancel_ssh_port_migration 1' "$ROOT/modules/security.sh"
 
 # 35. 防火墙重复进入时应先展示当前状态；已启用后不应再次询问“立即启用”。
 grep -q '^firewall_show_allowed()' "$ROOT/modules/security.sh"
@@ -366,7 +234,7 @@ grep -q 'firewalld 已运行。' "$ROOT/modules/security.sh"
 grep -q '以后再次进入本选项将只展示当前状态' "$ROOT/modules/security.sh"
 
 # 36. README 必须包含迁移回退与防火墙状态式流程说明。
-grep -q '模块 1 → 3 → 4 放弃迁移并恢复原端口' "$ROOT/README.md"
+grep -q '模块 1 → 3 → 3 放弃迁移并恢复原端口' "$ROOT/README.md"
 grep -q '不会重复出现“立即启用”提示' "$ROOT/README.md"
 
 # 37. SSH endpoint 解析需覆盖 IPv4、标准方括号 IPv6 与极端未加方括号 IPv6。
@@ -493,5 +361,94 @@ bash -c '
   ensure_managed_swap() { return 0; }
   check_upgrade_resources
 ' _ "$ROOT/lib/common.sh"
+
+# 49. Fail2Ban SSH 防爆破：实际生成 jail 配置，验证端口、阈值、封禁时长与当前来源 IP 忽略项。
+f2b_test_dir="$TEST_STATE_ROOT/fail2ban"
+mkdir -p "$f2b_test_dir/bin"
+cat > "$f2b_test_dir/bin/fail2ban-client" <<'F2BCLIENT'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -t) exit 0 ;;
+  reload) exit 0 ;;
+  status) exit 0 ;;
+  set) exit 0 ;;
+  stop) exit 0 ;;
+  *) exit 0 ;;
+esac
+F2BCLIENT
+cat > "$f2b_test_dir/bin/systemctl" <<'SYSTEMCTL'
+#!/usr/bin/env bash
+exit 0
+SYSTEMCTL
+chmod +x "$f2b_test_dir/bin/fail2ban-client" "$f2b_test_dir/bin/systemctl"
+VPS_TOOL_STATE="$f2b_test_dir/state-enable" FAIL2BAN_CONFIG="$f2b_test_dir/vps-tool-sshd.local" \
+PATH="$f2b_test_dir/bin:$PATH" \
+bash -c '
+  source "$1/lib/common.sh"
+  source "$1/modules/security.sh"
+  check_os() { PKG_MANAGER=apt; OS_PRETTY="test"; return 0; }
+  firewall_backend() { echo none; }
+  fail2ban_detect_log_config() { printf "%s\\n" "backend = systemd" "journalmatch = _COMM=sshd + _COMM=sshd-session"; }
+  fail2ban_detect_banaction() { :; }
+  get_current_ssh_ports() { printf "22\\n2222\\n"; }
+  ssh_current_source_ip() { echo 203.0.113.10; }
+  confirm_safety_prompt() { return 0; }
+  fail2ban_enable_ssh_protection
+  grep -q "port = 22,2222" "$FAIL2BAN_CONFIG"
+  grep -q "findtime = 10m" "$FAIL2BAN_CONFIG"
+  grep -q "maxretry = 5" "$FAIL2BAN_CONFIG"
+  grep -q "bantime = 1d" "$FAIL2BAN_CONFIG"
+  grep -q "203.0.113.10" "$FAIL2BAN_CONFIG"
+' _ "$ROOT"
+
+# 49a. Fail2Ban 已启用时，SSH 端口变化必须自动同步；迁移期间保护双端口。
+f2b_sync_dir="$f2b_test_dir/sync"
+mkdir -p "$f2b_sync_dir"
+printf '%s\n' 'port = 22' > "$f2b_sync_dir/vps-tool-sshd.local"
+VPS_TOOL_STATE="$f2b_sync_dir/state" FAIL2BAN_CONFIG="$f2b_sync_dir/vps-tool-sshd.local" \
+PATH="$f2b_test_dir/bin:$PATH" \
+bash -c '
+  source "$1/lib/common.sh"
+  source "$1/modules/security.sh"
+  firewall_backend() { echo none; }
+  get_current_ssh_ports() { printf "2222\n"; }
+  fail2ban_detect_log_config() { printf "%s\n" "backend = systemd" "journalmatch = _COMM=sshd + _COMM=sshd-session"; }
+  fail2ban_detect_banaction() { :; }
+  mark_owned(){ :; }
+  is_owned(){ return 0; }
+  fail2ban_sync_ssh_protection
+  grep -q "port = 2222" "$FAIL2BAN_CONFIG"
+' _ "$ROOT"
+
+# 49b. SSH 迁移状态存在时，F2 通过真实 sshd 端口集合自动覆盖旧/新两个端口。
+f2b_migration_dir="$f2b_test_dir/migration"
+mkdir -p "$f2b_migration_dir"
+printf '%s\n' 'port = 22' > "$f2b_migration_dir/vps-tool-sshd.local"
+VPS_TOOL_STATE="$f2b_migration_dir/state" FAIL2BAN_CONFIG="$f2b_migration_dir/vps-tool-sshd.local" \
+PATH="$f2b_test_dir/bin:$PATH" \
+bash -c '
+  source "$1/lib/common.sh"
+  source "$1/modules/security.sh"
+  firewall_backend() { echo none; }
+  get_current_ssh_ports() { printf "22\n2222\n"; }
+  fail2ban_detect_log_config() { printf "%s\n" "backend = systemd" "journalmatch = _COMM=sshd + _COMM=sshd-session"; }
+  fail2ban_detect_banaction() { :; }
+  mark_owned(){ :; }
+  is_owned(){ return 0; }
+  fail2ban_sync_ssh_protection
+  grep -q "port = 22,2222" "$FAIL2BAN_CONFIG"
+' _ "$ROOT"
+
+# 49a. Fail2Ban 停用必须只删除本工具创建的 jail 配置，不卸载 Fail2Ban 软件包。
+VPS_TOOL_STATE="$f2b_test_dir/state-enable" FAIL2BAN_CONFIG="$f2b_test_dir/vps-tool-sshd.local" \
+PATH="$f2b_test_dir/bin:$PATH" \
+bash -c '
+  source "$1/lib/common.sh"
+  source "$1/modules/security.sh"
+  is_owned() { return 0; }
+  confirm_safety_prompt() { return 0; }
+  fail2ban_disable_ssh_protection
+  [[ ! -e "$FAIL2BAN_CONFIG" ]]
+' _ "$ROOT"
 
 echo 'smoke tests: OK'
