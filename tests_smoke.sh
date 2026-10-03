@@ -462,13 +462,35 @@ status_view=$(TERM=xterm VPS_TOOL_STATE="$f2b_status_dir/state" FAIL2BAN_CONFIG=
   get_current_ssh_ports() { printf "22\n2222\n"; }
   fail2ban_sync_ssh_protection() { :; }
   fail2ban_show_ssh_status
-' _ "$ROOT" || true)
+' _ "$ROOT" <<< '0' || true)
 grep -q '当前保护端口.*22,2222/tcp' <<< "$status_view"
-grep -q '一、当前封禁 IP 总数.*2' <<< "$status_view"
-grep -q '二、近 5 分钟新封禁 IP' <<< "$status_view"
-grep -q '三、当前封禁 IP 详细' <<< "$status_view"
-grep -q '198.51.100.8' <<< "$status_view"
-grep -q '203.0.113.9' <<< "$status_view"
+grep -q '1\..*查看当前封禁 IP 总数' <<< "$status_view"
+grep -q '2\..*查看近 5 分钟新封禁 IP' <<< "$status_view"
+grep -q '3\..*查看当前封禁 IP 详细' <<< "$status_view"
+
+recent_view=$(TERM=xterm VPS_TOOL_STATE="$f2b_status_dir/state" FAIL2BAN_CONFIG="$f2b_status_dir/vps-tool-sshd.local" PATH="$f2b_status_dir/bin:$PATH" bash -c '
+  source "$1/lib/common.sh"
+  source "$1/modules/security.sh"
+  get_current_ssh_ports() { printf "22\n2222\n"; }
+  fail2ban_sync_ssh_protection() { :; }
+  fail2ban_show_ssh_status
+' _ "$ROOT" <<< $'2
+' || true)
+grep -q '近 5 分钟新封禁 IP' <<< "$recent_view"
+grep -q '198.51.100.8' <<< "$recent_view"
+grep -q '203.0.113.9' <<< "$recent_view"
+
+detail_view=$(TERM=xterm VPS_TOOL_STATE="$f2b_status_dir/state" FAIL2BAN_CONFIG="$f2b_status_dir/vps-tool-sshd.local" PATH="$f2b_status_dir/bin:$PATH" bash -c '
+  source "$1/lib/common.sh"
+  source "$1/modules/security.sh"
+  get_current_ssh_ports() { printf "22\n2222\n"; }
+  fail2ban_sync_ssh_protection() { :; }
+  fail2ban_show_ssh_status
+' _ "$ROOT" <<< $'3
+' || true)
+grep -q '当前封禁 IP 详细' <<< "$detail_view"
+grep -q '198.51.100.8' <<< "$detail_view"
+grep -q '203.0.113.9' <<< "$detail_view"
 
 # 49a. Fail2Ban 已启用时，SSH 端口变化必须自动同步；迁移期间保护双端口。
 f2b_sync_dir="$f2b_test_dir/sync"
