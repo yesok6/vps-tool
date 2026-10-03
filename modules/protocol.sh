@@ -943,7 +943,7 @@ deploy_tuic_v5() {
     state_set protocol_tuic 1
     state_set protocol_tuic_port "$port"
     local tuic_link
-    tuic_link="tuic://${uuid}:${password}@${server_ip}:${port}/?congestion_control=bbr&udp_relay_mode=native&alpn=h3&insecure=1&sni=${sni}#VPS-Tool-TUICv5"
+    tuic_link="tuic://${uuid}:${password}@${server_ip}:${port}/?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${sni}&allow_insecure=1#VPS-Tool-TUICv5"
     if ! write_protocol_node_info tuic "===================== 节点连接信息 =====================
 协议方案: TUIC v5
 运行状态: $(protocol_status_text tuic)
