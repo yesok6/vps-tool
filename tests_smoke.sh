@@ -233,7 +233,15 @@ grep -qF 'return 1' "$ROOT/modules/ip_test.sh"
 
 
 # 24. round22 补丁：版本号提升到 2.4.0；协议监听优先取 config.json，且不依赖 ss 固定字段号。
-grep -q '^CURRENT_VERSION="2.5.0"$' "$ROOT/install.sh"
+grep -q '^CURRENT_VERSION="2.6.0"$' "$ROOT/install.sh"
+
+# Round26: v2rayN TUIC share-link compatibility.
+grep -q 'tuic_link="tuic://.*sni=\${sni}&allow_insecure=1#VPS-Tool-TUICv5"' "$ROOT/modules/protocol.sh"
+grep -q 'congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=\${sni}&allow_insecure=1' "$ROOT/modules/protocol.sh"
+if grep -q 'tuic_link="tuic://.*&insecure=1&sni=' "$ROOT/modules/protocol.sh"; then
+    echo "legacy TUIC insecure=1 link format must not be generated" >&2
+    exit 1
+fi
 grep -qF 'port=$(jq -r --arg tag "${name}-in"' "$ROOT/modules/protocol.sh"
 grep -qF 'for (i = 1; i <= NF; i++)' "$ROOT/modules/protocol.sh"
 ! grep -qF '$5 ~ p' "$ROOT/modules/protocol.sh"
