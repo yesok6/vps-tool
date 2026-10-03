@@ -204,12 +204,92 @@ ssh_stub_dir="$TEST_STATE_ROOT/ssh-stub"
 mkdir -p "$ssh_stub_dir"
 cat > "$ssh_stub_dir/ss" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' 'ESTAB 0 0 192.0.2.10:34567 198.51.100.20:54322 users:(())'
+printf '%s\n' 'ESTAB 0 0 192.0.2.10:34567 198.51.100.20:54322'
 EOF
 chmod +x "$ssh_stub_dir/ss"
 PATH="$ssh_stub_dir:$PATH" SSH_CONNECTION='198.51.100.20 54321 192.0.2.10 22' bash -c 'source "$1"; ssh_new_session_detected 34567' _ "$ROOT/modules/security.sh"
+# 自动迁移超时路径必须真的触发回退，而不是仅返回失败。这里用依赖替身运行 change_ssh_port 进行快速行为测试。
+rollback_marker="$TEST_STATE_ROOT/ssh-timeout-rollback"
+export ROLLBACK_MARKER="$rollback_marker"
+if ! printf '2222\n' | bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    confirm_safety_prompt(){ return 0; }
+    check_os(){ return 0; }
+    get_current_ssh_port(){ echo 22; }
+    current_ssh_session_port(){ echo 22; }
+    active_ssh_socket(){ return 1; }
+    state_exists(){ return 1; }
+    validate_port(){ [[ "$1" == 2222 ]]; }
+    port_in_use(){ return 1; }
+    backup_current_ssh_files(){ return 0; }
+    backup_file_once(){ return 0; }
+    set_sshd_ports_global(){ return 0; }
+    validate_sshd_config(){ return 0; }
+    firewall_allow(){ return 0; }
+    restart_or_reload_ssh(){ return 0; }
+    ssh_port_listening(){ return 0; }
+    state_set(){ :; }
+    log_action(){ :; }
+    wait_for_new_ssh_session(){ return 1; }
+    cancel_ssh_port_migration(){ printf 'rollback\n' > "$ROLLBACK_MARKER"; return 0; }
+    change_ssh_port 2
+' _ "$ROOT/modules/security.sh"; then
+    :
+fi
+# change_ssh_port 需要把回退目标作为参数传给测试替身；若未生成标记则说明超时未触发自动回退。
+[[ -f "$rollback_marker" ]] && grep -q 'rollback' "$rollback_marker"
 
-# 30. SSH 双端口配置必须保留原有其它全局 Port，并保留 Match 块。
+
+# 30. 自动回退模式必须跳过人工确认，并恢复旧端口防火墙、清理新端口规则与迁移 state。
+auto_cancel_marker="$TEST_STATE_ROOT/auto-cancel-marker"
+export AUTO_CANCEL_MARKER="$auto_cancel_marker"
+auto_backup_dir="$TEST_STATE_ROOT/auto-cancel-backup/ssh_migration_sshd_config"
+mkdir -p "$auto_backup_dir"
+printf '1\n' > "$auto_backup_dir/present"
+printf 'Port 22\n' > "$auto_backup_dir/original"
+if bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    VPS_TOOL_BACKUPS="$2"
+    state_get(){ case "$1" in ssh_migration_old_port) echo 22;; ssh_migration_new_port) echo 34567;; *) return 1;; esac; }
+    validate_ssh_port(){ [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
+    current_ssh_session_port(){ echo 22; }
+    make_temp_dir(){ mktemp -d; }
+    backup_current_ssh_files(){ return 0; }
+    restore_file_backup(){ return 0; }
+    validate_sshd_config(){ return 0; }
+    restart_or_reload_ssh(){ return 0; }
+    firewall_remove_owned_rules(){ printf "remove:%s/%s\n" "$1" "$2" >> "$AUTO_CANCEL_MARKER"; return 0; }
+    firewall_backend(){ echo ufw; }
+    firewall_allow(){ printf "allow:%s/%s\n" "$1" "$2" >> "$AUTO_CANCEL_MARKER"; return 0; }
+    state_unset(){ printf "unset:%s\n" "$1" >> "$AUTO_CANCEL_MARKER"; }
+    log_action(){ :; }
+    confirm_safety_prompt(){ echo confirm_called >> "$AUTO_CANCEL_MARKER"; return 1; }
+    cancel_ssh_port_migration 1
+' _ "$ROOT/modules/security.sh" "$TEST_STATE_ROOT/auto-cancel-backup"; then
+    :
+else
+    echo 'automatic cancel rollback failed' >&2
+    exit 1
+fi
+if grep -q '^confirm_called$' "$auto_cancel_marker"; then
+    echo 'automatic rollback unexpectedly prompted for confirmation' >&2
+    exit 1
+fi
+for expected_marker in \
+    'remove:34567/tcp' \
+    'allow:22/tcp' \
+    'unset:ssh_migration_old_port' \
+    'unset:ssh_migration_new_port' \
+    'unset:ssh_migration_mode'; do
+    if ! grep -qF -- "$expected_marker" "$auto_cancel_marker"; then
+        echo "automatic rollback test missing marker: $expected_marker" >&2
+        exit 1
+    fi
+done
+
+# 31. SSH 双端口配置必须保留原有其它全局 Port，并保留 Match 块。
 ssh_cfg="$TEST_STATE_ROOT/sshd_config.test"
 cat > "$ssh_cfg" <<'EOF'
 Port 22
