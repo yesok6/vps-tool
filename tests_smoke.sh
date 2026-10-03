@@ -107,7 +107,7 @@ fi
 # 19b. 四个交互模块的菜单调用必须吞掉“用户取消/操作失败”的非零返回，避免 set -e 退出整个模块。
 grep -qF '1) change_ssh_port || true;' "$ROOT/modules/security.sh"
 grep -qF '2) remove_old_ssh_port || true;' "$ROOT/modules/security.sh"
-grep -qF '3) cancel_ssh_port_migration || true;' "$ROOT/modules/security.sh"
+grep -qF '4) cancel_ssh_port_migration || true;' "$ROOT/modules/security.sh"
 grep -qF '1) apply_production_tune || true;' "$ROOT/modules/optimize.sh"
 grep -qF '1) deploy_vless_reality || true;' "$ROOT/modules/protocol.sh"
 grep -qF '1) run_test_ipquality || true;' "$ROOT/modules/ip_test.sh"
@@ -190,7 +190,7 @@ normalized_root=$(readlink -f -- "$ROOT/install.sh")
 # 27. SSH 端口迁移只保留“保留旧端口 / 手动删除旧端口 / 回退”三种操作。
 grep -qF '1) change_ssh_port || true;' "$ROOT/modules/security.sh"
 grep -qF '2) remove_old_ssh_port || true;' "$ROOT/modules/security.sh"
-grep -qF '3) cancel_ssh_port_migration || true;' "$ROOT/modules/security.sh"
+grep -qF '4) cancel_ssh_port_migration || true;' "$ROOT/modules/security.sh"
 ! grep -qF 'change_ssh_port 2' "$ROOT/modules/security.sh"
 ! grep -qF 'wait_for_new_ssh_session' "$ROOT/modules/security.sh"
 ! grep -qF '新端口真实登录后自动删除旧端口' "$ROOT/modules/security.sh"
@@ -234,7 +234,7 @@ grep -q 'firewalld 已运行。' "$ROOT/modules/security.sh"
 grep -q '以后再次进入本选项将只展示当前状态' "$ROOT/modules/security.sh"
 
 # 36. README 必须包含迁移回退与防火墙状态式流程说明。
-grep -q '模块 1 → 3 → 3 放弃迁移并恢复原端口' "$ROOT/README.md"
+grep -q '模块 1 → 3 → 4 放弃迁移并恢复原端口' "$ROOT/README.md"
 grep -q '不会重复出现“立即启用”提示' "$ROOT/README.md"
 
 # 37. SSH endpoint 解析需覆盖 IPv4、标准方括号 IPv6 与极端未加方括号 IPv6。
@@ -258,7 +258,7 @@ chmod +x "$firewall_stub_dir/firewall-cmd"
 PATH="$firewall_stub_dir:$PATH" bash -c 'source "$1"; firewall_rule_exists firewalld 80 tcp' _ "$ROOT/modules/security.sh"
 
 # 39. 回退时若防火墙清理失败，迁移 state 必须继续保留，避免用户失去后续重试入口。
-awk '/cancel_ssh_port_migration\(\)/,/^}/' "$ROOT/modules/security.sh" | grep -q 'if ! firewall_remove_owned_rules'
+grep -q 'if ! firewall_remove_owned_rules' < <(awk '/cancel_ssh_port_migration\(\)/,/^}/' "$ROOT/modules/security.sh")
 
 # 40. firewall_allow 在 firewalld 已存在 http service 时不得重复创建 80/tcp 端口规则或留下工具记录。
 firewall_stub_dir2="$TEST_STATE_ROOT/firewall-allow-stub"
@@ -284,8 +284,8 @@ if ! validate_port_any 22 || ! validate_port_any 65535 || validate_port_any 0 ||
     exit 1
 fi
 # firewall_allow / firewall_remove_owned_rules 不应再拒绝 22/tcp。
-grep -A8 '^firewall_allow()' "$ROOT/lib/common.sh" | grep -q 'validate_port_any'
-grep -A12 '^firewall_remove_owned_rules()' "$ROOT/lib/common.sh" | grep -q 'validate_port_any'
+grep -q 'validate_port_any' < <(grep -A8 '^firewall_allow()' "$ROOT/lib/common.sh")
+grep -q 'validate_port_any' < <(grep -A12 '^firewall_remove_owned_rules()' "$ROOT/lib/common.sh")
 
 # 42. 系统升级前必须显示资源检查，并使用分级资源阈值。
 grep -q '^check_upgrade_resources()' "$ROOT/lib/common.sh"
@@ -400,6 +400,75 @@ bash -c '
   grep -q "bantime = 1d" "$FAIL2BAN_CONFIG"
   grep -q "203.0.113.10" "$FAIL2BAN_CONFIG"
 ' _ "$ROOT"
+
+# 50. SSH 成功登录 IP：重复 IP 合并，并按最近一次成功登录时间倒序。
+ssh_login_test_dir="$TEST_STATE_ROOT/ssh-login"
+mkdir -p "$ssh_login_test_dir/bin"
+cat > "$ssh_login_test_dir/bin/journalctl" <<'EOF'
+#!/usr/bin/env bash
+cat <<'LOG'
+2026-10-03T09:00:00+0800 host sshd[1]: Accepted publickey for root from 198.51.100.10 port 50001 ssh2
+2026-10-03T09:10:00+0800 host sshd[2]: Accepted password for root from 203.0.113.7 port 50002 ssh2
+2026-10-03T09:20:00+0800 host sshd[3]: Accepted publickey for root from 198.51.100.10 port 50003 ssh2
+LOG
+EOF
+chmod +x "$ssh_login_test_dir/bin/journalctl"
+login_raw=$(PATH="$ssh_login_test_dir/bin:$PATH" bash -c '
+  source "$1/lib/common.sh"
+  source "$1/modules/security.sh"
+  ssh_success_login_entries
+' _ "$ROOT")
+login_view=$(printf '%s\n' "$login_raw" | awk -F'|' '{ip=$2; if (!(ip in latest) || $1 > latest[ip]) latest[ip]=$1; count[ip]++} END {for (ip in latest) print latest[ip] "|" ip "|" count[ip]}' | sort -t'|' -k1,1r)
+awk 'NR==1 {exit ($0 ~ /198\.51\.100\.10/ ? 0 : 1)}' <<< "$login_view"
+awk 'NR==2 {found=($0 ~ /203\.0\.113\.7/)} END {exit (found ? 0 : 1)}' <<< "$login_view"
+awk 'NR==1 {found=($0 ~ /\|2$/)} END {exit (found ? 0 : 1)}' <<< "$login_view"
+
+# 51. Fail2Ban 状态页：中文三段摘要、当前保护端口、近 5 分钟去重封禁日志。
+f2b_status_dir="$TEST_STATE_ROOT/fail2ban-status"
+mkdir -p "$f2b_status_dir/bin"
+cat > "$f2b_status_dir/bin/fail2ban-client" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  status)
+    if [[ "${2:-}" == "vps-tool-sshd" ]]; then
+      cat <<'OUT'
+Status for the jail: vps-tool-sshd
+|- Currently failed: 0
+|- Total failed: 12
+|- Currently banned: 2
+|- Total banned: 4
+`- Banned IP list: 198.51.100.8 203.0.113.9
+OUT
+      exit 0
+    fi
+    exit 1
+    ;;
+  -t|reload|set|stop) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+cat > "$f2b_status_dir/bin/journalctl" <<'EOF'
+#!/usr/bin/env bash
+cat <<'LOG'
+2026-10-03T09:56:00+0800 host fail2ban[1]: NOTICE [vps-tool-sshd] Ban 198.51.100.8
+2026-10-03T09:57:00+0800 host fail2ban[2]: NOTICE [vps-tool-sshd] Ban 198.51.100.8
+2026-10-03T09:58:00+0800 host fail2ban[3]: NOTICE [vps-tool-sshd] Ban 203.0.113.9
+LOG
+EOF
+chmod +x "$f2b_status_dir/bin/fail2ban-client" "$f2b_status_dir/bin/journalctl"
+status_view=$(TERM=xterm VPS_TOOL_STATE="$f2b_status_dir/state" FAIL2BAN_CONFIG="$f2b_status_dir/vps-tool-sshd.local" PATH="$f2b_status_dir/bin:$PATH" bash -c '
+  source "$1/lib/common.sh"
+  source "$1/modules/security.sh"
+  get_current_ssh_ports() { printf "22\n2222\n"; }
+  fail2ban_sync_ssh_protection() { :; }
+  fail2ban_show_ssh_status
+' _ "$ROOT" || true)
+grep -q '当前保护端口.*22,2222/tcp' <<< "$status_view"
+grep -q '一、当前封禁 IP 总数.*2' <<< "$status_view"
+grep -q '二、近 5 分钟新封禁 IP' <<< "$status_view"
+grep -q '三、当前封禁 IP 详细' <<< "$status_view"
+grep -q '198.51.100.8' <<< "$status_view"
+grep -q '203.0.113.9' <<< "$status_view"
 
 # 49a. Fail2Ban 已启用时，SSH 端口变化必须自动同步；迁移期间保护双端口。
 f2b_sync_dir="$f2b_test_dir/sync"
