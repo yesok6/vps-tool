@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # 系统与高亮配色配置
 # ========================================================
 export LANG="${LANG:-C.UTF-8}"
-CURRENT_VERSION="2.9.1"
+CURRENT_VERSION="2.9.3"
 # GitHub 仓库配置
 GITHUB_USER="yesok6"
 GITHUB_REPO="vps-tool"
@@ -74,7 +74,7 @@ install_dependencies() {
 
 sync_bundle() (
     set -Eeuo pipefail
-    local base temp file name remote_version
+    local base temp file name remote_version catalog_version
     base=$(raw_base_url)
     temp=$(mktemp -d /tmp/vps-tool-sync.XXXXXX)
     trap 'rm -rf "${temp}"' EXIT
@@ -98,9 +98,23 @@ sync_bundle() (
     for file in "${temp}/install.sh" "${temp}/lib/common.sh" "${temp}"/modules/*.sh; do
         bash -n "$file"
     done
+
+    remote_version=$(grep '^CURRENT_VERSION=' "${temp}/install.sh" | head -n1 | cut -d'"' -f2 || true)
+    [[ -n "$remote_version" ]] || { echo -e "${RED}[错误]${PLAIN} 下载的主程序缺少版本号。"; return 1; }
+    [[ "$remote_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
+        echo -e "${RED}[错误]${PLAIN} 下载的主程序版本号格式异常：${remote_version}"
+        return 1
+    }
+
     if ! jq -e '(.schema_version | type == "number") and (.tool_version | type == "string") and (.protocols | type == "array") and all(.protocols[]; (.id | type == "string") and (.name | type == "string") and (.adapter_version | type == "number") and (.status | type == "string") and (.implemented | type == "boolean"))' "${temp}/protocol_catalog.json" >/dev/null 2>&1; then
         echo -e "${RED}[错误]${PLAIN} 下载到的 protocol_catalog.json 格式无效，已拒绝更新。"
         return 1
+    fi
+    catalog_version=$(jq -r '.tool_version' "${temp}/protocol_catalog.json")
+    if [[ "$catalog_version" != "$remote_version" ]]; then
+        echo -e "${YELLOW}[警告]${PLAIN} protocol_catalog.json 的 tool_version=${catalog_version} 与 install.sh 的 CURRENT_VERSION=${remote_version} 不一致，已以 install.sh 为准。"
+        jq --arg v "$remote_version" '.tool_version = $v' "${temp}/protocol_catalog.json" > "${temp}/protocol_catalog.json.tmp"
+        mv -f "${temp}/protocol_catalog.json.tmp" "${temp}/protocol_catalog.json"
     fi
 
     # 防止“版本号正确但关键 security.sh 实际仍是旧版”再次进入本机。
@@ -109,13 +123,6 @@ sync_bundle() (
         echo -e "${RED}[错误]${PLAIN} 下载到的 modules/security.sh 缺少关键防火墙归属函数，拒绝覆盖本机安全模块。"
         return 1
     fi
-
-    remote_version=$(grep '^CURRENT_VERSION=' "${temp}/install.sh" | head -n1 | cut -d'"' -f2 || true)
-    [[ -n "$remote_version" ]] || { echo -e "${RED}[错误]${PLAIN} 下载的主程序缺少版本号。"; return 1; }
-    [[ "$remote_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
-        echo -e "${RED}[错误]${PLAIN} 下载的主程序版本号格式异常：${remote_version}"
-        return 1
-    }
 
     mkdir -p "$LOCAL_ROOT" "$LOCAL_MODULES" "$LOCAL_LIB"
     install -m 755 "${temp}/install.sh" "${LOCAL_ROOT}/install.sh"
