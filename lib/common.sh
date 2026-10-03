@@ -19,8 +19,9 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 PLAIN='\033[0m'
 
-mkdir -p "${VPS_TOOL_STATE}" "${VPS_TOOL_BACKUPS}"
-chmod 700 "${VPS_TOOL_ETC}" "${VPS_TOOL_STATE}" "${VPS_TOOL_BACKUPS}" 2>/dev/null || true
+mkdir -p "${VPS_TOOL_ETC}" "${VPS_TOOL_STATE}" "${VPS_TOOL_BACKUPS}"
+chmod 711 "${VPS_TOOL_ETC}" 2>/dev/null || true
+chmod 700 "${VPS_TOOL_STATE}" "${VPS_TOOL_BACKUPS}" 2>/dev/null || true
 
 die() {
     echo -e "${RED}[错误]${PLAIN} $*" >&2
@@ -37,7 +38,7 @@ require_root() {
 log_action() {
     local action="${1:-}"
     mkdir -p "${VPS_TOOL_ETC}"
-    chmod 700 "${VPS_TOOL_ETC}" 2>/dev/null || true
+    chmod 711 "${VPS_TOOL_ETC}" 2>/dev/null || true
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${action}" >> "${VPS_TOOL_LOG}"
     chmod 600 "${VPS_TOOL_LOG}" 2>/dev/null || true
 }
