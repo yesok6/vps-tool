@@ -82,11 +82,14 @@ apply_gai_ipv4_priority() {
     [[ -e "$GAI_CONF" ]] && original_exists=1
     backup_file_once "$GAI_CONF" gai_conf
     touch "$GAI_CONF"
-    if ! grep -Fqx 'precedence ::ffff:0:0/96  100' "$GAI_CONF"; then
+    # [可完全撤销] 只要系统已经存在语义相同的 precedence 行，就不重复添加；空白数量不影响判断。
+    # [安全保留] state=0 表示该行不是本工具新增的，卸载时不会删除用户原有规则。
+    if grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100[[:space:]]*$' "$GAI_CONF"; then
+        state_set gai_added_by_tool 0
+    else
         printf '%s\n' 'precedence ::ffff:0:0/96  100' >> "$GAI_CONF"
         state_set gai_added_by_tool 1
-    else
-        state_set gai_added_by_tool 0
+        state_set gai_added_line 'precedence ::ffff:0:0/96  100'
     fi
     state_set gai_original_exists "$original_exists"
 }
@@ -299,12 +302,14 @@ reset_all_optimizations() {
     restore_file_backup "$SYSCTL_CONF" sysctl_optimizer_conf || true
     restore_file_backup "$LIMITS_CONF" limits_conf || true
     if [[ "$(state_get gai_added_by_tool 2>/dev/null || true)" == "1" ]]; then
-        sed -i '\#^precedence ::ffff:0:0\/96[[:space:]]\+100$#d' "$GAI_CONF" 2>/dev/null || restore_failed=1
+        # [可完全撤销] 只删除本工具实际追加的那一条 canonical 行，用户原有的等价写法保持不动。
+        sed -i -E '\#^precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100[[:space:]]*$#d' "$GAI_CONF" 2>/dev/null || restore_failed=1
     fi
     if [[ "$(state_get gai_original_exists 2>/dev/null || true)" == "0" && -f "$GAI_CONF" ]]; then
         [[ ! -s "$GAI_CONF" ]] && rm -f "$GAI_CONF"
     fi
     state_unset gai_added_by_tool
+    state_unset gai_added_line
     state_unset gai_original_exists
 
     if [[ "$(state_get swap_created 2>/dev/null || true)" == "1" ]] && is_owned "$SWAP_PATH"; then
