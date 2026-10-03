@@ -220,11 +220,38 @@ install_singbox() {
         return 1
     fi
     backup_file_once "$SERVICE_FILE" protocol_service_unit
-    cat > "$SERVICE_FILE" <<EOF2
+    local service_hardening="${VPS_TOOL_SERVICE_HARDENING:-on}"
+    case "${service_hardening,,}" in
+        off|0|false|no)
+            cat > "$SERVICE_FILE" <<EOF2
 [Unit]
 Description=VPS-Tool sing-box service
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=vps-tool
+Group=vps-tool
+ExecStart=${SINGBOX_BIN} run -c ${CONF_FILE}
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+            ;;
+        *)
+            cat > "$SERVICE_FILE" <<EOF2
+[Unit]
+Description=VPS-Tool sing-box service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -245,14 +272,16 @@ ProtectControlGroups=true
 RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 ReadOnlyPaths=/etc/vps-tool/sing-box
 
 [Install]
 WantedBy=multi-user.target
 EOF2
-chmod 0644 "$SERVICE_FILE"
-mark_owned "$SERVICE_FILE"
+            ;;
+    esac
+    chmod 0644 "$SERVICE_FILE"
+    mark_owned "$SERVICE_FILE"
 
 systemctl daemon-reload
 systemctl enable "$SERVICE_UNIT" >/dev/null
@@ -540,13 +569,39 @@ service_was_running() {
     systemctl is-active --quiet "$SERVICE_UNIT" 2>/dev/null
 }
 
+show_singbox_start_failure() {
+    echo -e "${RED}[错误]${PLAIN} sing-box 服务启动失败，下面是最近 20 条真实日志："
+    journalctl -u "$SERVICE_UNIT" -n 20 --no-pager -l 2>/dev/null | sed 's/^/    /' || true
+    log_action "[错误] ${SERVICE_UNIT} 启动失败；请执行 journalctl -u ${SERVICE_UNIT} -n 50 --no-pager -l 查看详情"
+}
+
 restart_service_and_verify() {
     systemctl daemon-reload
     if ! systemctl restart "$SERVICE_UNIT"; then
+        show_singbox_start_failure
+        systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
+        systemctl reset-failed "$SERVICE_UNIT" >/dev/null 2>&1 || true
         return 1
     fi
-    sleep 1
-    systemctl is-active --quiet "$SERVICE_UNIT"
+
+    local attempt
+    for ((attempt = 1; attempt <= 20; attempt++)); do
+        if systemctl is-active --quiet "$SERVICE_UNIT"; then
+            return 0
+        fi
+        if systemctl is-failed --quiet "$SERVICE_UNIT"; then
+            show_singbox_start_failure
+            systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
+            systemctl reset-failed "$SERVICE_UNIT" >/dev/null 2>&1 || true
+            return 1
+        fi
+        sleep 0.5
+    done
+
+    show_singbox_start_failure
+    systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
+    systemctl reset-failed "$SERVICE_UNIT" >/dev/null 2>&1 || true
+    return 1
 }
 
 write_node_info() {
@@ -627,7 +682,11 @@ deploy_vless_reality() {
     if ! restart_service_and_verify; then
         restore_protocol_fragment_transaction vless "$rollback_dir" "$had_fragment" >/dev/null
         validate_singbox_config >/dev/null 2>&1 || true
-        systemctl restart "$SERVICE_UNIT" >/dev/null 2>&1 || true
+        systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
+        systemctl reset-failed "$SERVICE_UNIT" >/dev/null 2>&1 || true
+        if [[ -f "$CONF_FILE" ]]; then
+            systemctl start "$SERVICE_UNIT" >/dev/null 2>&1 || echo -e "${YELLOW}[警告]${PLAIN} 回滚后的旧协议服务未能重新启动，请根据上方日志排查。"
+        fi
         rm -rf "$rollback_dir"
         echo -e "${RED}[错误]${PLAIN} sing-box 启动失败，已仅恢复原协议配置。"
         return 1
@@ -743,8 +802,12 @@ deploy_hysteria2() {
         rm -f "$cert_file" "$key_file"
         unmark_owned "$cert_file"
         unmark_owned "$key_file"
+        systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
+        systemctl reset-failed "$SERVICE_UNIT" >/dev/null 2>&1 || true
+        if [[ -f "$CONF_FILE" ]]; then
+            systemctl start "$SERVICE_UNIT" >/dev/null 2>&1 || echo -e "${YELLOW}[警告]${PLAIN} 回滚后的旧协议服务未能重新启动，请根据上方日志排查。"
+        fi
         rm -rf "$rollback_dir"
-        systemctl restart "$SERVICE_UNIT" >/dev/null 2>&1 || true
         echo -e "${RED}[错误]${PLAIN} Hysteria 2 启动失败，已仅恢复原协议配置。"
         return 1
     fi
@@ -865,7 +928,11 @@ deploy_tuic_v5() {
         rm -f "$cert_file" "$key_file"
         unmark_owned "$cert_file"
         unmark_owned "$key_file"
-        systemctl restart "$SERVICE_UNIT" >/dev/null 2>&1 || true
+        systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
+        systemctl reset-failed "$SERVICE_UNIT" >/dev/null 2>&1 || true
+        if [[ -f "$CONF_FILE" ]]; then
+            systemctl start "$SERVICE_UNIT" >/dev/null 2>&1 || echo -e "${YELLOW}[警告]${PLAIN} 回滚后的旧协议服务未能重新启动，请根据上方日志排查。"
+        fi
         rm -rf "$rollback_dir"
         echo -e "${RED}[错误]${PLAIN} sing-box 启动失败，已仅恢复原协议配置。"
         return 1
@@ -933,7 +1000,11 @@ remove_protocol() {
         if ! restart_service_and_verify; then
             restore_protocol_fragment_transaction "$name" "$rollback_dir" "$had_fragment" >/dev/null
             validate_singbox_config >/dev/null 2>&1 || true
-            systemctl restart "$SERVICE_UNIT" >/dev/null 2>&1 || true
+            systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
+            systemctl reset-failed "$SERVICE_UNIT" >/dev/null 2>&1 || true
+            if [[ -f "$CONF_FILE" ]]; then
+                systemctl start "$SERVICE_UNIT" >/dev/null 2>&1 || echo -e "${YELLOW}[警告]${PLAIN} 恢复后的协议服务未能重新启动，请根据上方日志排查。"
+            fi
             rm -rf "$rollback_dir"
             echo -e "${RED}[错误]${PLAIN} 移除 ${name} 后服务未能按新配置启动，已恢复该协议。"
             return 1
