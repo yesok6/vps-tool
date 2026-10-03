@@ -176,7 +176,7 @@ ssh_new_session_detected() {
     read -r _ remote_port _ current_session_local_port _ <<< "${SSH_CONNECTION:-}"
     [[ "$remote_port" =~ ^[0-9]+$ && "$current_session_local_port" =~ ^[0-9]+$ ]] || return 1
 
-    while read -r _ _ _ local_endpoint peer_endpoint _; do
+    while read -r _ _ _ local_endpoint peer_endpoint; do
         [[ -n "$local_endpoint" && -n "$peer_endpoint" ]] || continue
         local_port_now=$(ssh_endpoint_port "$local_endpoint" 2>/dev/null || true)
         peer_host=$(ssh_endpoint_host "$peer_endpoint" 2>/dev/null || true)
@@ -211,7 +211,7 @@ confirm_new_ssh_session() {
 
 wait_for_new_ssh_session() {
     local new_port="$1"
-    local timeout_seconds="${2:-300}"
+    local timeout_seconds="${2:-600}"
     local elapsed=0
 
     if ! current_ssh_session_port >/dev/null 2>&1; then
@@ -230,9 +230,7 @@ wait_for_new_ssh_session() {
     fi
     echo -e "${YELLOW}[重要警告]${PLAIN} 当前工具会保持旧端口 ${current_port} 与新端口 ${new_port} 同时监听。"
     echo -e "${YELLOW}[操作要求]${PLAIN} 请保持当前终端不要关闭，并立即用同一台客户端通过新端口 ${new_port} 新开一个 SSH 会话。"
-    echo -e "${YELLOW}[安全条件]${PLAIN} 自动验证要求新会话来自当前连接的来源 IP ${source_ip}，并且确实已经建立 SSH 连接；仅仅端口监听不会触发删除。"
-    echo -e "${YELLOW}[提示]${PLAIN} 如果你使用跳板机、NAT、代理或 IPv6 隐私地址，来源 IP 可能无法稳定匹配，此时请使用选项 3 手动删除。"
-    echo -e "${YELLOW}[超时处理]${PLAIN} ${timeout_seconds} 秒内没有检测到新会话，旧端口将继续保留，不会自动删除。"
+    echo -e "${YELLOW}[超时处理]${PLAIN} ${timeout_seconds} 秒内没有检测到新端口登录，将自动保留旧端口、删除新端口，并恢复旧端口防火墙放行。"
 
     while (( elapsed < timeout_seconds )); do
         if ssh_new_session_detected "$new_port"; then
@@ -530,13 +528,18 @@ change_ssh_port() {
             echo -e "${YELLOW}[安全说明]${PLAIN} 旧端口现在不会自动删除。"
             ;;
         2)
-            if wait_for_new_ssh_session "$new_port" 300; then
+            if wait_for_new_ssh_session "$new_port" 600; then
                 if ! remove_old_ssh_port "$cur_port" "$new_port" 1; then
                     echo -e "${YELLOW}[提示]${PLAIN} 已确认新端口真实登录，但旧端口自动删除失败。旧端口会继续保留，请从新端口会话进入选项 3 重试。"
                     return 1
                 fi
             else
-                echo -e "${YELLOW}[提示]${PLAIN} 未完成新端口登录验证，旧端口 ${cur_port} 继续保留。"
+                echo -e "${YELLOW}[自动回退]${PLAIN} 600 秒内未检测到新端口 ${new_port} 登录，正在自动恢复旧端口 ${cur_port}。"
+                if cancel_ssh_port_migration 1; then
+                    echo -e "${GREEN}[回退完成]${PLAIN} 已保留旧端口 ${cur_port}，删除新端口 ${new_port}，并恢复旧端口防火墙放行。"
+                else
+                    echo -e "${YELLOW}[提示]${PLAIN} SSH 配置回退或防火墙恢复未完全完成，请检查模块 1 → 3 → 4 的迁移状态。"
+                fi
                 return 1
             fi
             ;;
@@ -545,7 +548,8 @@ change_ssh_port() {
 
 
 cancel_ssh_port_migration() {
-    local old_port new_port current_port backup_dir action_dir
+    local auto_rollback="${1:-0}"
+    local old_port new_port current_port backup_dir action_dir backend
     old_port="$(state_get ssh_migration_old_port 2>/dev/null || true)"
     new_port="$(state_get ssh_migration_new_port 2>/dev/null || true)"
     validate_ssh_port "$old_port" || { echo -e "${RED}[错误]${PLAIN} 未找到有效的迁移旧端口记录。"; return 1; }
@@ -567,7 +571,11 @@ cancel_ssh_port_migration() {
     else
         echo -e "${YELLOW}[提示]${PLAIN} 当前会话不是可识别的旧/新 SSH 端口，将要求你确认是否继续回退。"
     fi
-    confirm_safety_prompt "放弃 SSH 端口迁移并恢复原端口" "回退会停止新端口 ${new_port}；如果当前会话来自新端口，当前连接可能会被立即断开。" || return 1
+    if [[ "$auto_rollback" == "1" ]]; then
+        echo -e "${YELLOW}[自动执行]${PLAIN} 未检测到新端口登录，将自动恢复原端口 ${old_port}。"
+    else
+        confirm_safety_prompt "放弃 SSH 端口迁移并恢复原端口" "回退会停止新端口 ${new_port}；如果当前会话来自新端口，当前连接可能会被立即断开。" || return 1
+    fi
 
     action_dir=$(make_temp_dir ssh-cancel-migration)
     if ! backup_current_ssh_files "$action_dir"; then
@@ -588,13 +596,22 @@ cancel_ssh_port_migration() {
         echo -e "${RED}[错误]${PLAIN} 回退后的 SSH 重载/重启失败，已恢复回退前配置。"
         return 1
     fi
-    # [部分可撤销/安全保留] SSH 本机配置可以完整回退；防火墙只删除本工具记录的规则。
-    # 如果防火墙清理失败，必须保留迁移 state，避免用户以为已经“完全回退”而失去后续重试入口。
+    # [部分可撤销/安全保留] SSH 本机配置可以完整回退；防火墙只处理本次迁移的端口。
+    # [安全回退] 新端口必须关闭；旧端口需要重新获得本机防火墙放行，确保回退后仍能通过原端口连接。
     if ! firewall_remove_owned_rules "$new_port" tcp; then
         rm -rf "$action_dir"
         echo -e "${YELLOW}[警告]${PLAIN} SSH 配置已经恢复为原端口 ${old_port}，但新端口 ${new_port}/tcp 的工具防火墙规则未能清理。"
-        echo -e "${YELLOW}[状态保留]${PLAIN} 本次迁移 state 将保留，方便下次继续清理；请确认防火墙状态后再处理。"
+        echo -e "${YELLOW}[状态保留]${PLAIN} 本次迁移 state 将保留，方便后续重试；请确认防火墙状态后再处理。"
         return 1
+    fi
+    backend=$(firewall_backend)
+    if [[ "$backend" == "ufw" || "$backend" == "firewalld" ]]; then
+        if ! firewall_allow "$old_port" tcp; then
+            rm -rf "$action_dir"
+            echo -e "${YELLOW}[警告]${PLAIN} SSH 配置已恢复原端口 ${old_port}，但无法确认旧端口防火墙放行。请立即检查防火墙状态。"
+            echo -e "${YELLOW}[状态保留]${PLAIN} 本次迁移 state 将保留，以便继续处理。"
+            return 1
+        fi
     fi
 
     state_unset ssh_migration_old_port
@@ -622,7 +639,7 @@ ssh_port_menu() {
         echo -e "  ${GREEN}1.${PLAIN} 修改 SSH 端口（保留旧端口）"
         echo -e "     ${YELLOW}新端口登录成功后，必须回来选择 3 手动删除旧端口。${PLAIN}"
         echo -e "  ${GREEN}2.${PLAIN} 修改 SSH 端口（新端口真实登录后自动删除旧端口）"
-        echo -e "     ${YELLOW}仅检测到实际新 SSH 会话后才删除，不能只凭端口监听状态判断。${PLAIN}"
+        echo -e "     ${YELLOW}请新开终端通过新端口登录；如要放弃迁移，可选择 4。${PLAIN}"
         echo -e "  ${GREEN}3.${PLAIN} 删除已验证的旧 SSH 端口"
         echo -e "     ${YELLOW}必须同时检测到新旧两个端口正在监听，且当前会话必须通过新端口登录。${PLAIN}"
         echo -e "  ${GREEN}4.${PLAIN} 放弃本次迁移并恢复原 SSH 端口"
