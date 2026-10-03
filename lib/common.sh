@@ -319,17 +319,20 @@ sys_security_upgrade() {
     check_os || return 1
     echo -e "${BLUE}[说明]${PLAIN} 安装安全补丁，优先减少已知高危漏洞。"
     check_upgrade_resources || return 1
-    confirm_safety_prompt "修补安全漏洞" "作用：更新安全补丁。风险：属于不可逆软件包变更，资源不足时可能失败。" || { echo -e "${YELLOW}[提示]${PLAIN} 已取消安全补丁升级。"; return 1; }
     case "${PKG_MANAGER}" in
         apt)
+            # [不可逆更新] Debian/Ubuntu 当前不保证存在独立安全源；本分支实际执行 apt-get upgrade，可能同时升级 openssh-server/内核。
+            confirm_safety_prompt "修补安全漏洞（Debian/Ubuntu 为全量升级）" "作用：更新系统软件与安全补丁。风险：可能包含 openssh-server/内核，属于不可逆变更；资源检查已通过。" || { echo -e "${YELLOW}[提示]${PLAIN} 已取消安全补丁升级。"; return 1; }
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
             apt-get -y upgrade
             ;;
         dnf)
+            confirm_safety_prompt "修补安全漏洞" "作用：更新安全补丁。风险：属于不可逆软件包变更，资源不足时可能失败。" || { echo -e "${YELLOW}[提示]${PLAIN} 已取消安全补丁升级。"; return 1; }
             dnf -y upgrade --security || dnf -y upgrade
             ;;
         yum)
+            confirm_safety_prompt "修补安全漏洞" "作用：更新安全补丁。风险：属于不可逆软件包变更，资源不足时可能失败。" || { echo -e "${YELLOW}[提示]${PLAIN} 已取消安全补丁升级。"; return 1; }
             yum -y update --security || yum -y update
             ;;
     esac
@@ -534,9 +537,20 @@ random_free_port() {
     local port
     while ((attempts < 100)); do
         port=$((RANDOM % 50001 + 10000))
-        if ! port_in_use "$port" "$proto"; then
-            echo "$port"
-            return 0
+        if port_in_use "$port" "$proto"; then
+            :
+        else
+            local rc=$?
+            case "$rc" in
+                1)
+                    echo "$port"
+                    return 0
+                    ;;
+                *)
+                    echo -e "${RED}[错误]${PLAIN} 无法可靠检查随机端口 ${port}/${proto}，已停止选取。" >&2
+                    return 1
+                    ;;
+            esac
         fi
         ((attempts += 1))
     done
@@ -642,16 +656,48 @@ firewall_allow() {
     esac
 }
 
+firewall_port_has_service_rule() {
+    local backend="$1" port="$2" proto="$3" item rule source
+    local -a entries=()
+    validate_port_any "$port" || return 1
+    case "$proto" in tcp|udp) ;; *) return 1 ;; esac
+    mapfile -t entries < <(firewall_open_port_entries "$backend" 2>/dev/null || true)
+    for item in "${entries[@]}"; do
+        rule="${item%%|*}"
+        source="${item#*|}"
+        if [[ "$rule" == "${port}/${proto}" && "$source" == *"服务:"* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 firewall_remove_owned_rule() {
-    local backend="$1" port="$2" proto="$3"
+    local backend="$1" port="$2" proto="$3" rule_count
     case "$backend" in
         ufw)
-            if ! ufw status 2>/dev/null | grep -Eq "^[[:space:]]*${port}/${proto}([[:space:]]|$)"; then
+            if firewall_port_has_service_rule "$backend" "$port" "$proto"; then
+                echo -e "${YELLOW}[安全保留]${PLAIN} ${port}/${proto} 由 UFW service/profile 管理，拒绝按端口强删。"
+                return 1
+            fi
+            rule_count=$(ufw status numbered 2>/dev/null | \
+                sed -E 's/^[[:space:]]*\[[[:space:]]*[0-9]+[[:space:]]*\][[:space:]]*//' | \
+                sed -E 's/[[:space:]]+\(v6\)$//' | \
+                grep -Ec "^${port}/${proto}([[:space:]]|$)" || true)
+            if (( rule_count == 0 )); then
                 return 0
+            fi
+            if (( rule_count != 1 )); then
+                echo -e "${YELLOW}[安全保留]${PLAIN} 检测到 ${port}/${proto} 存在多条防火墙规则，拒绝按端口强删，请手动处理。"
+                return 1
             fi
             ufw delete allow "${port}/${proto}" >/dev/null 2>&1
             ;;
         firewalld)
+            if firewall_port_has_service_rule "$backend" "$port" "$proto"; then
+                echo -e "${YELLOW}[安全保留]${PLAIN} ${port}/${proto} 由 firewalld service/profile 管理，拒绝按端口强删。"
+                return 1
+            fi
             if ! firewall-cmd --query-port="${port}/${proto}" --permanent >/dev/null 2>&1; then
                 return 0
             fi
