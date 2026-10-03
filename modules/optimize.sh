@@ -14,7 +14,6 @@ get_default_interface() {
     ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'
 }
 
-
 create_all_cpu_mask() {
     local cpu_count="$1" words=() cpu word bit value i out=""
     for ((cpu=0; cpu<cpu_count; cpu++)); do
@@ -31,7 +30,6 @@ create_all_cpu_mask() {
 }
 
 ensure_swap_if_needed() {
-    # [可完全撤销] 生产级调优沿用公共 Swap 管理；不覆盖用户现有 Swap。
     local mem_available_mb swap_mb recommended_mb
     mem_available_mb=$(get_mem_available_mb)
     swap_mb=$(current_swap_mb)
@@ -82,8 +80,6 @@ apply_gai_ipv4_priority() {
     [[ -e "$GAI_CONF" ]] && original_exists=1
     backup_file_once "$GAI_CONF" gai_conf
     touch "$GAI_CONF"
-    # [可完全撤销] 只要系统已经存在语义相同的 precedence 行，就不重复添加；空白数量不影响判断。
-    # [安全保留] state=0 表示该行不是本工具新增的，卸载时不会删除用户原有规则。
     if grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100[[:space:]]*$' "$GAI_CONF"; then
         state_set gai_added_by_tool 0
     else
@@ -118,7 +114,6 @@ set_ipv4_priority() {
     log_action "[可撤销] 启用 IPv4 优先解析"
     echo -e "${GREEN}[成功]${PLAIN} IPv4 优先解析已启用。"
 }
-
 
 install_bbrv3_max() {
     [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
@@ -194,14 +189,24 @@ apply_production_tune() {
         return 1
     fi
     [[ "$swap_state_before" == "1" || "$(state_get swap_created 2>/dev/null || true)" != "1" ]] || swap_created_now=1
+    
+    # [修复 Bug] 动态探测并自适应内核 fs.nr_open 极限，彻底防止强行写入导致 PAM 崩溃造成的系统失联！
+    local max_nofile=1048576
+    local sys_nr_open
+    sys_nr_open=$(sysctl -n fs.nr_open 2>/dev/null || echo 1048576)
+    if [[ "$sys_nr_open" =~ ^[0-9]+$ ]] && (( sys_nr_open < max_nofile )); then
+        max_nofile=$sys_nr_open
+        echo -e "${YELLOW}[安全防御]${PLAIN} 检测到内核 fs.nr_open (${sys_nr_open}) 较小，已自动向下安全限频文件描述符以防 SSH 死锁。"
+    fi
+
     backup_file_once "$LIMITS_CONF" limits_conf
     mkdir -p "$(dirname "$LIMITS_CONF")"
-    cat > "$LIMITS_CONF" <<'EOF2'
+    cat > "$LIMITS_CONF" <<EOF2
 # Managed by VPS-Tool.
-* soft nofile 1048576
-* hard nofile 1048576
-root soft nofile 1048576
-root hard nofile 1048576
+* soft nofile ${max_nofile}
+* hard nofile ${max_nofile}
+root soft nofile ${max_nofile}
+root hard nofile ${max_nofile}
 EOF2
     chmod 644 "$LIMITS_CONF"
 
@@ -295,14 +300,12 @@ EOF2
     echo -e "${GREEN}[成功]${PLAIN} BBR 暴躁/疯批模式已启用。"
 }
 
-
 reset_all_optimizations() {
     local restore_failed=0 iface qlen
     echo -e "${BLUE}[恢复]${PLAIN} 仅恢复 VPS-Tool 自己修改并记录过的项目。"
     restore_file_backup "$SYSCTL_CONF" sysctl_optimizer_conf || true
     restore_file_backup "$LIMITS_CONF" limits_conf || true
     if [[ "$(state_get gai_added_by_tool 2>/dev/null || true)" == "1" ]]; then
-        # [可完全撤销] 只删除本工具实际追加的那一条 canonical 行，用户原有的等价写法保持不动。
         sed -i -E '\#^precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100[[:space:]]*$#d' "$GAI_CONF" 2>/dev/null || restore_failed=1
     fi
     if [[ "$(state_get gai_original_exists 2>/dev/null || true)" == "0" && -f "$GAI_CONF" ]]; then
@@ -346,7 +349,6 @@ reset_all_optimizations() {
     log_action "[已撤销] 清除网络优化参数，复原工具修改前状态"
     echo -e "${GREEN}[成功]${PLAIN} 本工具记录的网络优化参数已恢复。"
 }
-
 
 show_dashboard() {
     local cur_kernel cc qdisc avail iface
@@ -392,7 +394,6 @@ optimize_menu() {
         esac
     done
 }
-
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-}" in
