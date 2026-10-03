@@ -233,7 +233,7 @@ grep -qF 'return 1' "$ROOT/modules/ip_test.sh"
 
 
 # 24. round22 补丁：版本号提升到 2.4.0；协议监听优先取 config.json，且不依赖 ss 固定字段号。
-grep -q '^CURRENT_VERSION="2.9.1"$' "$ROOT/install.sh"
+grep -q '^CURRENT_VERSION="2.9.3"$' "$ROOT/install.sh"
 
 # Round26: v2rayN TUIC share-link compatibility.
 grep -q 'tuic_link="tuic://.*sni=\${sni}&allow_insecure=1' "$ROOT/modules/protocol.sh"
@@ -247,9 +247,9 @@ grep -qF 'port=$(jq -r --arg tag "${name}-in"' "$ROOT/modules/protocol.sh"
 grep -qF 'for (i = 1; i <= NF; i++)' "$ROOT/modules/protocol.sh"
 ! grep -qF '$5 ~ p' "$ROOT/modules/protocol.sh"
 # 同一协议重复部署仍要求先移除：本轮采用补丁 3 的方案 B，避免扩大证书/密钥回滚范围。
-grep -q 'VLESS + Reality 已经部署。若需更换端口、SNI 或密钥，请先选择“5. 移除指定协议”' "$ROOT/modules/protocol.sh"
-grep -q 'Hysteria 2 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除指定协议”' "$ROOT/modules/protocol.sh"
-grep -q 'TUIC v5 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除指定协议”' "$ROOT/modules/protocol.sh"
+grep -q 'VLESS + Reality 已经部署。若需更换端口、SNI 或密钥，请先选择“5. 移除协议 / 清理全部”' "$ROOT/modules/protocol.sh"
+grep -q 'Hysteria 2 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除协议 / 清理全部”' "$ROOT/modules/protocol.sh"
+grep -q 'TUIC v5 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除协议 / 清理全部”' "$ROOT/modules/protocol.sh"
 # 旧版 node_info.txt 不再由卸载流程恢复。
 ! grep -qF 'restore_file_backup "$NODE_INFO_FILE" protocol_node_info' "$ROOT/modules/protocol.sh"
 grep -qF '检测到旧版节点信息文件' "$ROOT/modules/protocol.sh"
@@ -955,7 +955,7 @@ grep -q 'download_one "protocol_catalog.json"' "$ROOT/install.sh"
 grep -q 'install -m 644 "${temp}/protocol_catalog.json"' "$ROOT/install.sh"
 
 jq -e '(.schema_version | type == "number") and (.tool_version | type == "string") and (.protocols | type == "array") and all(.protocols[]; (.id | type == "string") and (.name | type == "string") and (.adapter_version | type == "number") and (.status | type == "string") and (.implemented | type == "boolean"))' "$ROOT/protocol_catalog.json" >/dev/null
-[[ "$(jq -r '.tool_version' "$ROOT/protocol_catalog.json")" == "2.9.1" ]]
+[[ "$(jq -r '.tool_version' "$ROOT/protocol_catalog.json")" == "2.9.3" ]]
 [[ "$(jq -r '.protocols | length' "$ROOT/protocol_catalog.json")" -eq 3 ]]
 [[ "$(jq -r '.protocols[] | select(.id == "tuic-v5") | .adapter_version' "$ROOT/protocol_catalog.json")" == "2" ]]
 
@@ -964,7 +964,7 @@ update_check_capture="$TEST_STATE_ROOT/protocol-update-check.txt"
 VPS_TOOL_ROOT="$TEST_STATE_ROOT/protocol-root" bash -c '
   source "$1/modules/protocol.sh"
   mkdir -p "$VPS_TOOL_ROOT"
-  printf "2.9.1\n" > "$VPS_TOOL_ROOT/VERSION"
+  printf "2.9.3\n" > "$VPS_TOOL_ROOT/VERSION"
   curl() {
     local out=""
     while (($#)); do
@@ -974,7 +974,7 @@ VPS_TOOL_ROOT="$TEST_STATE_ROOT/protocol-root" bash -c '
       esac
     done
     cat > "$out" <<"JSON"
-{"schema_version":1,"tool_version":"2.9.1","updated_at":"2026-10-03","protocols":[{"id":"vless-reality","name":"VLESS + Reality","status":"stable","implemented":true,"adapter_version":1},{"id":"hysteria2","name":"Hysteria 2","status":"stable","implemented":true,"adapter_version":1},{"id":"tuic-v5","name":"TUIC v5","status":"stable","implemented":true,"adapter_version":2},{"id":"new-protocol","name":"New Protocol","status":"stable","implemented":true,"adapter_version":1}]}
+{"schema_version":1,"tool_version":"2.9.3","updated_at":"2026-10-03","protocols":[{"id":"vless-reality","name":"VLESS + Reality","status":"stable","implemented":true,"adapter_version":1},{"id":"hysteria2","name":"Hysteria 2","status":"stable","implemented":true,"adapter_version":1},{"id":"tuic-v5","name":"TUIC v5","status":"stable","implemented":true,"adapter_version":2},{"id":"new-protocol","name":"New Protocol","status":"stable","implemented":true,"adapter_version":1}]}
 JSON
   }
   protocol_update_check
@@ -1013,7 +1013,7 @@ singbox_update_capture="$TEST_STATE_ROOT/singbox-update-check.txt"
 VPS_TOOL_ROOT="$TEST_STATE_ROOT/protocol-root-singbox" bash -c '
   source "$1/modules/protocol.sh"
   mkdir -p "$VPS_TOOL_ROOT"
-  printf "2.9.1\n" > "$VPS_TOOL_ROOT/VERSION"
+  printf "2.9.3\n" > "$VPS_TOOL_ROOT/VERSION"
   fake="$VPS_TOOL_ROOT/fake-sing-box"
   cat > "$fake" <<"EOF"
 #!/usr/bin/env bash
@@ -1031,7 +1031,7 @@ EOF
       esac
     done
     cat > "$out" <<"JSON"
-{"schema_version":1,"tool_version":"2.9.1","updated_at":"2026-10-03","protocols":[{"id":"vless-reality","name":"VLESS + Reality","status":"stable","implemented":true,"adapter_version":1},{"id":"hysteria2","name":"Hysteria 2","status":"stable","implemented":true,"adapter_version":1},{"id":"tuic-v5","name":"TUIC v5","status":"stable","implemented":true,"adapter_version":2}]}
+{"schema_version":1,"tool_version":"2.9.3","updated_at":"2026-10-03","protocols":[{"id":"vless-reality","name":"VLESS + Reality","status":"stable","implemented":true,"adapter_version":1},{"id":"hysteria2","name":"Hysteria 2","status":"stable","implemented":true,"adapter_version":1},{"id":"tuic-v5","name":"TUIC v5","status":"stable","implemented":true,"adapter_version":2}]}
 JSON
   }
   protocol_update_check
@@ -1126,10 +1126,10 @@ grep -q '^protocol_diagnose()' "$ROOT/modules/protocol.sh"
 grep -q '^setup_port_hopping()' "$ROOT/modules/protocol.sh"
 grep -q '^remove_port_hopping()' "$ROOT/modules/protocol.sh"
 grep -q 'VPS_TOOL_FORCE_DEPLOY' "$ROOT/modules/protocol.sh"
-grep -q '10. 协议诊断（只读）' "$ROOT/modules/protocol.sh"
-grep -q '8. 生成/查看 Clash / Mihomo 配置' "$ROOT/modules/protocol.sh"
-grep -q '9. 显示节点二维码' "$ROOT/modules/protocol.sh"
-grep -q '11. 关闭端口跳跃并恢复单端口' "$ROOT/modules/protocol.sh"
+grep -q '3. 协议诊断（只读）' "$ROOT/modules/protocol.sh"
+grep -q '2. 生成 / 查看 Clash / Mihomo 配置' "$ROOT/modules/protocol.sh"
+grep -q '2. 显示节点二维码' "$ROOT/modules/protocol.sh"
+grep -q '4. 关闭端口跳跃并恢复单端口' "$ROOT/modules/protocol.sh"
 ! grep -q '^SECURITY_MODULE_REV=' "$ROOT/install.sh" || true
 
 # 64a. 资源预检阈值、流水线和强制继续行为。
@@ -1244,3 +1244,28 @@ grep -q 'firewall_port_has_service_rule' "$ROOT/install.sh"
 
 echo 'round29 defects-and-features: OK'
 
+
+
+# Round31：模块 2 界面精简与三项行为调整。
+grep -q '5. 移除协议 / 清理全部' "$ROOT/modules/protocol.sh"
+grep -q '7. 其他与诊断' "$ROOT/modules/protocol.sh"
+! grep -q '5. 移除指定协议$' "$ROOT/modules/protocol.sh"
+! grep -q '6. 清理本工具创建的协议环境$' "$ROOT/modules/protocol.sh"
+grep -q '请选择 \[0-7\]' "$ROOT/modules/protocol.sh"
+grep -qE 'RED.*0\.\s*退出' "$ROOT/modules/protocol.sh"
+grep -q '^remove_or_clean_menu()' "$ROOT/modules/protocol.sh"
+grep -q '1. 清理全部协议与协议环境' "$ROOT/modules/protocol.sh"
+grep -q '^other_and_diagnose_menu()' "$ROOT/modules/protocol.sh"
+grep -q '^qr_menu()' "$ROOT/modules/protocol.sh"
+grep -q '1. 安装 / 检查二维码依赖' "$ROOT/modules/protocol.sh"
+grep -q '2. 显示节点二维码' "$ROOT/modules/protocol.sh"
+grep -q '是否现在安装' "$ROOT/modules/protocol.sh"
+! grep -qE 'for cmd in .*qrencode' "$ROOT/install.sh"
+grep -q '是否启用 UDP 端口跳跃.*\[Y/n\]' "$ROOT/modules/protocol.sh"
+! grep -q '是否启用 UDP 端口跳跃.*\[y/N\]' "$ROOT/modules/protocol.sh"
+grep -q '云平台安全组需放行整段' "$ROOT/modules/protocol.sh"
+grep -q 'vision_flow="xtls-rprx-vision"' "$ROOT/modules/protocol.sh"
+grep -qF '启用 Vision 流控？[Y/n]' "$ROOT/modules/protocol.sh"
+cat_ver=$(grep -m1 '^CURRENT_VERSION=' "$ROOT/install.sh" | cut -d'"' -f2)
+cat_tool=$(jq -r '.tool_version' "$ROOT/protocol_catalog.json")
+[[ "$cat_ver" == "$cat_tool" ]]
