@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # 系统与高亮配色配置
 # ========================================================
 export LANG="${LANG:-C.UTF-8}"
-CURRENT_VERSION="2.0.0"
+CURRENT_VERSION="2.3.0"
 # GitHub 仓库配置
 GITHUB_USER="yesok6"
 GITHUB_REPO="vps-tool"
@@ -137,6 +137,19 @@ SH
     rm -f "$tmp"
 }
 
+version_gt() {
+    local a="$1" b="$2" a1 a2 a3 b1 b2 b3
+    [[ "$a" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([.-][0-9A-Za-z.-]+)?$ ]] || return 2
+    a1="${BASH_REMATCH[1]}"; a2="${BASH_REMATCH[2]}"; a3="${BASH_REMATCH[3]}"
+    [[ "$b" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([.-][0-9A-Za-z.-]+)?$ ]] || return 2
+    b1="${BASH_REMATCH[1]}"; b2="${BASH_REMATCH[2]}"; b3="${BASH_REMATCH[3]}"
+    ((10#$a1 > 10#$b1)) && return 0
+    ((10#$a1 < 10#$b1)) && return 1
+    ((10#$a2 > 10#$b2)) && return 0
+    ((10#$a2 < 10#$b2)) && return 1
+    ((10#$a3 > 10#$b3))
+}
+
 check_version_update() {
     local base remote cache_file cache_age now
     local cache_ttl="${VPS_TOOL_VERSION_CACHE_TTL:-900}"
@@ -169,9 +182,13 @@ check_version_update() {
         fi
     fi
 
-    if [[ -n "$remote" && "$remote" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ && "$remote" != "$CURRENT_VERSION" ]]; then
-        VERSION_TIPS="${YELLOW}[发现远端版本 v${remote}，可通过 8 更新]${PLAIN}"
-    elif [[ -n "$remote" && ! "$remote" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+    if [[ -n "$remote" && "$remote" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+        if version_gt "$remote" "$CURRENT_VERSION"; then
+            VERSION_TIPS="${YELLOW}[发现远端版本 v${remote}，可通过 8 更新]${PLAIN}"
+        else
+            VERSION_TIPS="${GREEN}[当前已是 v${CURRENT_VERSION}，远端未高于当前版本]${PLAIN}"
+        fi
+    elif [[ -n "$remote" ]]; then
         log_action "[安全] 忽略格式异常的远端版本号：${remote}"
     fi
 }
@@ -194,6 +211,25 @@ update_tool() {
     echo -e "${CYAN}                 [在线更新]                        ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "当前版本：${YELLOW}v${CURRENT_VERSION}${PLAIN}"
+
+    local base remote
+    base=$(raw_base_url)
+    remote=$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 3 --max-time 8 \
+        "${base}/install.sh?t=$(date +%s%N)" 2>/dev/null | grep '^CURRENT_VERSION=' | head -n1 | cut -d'"' -f2 || true)
+    if [[ -z "$remote" ]]; then
+        echo -e "${RED}[错误]${PLAIN} 无法获取远端版本号，当前版本保持不变。"
+        return 1
+    fi
+    if [[ ! "$remote" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+        echo -e "${RED}[错误]${PLAIN} 远端版本号格式异常：${remote}"
+        return 1
+    fi
+    if ! version_gt "$remote" "$CURRENT_VERSION"; then
+        echo -e "${GREEN}[提示]${PLAIN} 当前已是最新版本或远端版本不高于当前版本：v${CURRENT_VERSION}。"
+        return 0
+    fi
+
+    echo -e "${BLUE}[更新]${PLAIN} 发现新版本：v${remote}，开始同步。"
     if ! sync_bundle; then
         echo -e "${RED}[错误]${PLAIN} 更新失败，当前已安装版本保持不变。"
         return 1
