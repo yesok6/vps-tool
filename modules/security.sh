@@ -552,6 +552,63 @@ cancel_ssh_port_migration() {
     echo -e "${YELLOW}[提示]${PLAIN} 如需再次迁移，请重新进入模块 1 → 3。"
 }
 
+ssh_success_login_entries() {
+    # [只读/可完全撤销] 只读取系统已有 SSH 成功登录记录，不修改 SSH、防火墙或 F2。
+    local journal_line journal_entries file_line
+    if command_exists journalctl; then
+        journal_line=$(journalctl --no-pager -o short-iso 2>/dev/null || true)
+        if [[ -n "$journal_line" ]]; then
+            journal_entries=$(awk 'index($0,"sshd") && $0 ~ /Accepted (password|publickey|keyboard-interactive)/ {
+                ip="";
+                for (i=1; i<NF; i++) if ($i=="from") { ip=$(i+1); break }
+                if (ip!="") print $1 "|" ip
+            }' <<< "$journal_line")
+            if [[ -n "$journal_entries" ]]; then
+                printf '%s\n' "$journal_entries"
+                return 0
+            fi
+        fi
+    fi
+
+    for file_line in /var/log/auth.log /var/log/secure; do
+        if [[ -f "$file_line" ]]; then
+            awk '/sshd.*Accepted (password|publickey|keyboard-interactive)/ {
+                ip="";
+                for (i=1; i<NF; i++) if ($i=="from") { ip=$(i+1); break }
+                if (ip!="") print $1 " " $2 " " $3 "|" ip
+            }' "$file_line"
+        fi
+    done
+}
+
+show_successful_ssh_login_ips() {
+    local -a entries=()
+    local line rank stamp ip count
+    mapfile -t entries < <(ssh_success_login_entries | awk -F'|' '{ip=$2; if (!(ip in latest) || $1 > latest[ip]) latest[ip]=$1; count[ip]++} END {for (ip in latest) print latest[ip] "|" ip "|" count[ip]}' | sort -t'|' -k1,1r)
+
+    clear
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${CYAN}             [SSH 成功登录来源 IP]                 ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${BLUE}[说明]${PLAIN} 重复 IP 已合并，按最近一次成功登录时间从近到远排列。"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    if ((${#entries[@]} == 0)); then
+        echo -e "${YELLOW}暂无可读取的 SSH 成功登录记录。${PLAIN}"
+    else
+        printf '%-4s %-22s %-40s %s\n' '序号' '最近登录' 'IP 地址' '登录次数'
+        rank=1
+        for line in "${entries[@]}"; do
+            stamp=${line%%|*}
+            ip=${line#*|}; ip=${ip%%|*}
+            count=${line##*|}
+            printf '%-4s %-22s %-40s %s\n' "$rank" "$stamp" "$ip" "$count"
+            rank=$((rank + 1))
+        done
+    fi
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    read -rp "按回车返回..."
+}
+
 ssh_port_menu() {
     while true; do
         clear
@@ -569,15 +626,18 @@ ssh_port_menu() {
         echo -e "     ${YELLOW}新端口登录成功后，必须回来选择 2 手动删除旧端口。${PLAIN}"
         echo -e "  ${GREEN}2.${PLAIN} 删除已验证的旧 SSH 端口"
         echo -e "     ${YELLOW}必须同时检测到新旧两个端口正在监听，且当前会话必须通过新端口登录。${PLAIN}"
-        echo -e "  ${GREEN}3.${PLAIN} 放弃本次迁移并恢复原 SSH 端口"
+        echo -e "  ${GREEN}3.${PLAIN} 查看成功登录 SSH 的 IP"
+        echo -e "     ${YELLOW}重复 IP 自动合并，并按最近一次成功登录时间排序。${PLAIN}"
+        echo -e "  ${GREEN}4.${PLAIN} 放弃本次迁移并恢复原 SSH 端口"
         echo -e "     ${YELLOW}用于解除迁移状态卡住的问题；如果当前会话来自新端口，回退可能导致当前连接断开。${PLAIN}"
         echo -e "  ${GREEN}0.${PLAIN} 返回上一级"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请输入选项 [0-3]: " choice
+        read -rp "请输入选项 [0-4]: " choice
         case "$choice" in
             1) change_ssh_port || true; read -rp "按回车继续..." ;;
             2) remove_old_ssh_port || true; read -rp "按回车继续..." ;;
-            3) cancel_ssh_port_migration || true; read -rp "按回车继续..." ;;
+            3) show_successful_ssh_login_ips ;;
+            4) cancel_ssh_port_migration || true; read -rp "按回车继续..." ;;
             0) return 0 ;;
             *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
@@ -1326,16 +1386,115 @@ fail2ban_enable_ssh_protection() {
     log_action "[安全保留] 启用 Fail2Ban SSH 防爆破（5/10m，ban=1d，port=${ssh_ports})"
 }
 
+fail2ban_current_ban_summary() {
+    local status_line
+    fail2ban-client status "$FAIL2BAN_JAIL_NAME" 2>/dev/null | awk -F: '/Currently banned/ {gsub(/^ +/,"",$2); print $2; exit}'
+}
+
+fail2ban_total_ban_actions() {
+    fail2ban-client status "$FAIL2BAN_JAIL_NAME" 2>/dev/null | awk -F: '/Total banned/ {gsub(/^ +/,"",$2); print $2; exit}'
+}
+
+fail2ban_current_banned_ips() {
+    local list
+    list=$(fail2ban-client status "$FAIL2BAN_JAIL_NAME" 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*//p' | head -n1 || true)
+    [[ -n "$list" ]] || return 0
+    tr ' ' '\n' <<< "$list" | awk 'NF' | sort -u
+}
+
+fail2ban_ban_events() {
+    # [只读/可完全撤销] 读取 F2 的封禁日志，不修改任何防火墙规则。
+    local since="$1" line entries
+    if command_exists journalctl; then
+        if [[ -n "$since" ]]; then
+            line=$(journalctl --no-pager -o short-iso -u "$(fail2ban_service_name)" --since "$since" 2>/dev/null || true)
+        else
+            line=$(journalctl --no-pager -o short-iso -u "$(fail2ban_service_name)" 2>/dev/null || true)
+        fi
+        if [[ -n "$line" ]]; then
+            entries=$(awk '/[[:space:]]Ban[[:space:]]/ {
+                ip="";
+                for (i=1; i<NF; i++) if ($i=="Ban") { ip=$(i+1); break }
+                if (ip!="") print $1 "|" ip
+            }' <<< "$line")
+            if [[ -n "$entries" ]]; then
+                printf '%s\n' "$entries"
+                return 0
+            fi
+        fi
+    fi
+
+    if [[ -f /var/log/fail2ban.log ]]; then
+        awk '/[[:space:]]Ban[[:space:]]/ {
+            ip="";
+            for (i=1; i<NF; i++) if ($i=="Ban") { ip=$(i+1); break }
+            if (ip!="") print $1 " " $2 " " $3 "|" ip
+        }' /var/log/fail2ban.log
+    fi
+}
+
+fail2ban_recent_banned_ips() {
+    local -a entries=()
+    mapfile -t entries < <(fail2ban_ban_events '5 minutes ago' | awk -F'|' '{ip=$2; if (!(ip in latest) || $1 > latest[ip]) latest[ip]=$1} END {for (ip in latest) print latest[ip] "|" ip}' | sort -t'|' -k1,1r)
+    printf '%s\n' "${entries[@]}"
+}
+
 fail2ban_show_ssh_status() {
+    local target_ports current_banned total_banned
+    local -a banned_ips=() recent_ips=()
     fail2ban_sync_ssh_protection || true
+    clear
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${CYAN}              [SSH 防爆破状态]                     ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+
     if ! command_exists fail2ban-client; then
         echo -e "${YELLOW}[状态]${PLAIN} 尚未安装 Fail2Ban。"
         return 1
     fi
-    if ! fail2ban-client status "$FAIL2BAN_JAIL_NAME" 2>/dev/null; then
-        echo -e "${YELLOW}[状态]${PLAIN} SSH 防爆破 jail 当前未启用。"
+    if ! fail2ban-client status "$FAIL2BAN_JAIL_NAME" >/dev/null 2>&1; then
+        target_ports=$(fail2ban_target_ssh_ports 2>/dev/null || echo '未知')
+        echo -e "${YELLOW}[状态]${PLAIN} SSH 防爆破当前未启用。"
+        echo -e "${BLUE}[保护端口]${PLAIN} ${target_ports}/tcp"
         return 1
     fi
+
+    target_ports=$(fail2ban_target_ssh_ports 2>/dev/null || echo '未知')
+    current_banned=$(fail2ban_current_ban_summary | head -n1)
+    total_banned=$(fail2ban_total_ban_actions | head -n1)
+    mapfile -t banned_ips < <(fail2ban_current_banned_ips)
+    mapfile -t recent_ips < <(fail2ban_recent_banned_ips)
+
+    echo -e "${GREEN}[运行状态]${PLAIN} SSH 防爆破已启用"
+    echo -e "${BLUE}[当前保护端口]${PLAIN} ${target_ports}/tcp"
+    echo -e "${BLUE}[策略]${PLAIN} 10 分钟内失败 5 次 → 封禁 1 天"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    echo -e "${GREEN}一、当前封禁 IP 总数${PLAIN}: ${current_banned:-0}"
+    echo -e "${GREEN}累计封禁次数${PLAIN}: ${total_banned:-0}"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    echo -e "${GREEN}二、近 5 分钟新封禁 IP${PLAIN}:"
+    if ((${#recent_ips[@]} == 0)); then
+        echo -e "  ${YELLOW}暂无${PLAIN}"
+    else
+        local i=1 entry stamp ip
+        for entry in "${recent_ips[@]}"; do
+            stamp=${entry%%|*}; ip=${entry#*|}
+            printf '  %s. %s  %s\n' "$i" "$stamp" "$ip"
+            i=$((i+1))
+        done
+    fi
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    echo -e "${GREEN}三、当前封禁 IP 详细${PLAIN}:"
+    if ((${#banned_ips[@]} == 0)); then
+        echo -e "  ${YELLOW}暂无当前封禁 IP${PLAIN}"
+    else
+        local i=1 ip
+        for ip in "${banned_ips[@]}"; do
+            printf '  %s. %s\n' "$i" "$ip"
+            i=$((i+1))
+        done
+    fi
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
 }
 
 fail2ban_unban_ssh_ip() {
@@ -1376,9 +1535,12 @@ ssh_bruteforce_menu() {
     while true; do
         fail2ban_sync_ssh_protection || true
         clear
+        local protected_ports
+        protected_ports=$(fail2ban_target_ssh_ports 2>/dev/null || echo "未知")
         echo -e "${CYAN}====================================================${PLAIN}"
         echo -e "${CYAN}              [SSH 防爆破保护] Fail2Ban              ${PLAIN}"
         echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "  当前保护端口: ${GREEN}${protected_ports}/tcp${PLAIN}"
         echo -e "  当前策略: ${YELLOW}10 分钟内失败 5 次 → 封禁 1 天${PLAIN}"
         echo -e "  ${GREEN}1.${PLAIN} 启用/更新 SSH 防爆破"
         echo -e "  ${GREEN}2.${PLAIN} 查看防爆破状态"
@@ -1416,10 +1578,10 @@ security_menu() {
         echo -e "  ${GREEN}2.${PLAIN} 一键高危安全漏洞修补升级       ${YELLOW}[不可逆更新]${PLAIN}"
         echo -e "  ----------------------------------------------------"
         echo -e "  ${YELLOW}3.${PLAIN} 修改 SSH 远程连接端口           ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
-        echo -e "  ${YELLOW}4.${PLAIN} 防火墙基线与端口管理             ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
-        echo -e "  ${YELLOW}5.${PLAIN} 部署密钥认证并关闭密码         ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
+        echo -e "  ${YELLOW}4.${PLAIN} SSH 防爆破保护（Fail2Ban）        ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
+        echo -e "  ${YELLOW}5.${PLAIN} 防火墙基线与端口管理             ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
         echo -e "  ${YELLOW}6.${PLAIN} 查看/管理已放行端口               ${GREEN}[本机规则可撤销]${PLAIN}"
-        echo -e "  ${YELLOW}7.${PLAIN} SSH 防爆破保护（Fail2Ban）        ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
+        echo -e "  ${YELLOW}7.${PLAIN} 部署密钥认证并关闭密码         ${YELLOW}[部分可撤销/安全保留]${PLAIN}"
         echo -e "  ----------------------------------------------------"
         echo -e "  ${RED}0.${PLAIN} 返回主菜单"
         echo -e "${CYAN}====================================================${PLAIN}"
@@ -1428,10 +1590,10 @@ security_menu() {
             1) sys_full_upgrade || true; read -rp "按回车继续..." ;;
             2) sys_security_upgrade || true; read -rp "按回车继续..." ;;
             3) ssh_port_menu || true ;;
-            4) setup_firewall || true; read -rp "按回车继续..." ;;
-            5) setup_ssh_key_auth || true; read -rp "按回车继续..." ;;
+            4) ssh_bruteforce_menu || true ;;
+            5) setup_firewall || true; read -rp "按回车继续..." ;;
             6) firewall_port_manager_menu || true ;;
-            7) ssh_bruteforce_menu || true ;;
+            7) setup_ssh_key_auth || true; read -rp "按回车继续..." ;;
             0) break ;;
             *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
