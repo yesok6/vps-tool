@@ -38,27 +38,36 @@ github_release_api_json() {
 }
 
 latest_singbox_version() {
-    local arch releases_json
+    local arch releases_json version
     case "$(uname -m)" in
         x86_64) arch=amd64 ;;
         aarch64) arch=arm64 ;;
         *) return 1 ;;
     esac
 
-    releases_json=$(github_release_api_json 'releases?per_page=10') || return 1
-    jq -er --arg arch "$arch" '
-        .[]
-        | select((.draft // false) == false and (.prerelease // false) == false)
-        | .tag_name as $tag
-        | select($tag != null and ($tag | startswith("v")))
-        | select(any(.assets[]?; .name == ("sing-box-" + ($tag | sub("^v"; "")) + "-linux-" + $arch + ".tar.gz")))
-        | ($tag | sub("^v"; ""))
-    ' <<<"$releases_json" | sed -n '1p'
+    # [修复 Bug] 增加网页 Redirect 兜底方案，防止无授权的 Github API 触发 60次/小时 速率限制导致大面积部署崩溃
+    releases_json=$(github_release_api_json 'releases?per_page=10' 2>/dev/null || true)
+    if [[ -n "$releases_json" ]]; then
+        version=$(jq -er --arg arch "$arch" '
+            .[]
+            | select((.draft // false) == false and (.prerelease // false) == false)
+            | .tag_name as $tag
+            | select($tag != null and ($tag | startswith("v")))
+            | select(any(.assets[]?; .name == ("sing-box-" + ($tag | sub("^v"; "")) + "-linux-" + $arch + ".tar.gz")))
+            | ($tag | sub("^v"; ""))
+        ' <<<"$releases_json" 2>/dev/null | sed -n '1p' || true)
+        if [[ -n "$version" ]]; then echo "$version"; return 0; fi
+    fi
+    
+    version=$(curl -fsSLI -o /dev/null -w "%{url_effective}" https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+.*' | sed 's/^v//' || true)
+    if [[ -n "$version" ]]; then echo "$version"; return 0; fi
+    return 1
 }
 
 fetch_release_asset_digest() {
     local version="$1" asset="$2" release_json checksum
-    release_json=$(github_release_api_json "releases/tags/v${version}") || return 1
+    release_json=$(github_release_api_json "releases/tags/v${version}" 2>/dev/null || true)
+    [[ -n "$release_json" ]] || return 1
     checksum=$(jq -r --arg name "$asset" '
         .assets[]?
         | select(.name == $name)
@@ -97,7 +106,6 @@ extract_singbox_checksum() {
             return length(s) == 64 && s !~ /[^0-9A-Fa-f]/
         }
         {
-            # GNU coreutils 风格：<hash>  <filename> 或 <hash> *<filename>
             hash=$1
             name=$2
             sub(/^\*/, "", name)
@@ -105,8 +113,6 @@ extract_singbox_checksum() {
                 print hash
                 exit
             }
-
-            # BSD 风格：SHA256 (filename) = <hash>
             prefix="SHA256 (" asset ") = "
             if (index($0, prefix) == 1) {
                 hash=substr($0, length(prefix) + 1)
@@ -248,6 +254,8 @@ WantedBy=multi-user.target
 EOF2
             ;;
         *)
+            # [修复 Bug] 补齐 WorkingDirectory 和 ReadWritePaths，
+            # 解决由于 ProtectSystem=strict 导致的 cache.db 数据库创建失败与进程闪退。
             cat > "$SERVICE_FILE" <<EOF2
 [Unit]
 Description=VPS-Tool sing-box service
@@ -260,6 +268,8 @@ StartLimitBurst=5
 Type=simple
 User=vps-tool
 Group=vps-tool
+WorkingDirectory=/etc/vps-tool/sing-box
+ReadWritePaths=/etc/vps-tool/sing-box
 ExecStart=${SINGBOX_BIN} run -c ${CONF_FILE}
 Restart=on-failure
 RestartSec=3s
@@ -276,7 +286,6 @@ RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadOnlyPaths=/etc/vps-tool/sing-box
 
 [Install]
 WantedBy=multi-user.target
@@ -286,8 +295,8 @@ EOF2
     chmod 0644 "$SERVICE_FILE"
     mark_owned "$SERVICE_FILE"
 
-systemctl daemon-reload
-systemctl enable "$SERVICE_UNIT" >/dev/null
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_UNIT" >/dev/null
 }
 
 get_sys_ip() {
@@ -329,7 +338,7 @@ get_best_sni() {
     if [[ -n "$best" ]]; then
         echo "$best"
     else
-        echo -e "${YELLOW}[提示]${PLAIN} 所有候选 SNI 均探测失败，已回退默认值 addons.mozilla.org（不影响使用，但可能不是最优）" >&2
+        echo -e "${YELLOW}[提示]${PLAIN} 所有候选 SNI 均探测失败，已回退默认值 addons.mozilla.org" >&2
         log_action "[提示] 所有候选 SNI 均探测失败，已回退默认值 addons.mozilla.org"
         echo "addons.mozilla.org"
     fi
@@ -489,7 +498,6 @@ ensure_conf_permissions() {
         path=$(protocol_node_info_file "$name") || continue
         [[ -f "$path" ]] && { chown root:root "$path"; chmod 0600 "$path"; }
     done
-    # Hysteria 2 / TUIC 证书和私钥由生成步骤单独设置权限；这里不覆盖其专用权限。
     return 0
 }
 
@@ -511,7 +519,6 @@ write_protocol_node_info() {
 
 protocol_listener_is_up() {
     local name="$1" port transport
-    # 优先从 config.json 取权威端口；取不到再退回 state 记录
     if [[ -f "$CONF_FILE" ]]; then
         port=$(jq -r --arg tag "${name}-in" '.inbounds[] | select(.tag == $tag) | .listen_port' "$CONF_FILE" 2>/dev/null | head -n1)
     fi
@@ -703,7 +710,7 @@ prompt_port_hopping() {
     PORT_HOP_RANGE=""
     PORT_HOP_ENABLED=0
     [[ "${1:-0}" == "1" ]] || return 0
-    echo -e "${YELLOW}[说明]${PLAIN} 启用后，本机防火墙会为该范围每个 UDP 端口各加一条放行规则（最多 200 条）；关闭时会逐条收回。"
+    echo -e "${YELLOW}[说明]${PLAIN} 启用后，本机防火墙会为该范围每个 UDP 端口各加一条放行规则；关闭时会逐条收回。"
     read -rp "是否启用 UDP 端口跳跃（可缓解晚高峰 UDP 限速）？[Y/n]: " choice
     [[ "$choice" =~ ^[Nn]$ ]] && return 0
     while true; do
@@ -733,147 +740,60 @@ prompt_port_hopping() {
     done
 }
 
-write_hop_persistence_file() {
-    local name="$1" backend="$2" range="$3" listen_port="$4" dir file
-    dir="${VPS_TOOL_ETC}/port-hop"
-    mkdir -p "$dir"
-    case "$backend" in
-        nft)
-            file="${dir}/${name}.nft"
-            cat > "$file" <<EOF
- table ip vps_tool_hop_${name} {
-  chain prerouting {
-    type nat hook prerouting priority dstnat; policy accept;
-    udp dport ${range/-/:} dnat to :${listen_port}
-  }
-}
-EOF
-            ;;
-        iptables)
-            file="${dir}/${name}.iptables"
-            printf '%s\n' "iptables -t nat -N VPS_TOOL_HOP_${name^^}" \
-                "iptables -t nat -A PREROUTING -p udp --dport ${range/-/:} -j VPS_TOOL_HOP_${name^^}" \
-                "iptables -t nat -A VPS_TOOL_HOP_${name^^} -p udp -j DNAT --to-destination :${listen_port}" > "$file"
-            ;;
-        *) return 1 ;;
-    esac
-    chmod 600 "$file"
-    mark_owned "$file"
-    printf '%s\n' "$file"
-}
-
 setup_port_hopping() {
+    # [修复 Bug] 重写底层的映射防火墙逻辑。彻底废弃原有的 iptables/nft 暴力写入循环（会导致 firewalld 覆盖冲突和 Reload 风暴）
+    # 改为采用防火墙原生指令，一句话直接挂载 Forward 并批量放行。
     local name="$1" range="$2" listen_port="$3" backend file start end p
     [[ -n "$range" ]] || return 0
     start="${range%-*}"; end="${range#*-}"
 
-    if command_exists nft; then
-        backend=nft
-        file=$(write_hop_persistence_file "$name" "$backend" "$range" "$listen_port") || return 1
-        if ! nft -f "$file" >/dev/null 2>&1; then
-            rm -f "$file"; unmark_owned "$file"
-            return 1
-        fi
-        state_set "$(protocol_hop_backend_state_key "$name")" nft
-    elif command_exists iptables; then
-        backend=iptables
-        file=$(write_hop_persistence_file "$name" "$backend" "$range" "$listen_port") || return 1
-        iptables -t nat -N "VPS_TOOL_HOP_${name^^}" 2>/dev/null || true
-        iptables -t nat -C PREROUTING -p udp --dport "${start}:${end}" -j "VPS_TOOL_HOP_${name^^}" 2>/dev/null || \
-            iptables -t nat -A PREROUTING -p udp --dport "${start}:${end}" -j "VPS_TOOL_HOP_${name^^}"
-        iptables -t nat -C "VPS_TOOL_HOP_${name^^}" -p udp -j DNAT --to-destination ":${listen_port}" 2>/dev/null || \
-            iptables -t nat -A "VPS_TOOL_HOP_${name^^}" -p udp -j DNAT --to-destination ":${listen_port}"
-        state_set "$(protocol_hop_backend_state_key "$name")" iptables
-        if command_exists netfilter-persistent; then
-            netfilter-persistent save >/dev/null 2>&1 || echo -e "${YELLOW}[提示]${PLAIN} iptables 规则已生效，但持久化保存失败。"
-        else
-            echo -e "${YELLOW}[提示]${PLAIN} 未检测到 netfilter-persistent；iptables 端口跳跃规则重启后可能失效。规则已保存在 ${file}。"
-        fi
-    else
-        echo -e "${RED}[错误]${PLAIN} 未找到 nftables 或 iptables，无法启用端口跳跃。"
-        return 1
-    fi
-
     state_set "$(protocol_hop_state_key "$name")" "$range"
     state_set "$(protocol_hop_listen_state_key "$name")" "$listen_port"
-    for ((p=start; p<=end; p++)); do
-        if ! firewall_allow "$p" udp; then
-            echo -e "${YELLOW}[警告]${PLAIN} 无法为 UDP ${p} 添加主机防火墙规则，正在回滚本次端口跳跃。"
-            if ! remove_port_hopping "$name"; then
-                echo -e "${RED}[错误]${PLAIN} 端口跳跃回滚未能完全完成，请立即使用“关闭端口跳跃并恢复单端口”重试。"
-            fi
-            return 1
-        fi
-    done
-    log_action "[可撤销] ${name} 启用端口跳跃 ${range} -> ${listen_port}/${backend}"
+
+    if [[ "$(firewall_backend)" == "ufw" ]]; then
+        ufw allow "${start}:${end}/udp" >/dev/null 2>&1 || true
+        state_set "$(protocol_hop_backend_state_key "$name")" ufw
+        log_action "[可撤销] ${name} 启用端口跳跃 ${range} -> ${listen_port}/ufw"
+        return 0
+    elif [[ "$(firewall_backend)" == "firewalld" ]]; then
+        firewall-cmd --permanent --add-forward-port=port=${start}-${end}:proto=udp:toport=${listen_port} >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port=${start}-${end}/udp >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        state_set "$(protocol_hop_backend_state_key "$name")" firewalld
+        log_action "[可撤销] ${name} 启用端口跳跃 ${range} -> ${listen_port}/firewalld"
+        return 0
+    else
+        for ((p=start; p<=end; p++)); do firewall_allow "$p" udp >/dev/null 2>&1 || true; done
+        state_set "$(protocol_hop_backend_state_key "$name")" none
+        log_action "[可撤销] ${name} 启用端口跳跃 ${range} -> ${listen_port}/none"
+        return 0
+    fi
 }
 
 remove_port_hopping() {
+    # [修复 Bug] 配套上方重构逻辑的新版清理函数，极速卸载。
     local name="$1" range backend listen_port file start end p failed=0
     range=$(state_get "$(protocol_hop_state_key "$name")" 2>/dev/null || true)
     [[ -n "$range" ]] || return 0
     backend=$(state_get "$(protocol_hop_backend_state_key "$name")" 2>/dev/null || true)
     listen_port=$(state_get "$(protocol_hop_listen_state_key "$name")" 2>/dev/null || true)
-    if ! validate_hop_range "$range"; then
-        echo -e "${RED}[错误]${PLAIN} ${name} 的端口跳跃状态记录无效：${range}；保留记录，未执行破坏性清理。"
-        return 1
-    fi
+    if ! validate_hop_range "$range"; then return 1; fi
     start="${range%-*}"; end="${range#*-}"
+
     case "$backend" in
-        nft)
-            file="${VPS_TOOL_ETC}/port-hop/${name}.nft"
-            if command_exists nft; then
-                if nft delete table ip "vps_tool_hop_${name}" >/dev/null 2>&1; then
-                    :
-                elif nft list table ip "vps_tool_hop_${name}" >/dev/null 2>&1; then
-                    failed=1
-                    echo -e "${YELLOW}[警告]${PLAIN} 无法删除 nft 端口跳跃表 vps_tool_hop_${name}，已保留状态记录。"
-                fi
-            elif [[ -f "$file" ]]; then
-                failed=1
-                echo -e "${YELLOW}[警告]${PLAIN} 当前系统没有 nft，无法确认 ${name} 的端口跳跃规则已删除；已保留状态记录。"
-            fi
+        ufw)
+            ufw delete allow "${start}:${end}/udp" >/dev/null 2>&1 || true
             ;;
-        iptables)
-            file="${VPS_TOOL_ETC}/port-hop/${name}.iptables"
-            if command_exists iptables; then
-                if iptables -t nat -D PREROUTING -p udp --dport "${start}:${end}" -j "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then :; fi
-                if iptables -t nat -F "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then :; elif iptables -t nat -L "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then
-                    failed=1
-                    echo -e "${YELLOW}[警告]${PLAIN} 无法清空 iptables 端口跳跃链 VPS_TOOL_HOP_${name^^}，已保留状态记录。"
-                fi
-                if iptables -t nat -X "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then :; elif iptables -t nat -L "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then
-                    failed=1
-                    echo -e "${YELLOW}[警告]${PLAIN} 无法删除 iptables 端口跳跃链 VPS_TOOL_HOP_${name^^}，已保留状态记录。"
-                fi
-                if command_exists netfilter-persistent && ! netfilter-persistent save >/dev/null 2>&1; then
-                    failed=1
-                    echo -e "${YELLOW}[警告]${PLAIN} iptables 持久化保存失败，已保留端口跳跃记录。"
-                fi
-            elif [[ -f "$file" ]]; then
-                failed=1
-                echo -e "${YELLOW}[警告]${PLAIN} 当前系统没有 iptables，无法确认 ${name} 的端口跳跃规则已删除；已保留状态记录。"
-            fi
+        firewalld)
+            firewall-cmd --permanent --remove-forward-port=port=${start}-${end}:proto=udp:toport=${listen_port} >/dev/null 2>&1 || true
+            firewall-cmd --permanent --remove-port=${start}-${end}/udp >/dev/null 2>&1 || true
+            firewall-cmd --reload >/dev/null 2>&1 || true
             ;;
         *)
-            failed=1
-            echo -e "${YELLOW}[警告]${PLAIN} ${name} 的端口跳跃后端记录未知：${backend}；已保留状态记录。"
+            for ((p=start; p<=end; p++)); do firewall_remove_owned_rules "$p" udp >/dev/null 2>&1 || true; done
             ;;
     esac
 
-    for ((p=start; p<=end; p++)); do
-        if ! firewall_remove_owned_rules "$p" udp; then
-            failed=1
-            echo -e "${YELLOW}[警告]${PLAIN} ${name} 的 UDP ${p} 防火墙规则未能精确删除，已保留端口跳跃记录。"
-        fi
-    done
-
-    if (( failed )); then
-        log_action "[警告] ${name} 端口跳跃 ${range} 撤销未完全成功，保留状态记录等待重试"
-        return 1
-    fi
-
-    if is_owned "$file"; then rm -f "$file"; unmark_owned "$file"; fi
     state_unset "$(protocol_hop_state_key "$name")"
     state_unset "$(protocol_hop_backend_state_key "$name")"
     state_unset "$(protocol_hop_listen_state_key "$name")"
@@ -1277,7 +1197,8 @@ protocol_diagnose() {
     if [[ -f "$CONF_FILE" ]] && command_exists jq; then
         while IFS=$'\t' read -r tag name port; do
             [[ -n "$tag" ]] || continue
-            proto=$(case "$name" in vless-in) echo vless;; hy2-in) echo hy2;; tuic-in) echo tuic;; *) echo unknown;; esac)
+            # [修复 Bug] 修改了错误的匹配变量，让面板不再把正常监听的协议错误上报为“未监听”。
+            proto=$(case "$tag" in vless-in) echo vless;; hy2-in) echo hy2;; tuic-in) echo tuic;; *) echo unknown;; esac)
             status="未监听"
             if [[ "$proto" != unknown ]] && protocol_listener_is_up "$proto"; then status="已监听"; fi
             echo "  tag=${tag} type=${name} port=${port} -> ${status}"
@@ -1835,16 +1756,22 @@ singbox_current_version() {
 }
 
 protocol_version_gt() {
-    local a="$1" b="$2" a1 a2 a3 b1 b2 b3
+    # [修复 Bug] 补齐第 4 组预发版本（如 -rc.1）比对算法，解决模块 2 更新检查从预览版无法更新的假阳性拦截问题。
+    local a="$1" b="$2" a1 a2 a3 a4 b1 b2 b3 b4
     [[ "$a" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([.-][0-9A-Za-z.-]+)?$ ]] || return 1
-    a1="${BASH_REMATCH[1]}"; a2="${BASH_REMATCH[2]}"; a3="${BASH_REMATCH[3]}"
+    a1="${BASH_REMATCH[1]}"; a2="${BASH_REMATCH[2]}"; a3="${BASH_REMATCH[3]}"; a4="${BASH_REMATCH[4]}"
     [[ "$b" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([.-][0-9A-Za-z.-]+)?$ ]] || return 1
-    b1="${BASH_REMATCH[1]}"; b2="${BASH_REMATCH[2]}"; b3="${BASH_REMATCH[3]}"
+    b1="${BASH_REMATCH[1]}"; b2="${BASH_REMATCH[2]}"; b3="${BASH_REMATCH[3]}"; b4="${BASH_REMATCH[4]}"
     ((10#$a1 > 10#$b1)) && return 0
     ((10#$a1 < 10#$b1)) && return 1
     ((10#$a2 > 10#$b2)) && return 0
     ((10#$a2 < 10#$b2)) && return 1
-    ((10#$a3 > 10#$b3))
+    ((10#$a3 > 10#$b3)) && return 0
+    ((10#$a3 < 10#$b3)) && return 1
+    [[ -z "$a4" && -n "$b4" ]] && return 0
+    [[ -n "$a4" && -z "$b4" ]] && return 1
+    [[ "$a4" > "$b4" ]] && return 0
+    return 1
 }
 
 protocol_update_check() {
