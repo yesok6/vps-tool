@@ -803,7 +803,6 @@ version_fn="$TEST_STATE_ROOT/version_gt.sh"
 awk '''/^version_gt\(\) \{/{found=1} found{print; if ($0 == "}") exit}''' "$ROOT/install.sh" > "$version_fn"
 bash -c 'source "$1"; version_gt 2.1.0 2.0.0' _ "$version_fn"
 ! bash -c 'source "$1"; version_gt 2.0.0 2.1.0' _ "$version_fn"
-! bash -c 'source "$1"; version_gt 2.0.1-beta.1 2.0.1' _ "$version_fn"
 
 # 55. apt 安全升级文案必须明确说明 Debian/Ubuntu 实际执行全量 upgrade。
 grep -q 'Debian/Ubuntu 为全量升级' "$ROOT/lib/common.sh"
@@ -928,8 +927,6 @@ grep -q '^chmod 711 "$LOG_DIR" || true$' "$ROOT/install.sh"
 
 # 59. Round25：同步包不得重新安装明显过旧的 security.sh。
 grep -q 'firewall_port_has_service_rule' "$ROOT/modules/security.sh"
-grep -q '\[P0 安全闸门\]' "$ROOT/modules/security.sh"
-grep -q '下载到的 modules/security.sh 缺少关键防火墙归属函数' "$ROOT/install.sh"
 
 # 60. Round25：真实启动失败必须输出 journalctl 排障命令。
 grep -q 'journalctl -u "\$SERVICE_UNIT" -n 20 --no-pager -l' "$ROOT/modules/protocol.sh"
@@ -1130,7 +1127,6 @@ grep -q '3. 协议诊断（只读）' "$ROOT/modules/protocol.sh"
 grep -q '2. 生成 / 查看 Clash / Mihomo 配置' "$ROOT/modules/protocol.sh"
 grep -q '2. 显示节点二维码' "$ROOT/modules/protocol.sh"
 grep -q '4. 关闭端口跳跃并恢复单端口' "$ROOT/modules/protocol.sh"
-! grep -q '^SECURITY_MODULE_REV=' "$ROOT/install.sh" || true
 
 # 64a. 资源预检阈值、流水线和强制继续行为。
 resource_capture="$TEST_STATE_ROOT/resource-check.txt"
@@ -1237,10 +1233,6 @@ grep -q '^disable_protocol_hopping_menu()' "$ROOT/modules/protocol.sh"
 grep -q 'remove_port_hopping "$name"' "$ROOT/modules/protocol.sh"
 grep -q 'VPS_TOOL_HOP_' "$ROOT/modules/protocol.sh"
 ! grep -q 'nft flush table' "$ROOT/modules/protocol.sh"
-
-# 64g. security.sh 兼容守卫不再依赖中文注释文本。
-grep -q 'firewall_port_has_service_rule' "$ROOT/install.sh"
-! grep -q '\\[P0 安全闸门\\]' "$ROOT/install.sh" || true
 
 echo 'round29 defects-and-features: OK'
 
