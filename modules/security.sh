@@ -111,11 +111,10 @@ set_sshd_option_global() {
     tmp=$(mktemp) || return 1
     out="${tmp}.out"
 
-    # [修复 Bug] 更新 awk 正则，支持无空格写法的 PasswordAuthentication=yes 的成功捕获与清除
     if ! awk -v key="$key" '
         BEGIN { in_match=0 }
         /^[[:space:]]*Match([[:space:]]|$)/ { in_match=1 }
-        !in_match && $0 ~ "^[[:space:]]*" key "(=|[[:space:]]|$)" { next }
+        !in_match && $1 == key { next }
         { print }
     ' "$SSHD_CONFIG" > "$tmp"; then
         rm -f "$tmp" "$out"
@@ -151,71 +150,28 @@ restart_or_reload_ssh() {
 }
 
 current_ssh_session_port() {
-    # [修复 Bug] 彻底解决 tmux/screen/sudo su 等环境丢失 SSH_CONNECTION 导致的迁移死锁
     local remote_ip remote_port local_ip local_port
-    if [[ -n "${SSH_CONNECTION:-}" ]]; then
-        read -r remote_ip remote_port local_ip local_port _ <<< "${SSH_CONNECTION}"
-        if [[ "$local_port" =~ ^[0-9]+$ ]]; then
-            printf '%s\n' "$local_port"
-            return 0
-        fi
+    if [[ -z "${SSH_CONNECTION:-}" ]]; then
+        return 1
     fi
-    # 回退方案：向上追溯进程树寻找 sshd，然后读取其真实端口
-    local ppid=$$ sshd_pid=""
-    while [[ $ppid -gt 1 ]]; do
-        local comm
-        comm=$(ps -p $ppid -o comm= 2>/dev/null || true)
-        if [[ "$comm" == *"sshd"* ]]; then
-            sshd_pid=$ppid
-            break
-        fi
-        ppid=$(ps -p $ppid -o ppid= 2>/dev/null | tr -d ' ' || echo 0)
-    done
-    if [[ -n "$sshd_pid" ]]; then
-        local_port=$(ss -Htnp 2>/dev/null | awk -v pid="pid=${sshd_pid}," '$0 ~ pid {split($4, a, ":"); print a[length(a)]; exit}')
-        if [[ "$local_port" =~ ^[0-9]+$ ]]; then
-            printf '%s\n' "$local_port"
-            return 0
-        fi
-    fi
-    return 1
+    read -r remote_ip remote_port local_ip local_port _ <<< "${SSH_CONNECTION}"
+    [[ "$local_port" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$local_port"
 }
 
 current_ssh_session_uses_port() {
     local expected="$1"
     local current_port
-    current_port=$(current_ssh_session_port 2>/dev/null || true)
-    if [[ -z "$current_port" ]]; then
-        # 极度异常环境，给调用方留后门判断
-        return 2
-    fi
+    current_port=$(current_ssh_session_port 2>/dev/null) || return 1
     [[ "$current_port" == "$expected" ]]
 }
 
 ssh_current_source_ip() {
     local remote_ip
-    if [[ -n "${SSH_CONNECTION:-}" ]]; then
-        read -r remote_ip _ _ _ _ <<< "${SSH_CONNECTION}"
-        if [[ -n "$remote_ip" ]]; then
-            printf '%s\n' "$remote_ip"
-            return 0
-        fi
-    fi
-    local ppid=$$ sshd_pid=""
-    while [[ $ppid -gt 1 ]]; do
-        local comm
-        comm=$(ps -p $ppid -o comm= 2>/dev/null || true)
-        if [[ "$comm" == *"sshd"* ]]; then sshd_pid=$ppid; break; fi
-        ppid=$(ps -p $ppid -o ppid= 2>/dev/null | tr -d ' ' || echo 0)
-    done
-    if [[ -n "$sshd_pid" ]]; then
-        remote_ip=$(ss -Htnp 2>/dev/null | awk -v pid="pid=${sshd_pid}," '$0 ~ pid {split($5, a, ":"); print a[1]; exit}')
-        if [[ -n "$remote_ip" ]]; then
-            printf '%s\n' "$remote_ip"
-            return 0
-        fi
-    fi
-    return 1
+    [[ -n "${SSH_CONNECTION:-}" ]] || return 1
+    read -r remote_ip _ _ _ _ <<< "${SSH_CONNECTION}"
+    [[ -n "$remote_ip" ]] || return 1
+    printf '%s\n' "$remote_ip"
 }
 
 ssh_endpoint_port() {
@@ -229,12 +185,13 @@ ssh_endpoint_port() {
 
 ssh_endpoint_host() {
     local endpoint="$1"
-    # IPv6 推荐使用 [addr]:port；对 ss 极端输出的未加方括号 IPv6，仍按“最后一个冒号后的数字”为端口处理。
+    # IPv6 必须采用 [addr]:port；未加方括号的多冒号形式存在歧义，宁可拒绝识别也不猜测主机地址。
     if [[ "$endpoint" =~ ^\[([^]]+)\]:[0-9]+$ ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
         return 0
     fi
-    if [[ "$endpoint" =~ ^(.+):[0-9]+$ ]]; then
+    # IPv4 与主机名只允许单个分隔冒号，避免把未加方括号的 IPv6 尾段误当端口。
+    if [[ "$endpoint" =~ ^([^:]+):[0-9]+$ ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
         return 0
     fi
@@ -243,12 +200,15 @@ ssh_endpoint_host() {
 
 ssh_new_session_detected() {
     local expected_port="$1"
-    local remote_ip current_session_local_port
+    local remote_ip remote_port current_session_local_port
     local local_endpoint peer_endpoint local_port_now peer_host peer_port
 
+    # [可完全撤销] 本函数只读取现有 SSH 会话状态，不修改 sshd/firewall。
+    # 安全条件：必须看到“当前脚本会话之外”的、来自同一来源地址的新 SSH established 连接。
     remote_ip=$(ssh_current_source_ip 2>/dev/null) || return 1
     [[ -n "$remote_ip" ]] || return 1
-    current_session_local_port=$(current_ssh_session_port 2>/dev/null) || return 1
+    read -r _ remote_port _ current_session_local_port _ <<< "${SSH_CONNECTION:-}"
+    [[ "$remote_port" =~ ^[0-9]+$ && "$current_session_local_port" =~ ^[0-9]+$ ]] || return 1
 
     while read -r _ _ _ local_endpoint peer_endpoint; do
         [[ -n "$local_endpoint" && -n "$peer_endpoint" ]] || continue
@@ -258,8 +218,9 @@ ssh_new_session_detected() {
         [[ "$local_port_now" == "$expected_port" ]] || continue
         [[ "$peer_host" == "$remote_ip" ]] || continue
 
-        # 通过“来源 IP + 本机端口”精确排除当前工具会话，避免把自己误判成“新会话”。
-        if [[ "$peer_host" == "$remote_ip" && "$local_port_now" == "$current_session_local_port" ]]; then
+        # [安全校验] current_session_local_port 是当前工具会话在 VPS 本机的端口。
+        # 通过“来源 IP + 来源临时端口 + 本机端口”精确排除当前这条连接，避免把自己误判成“新会话”。
+        if [[ "$peer_host" == "$remote_ip" && "$peer_port" == "$remote_port" && "$local_port_now" == "$current_session_local_port" ]]; then
             continue
         fi
         return 0
@@ -351,7 +312,7 @@ sshd_has_port() {
 }
 
 remove_old_ssh_port() {
-    local old_port new_port action_dir backend use_rc
+    local old_port new_port action_dir backend
     old_port="${1:-$(state_get ssh_migration_old_port 2>/dev/null || true)}"
     new_port="${2:-$(state_get ssh_migration_new_port 2>/dev/null || true)}"
 
@@ -359,15 +320,10 @@ remove_old_ssh_port() {
     validate_ssh_port "$new_port" || { echo -e "${RED}[错误]${PLAIN} 未找到有效的新 SSH 端口记录。"; return 1; }
     [[ "$old_port" != "$new_port" ]] || { echo -e "${RED}[错误]${PLAIN} 新旧 SSH 端口不能相同。"; return 1; }
 
-    current_ssh_session_uses_port "$new_port"
-    use_rc=$?
-    if (( use_rc == 1 )); then
-        echo -e "${RED}[禁止删除]${PLAIN} 当前这次 SSH 会话是通过旧端口或其它端口登录的，未通过新端口 ${new_port} 登录。"
+    if ! current_ssh_session_uses_port "$new_port"; then
+        echo -e "${RED}[禁止删除]${PLAIN} 当前这次 SSH 会话不是通过新端口 ${new_port} 登录的。"
         echo -e "${YELLOW}[安全条件]${PLAIN} 必须先用新端口建立一个全新的 SSH 会话，再从那个新会话进入此工具删除旧端口。"
         return 1
-    elif (( use_rc == 2 )); then
-        echo -e "${YELLOW}[警告]${PLAIN} 无法可靠探测当前会话的本地登录端口（可能处于特殊容器或极简终端环境）。"
-        confirm_safety_prompt "盲目删除旧 SSH 端口" "工具无法确定你是否已用新端口 ${new_port} 成功登入；如果尚未登入，此操作将导致服务器失联！" || return 1
     fi
 
     if ! sshd_has_port "$old_port" || ! sshd_has_port "$new_port"; then
@@ -416,13 +372,17 @@ remove_old_ssh_port() {
 
     if [[ "$(firewall_backend)" == "ufw" || "$(firewall_backend)" == "firewalld" ]]; then
         backend=$(firewall_backend)
+        # [P0 安全闸门] 任何关闭旧 SSH 防火墙放行的动作之前，必须先确认新端口当前确实已被本机防火墙放行。
+        # [安全保留] 新端口未放行时绝不删除旧端口规则，避免最后一个 SSH 入站入口被误关闭。
         if ! firewall_rule_exists "$backend" "$new_port" tcp; then
             state_set ssh_migration_firewall_cleanup_pending "$old_port"
             echo -e "${YELLOW}[安全保留]${PLAIN} 新 SSH 端口 ${new_port}/tcp 当前未被本机防火墙确认放行，旧端口 ${old_port}/tcp 不会关闭。请先放行新端口后再清理旧规则。"
         elif firewall_port_has_service_rule "$backend" "$old_port" tcp; then
             state_set ssh_migration_firewall_cleanup_pending "$old_port"
             echo -e "${YELLOW}[安全保留]${PLAIN} 旧端口 ${old_port}/tcp 由防火墙 service/profile 管理，不会强制删除；请手动调整该 service。"
-        elif firewall_remove_owned_rules "$old_port" tcp; then
+        # [安全闭环] SSH 旧端口删除后，同步关闭“本工具自己创建”的旧端口防火墙放行。
+        # [安全保留] 如果旧端口不是本工具创建的规则，或规则由更高层 service 管理，则不强删，避免误伤其它业务。
+        elif firewall_remove_owned_rules port "$old_port" tcp; then
             state_unset ssh_migration_firewall_cleanup_pending
             echo -e "${GREEN}[完成]${PLAIN} SSH 旧端口 ${old_port} 已删除，对应的工具防火墙放行也已关闭。"
         elif ! port_in_use "$old_port" tcp && firewall_close_port_rule "$old_port" tcp; then
@@ -434,6 +394,7 @@ remove_old_ssh_port() {
         fi
     fi
 
+    # [安全同步] 删除旧 SSH 后，F2 重新读取 sshd 实际端口集合，只保护仍然存在的新端口。
     if command_exists fail2ban-client && [[ -f "$FAIL2BAN_CONFIG" ]] && is_owned "$FAIL2BAN_CONFIG"; then
         if ! fail2ban_sync_ssh_protection; then
             echo -e "${YELLOW}[提示]${PLAIN} 旧 SSH 端口已删除，但 Fail2Ban 尚未完成端口同步；后续进入模块 1 会自动重试。"
@@ -471,7 +432,7 @@ change_ssh_port() {
 
     confirm_safety_prompt "修改 SSH 端口（保留旧端口）" "旧端口会与新端口同时保留；你必须新开终端通过新端口登录成功。之后再次进入本选项并选择 2，才会删除旧端口。" || return 1
 
-    read -rp "当前 SSH 端口 ${cur_port}，请输入新端口 [1024-65535]: " new_port
+    read -rp "当前 SSH 端口 ${cur_port}，请输入新端口 [1024-65535]: " new_port || { echo -e "${YELLOW}[提示]${PLAIN} 未读取到端口输入，操作已取消。"; return 1; }
     validate_port "$new_port" || { echo -e "${RED}[错误]${PLAIN} 端口必须在 1024-65535。"; return 1; }
     [[ "$new_port" != "$cur_port" ]] || { echo -e "${YELLOW}[提示]${PLAIN} 新旧端口相同。"; return 0; }
     if port_in_use "$new_port" tcp; then
@@ -505,11 +466,15 @@ change_ssh_port() {
         return 1
     fi
 
-    firewall_allow "$new_port" tcp || true
+    if [[ "$(firewall_backend)" == "none" ]]; then
+        echo -e "${YELLOW}[提示]${PLAIN} 当前未启用 UFW/firewalld；请在云安全组/外部防火墙放行新 SSH 端口 ${new_port}/tcp。"
+    elif ! firewall_allow "$new_port" tcp; then
+        echo -e "${YELLOW}[警告]${PLAIN} 未能确认新 SSH 端口 ${new_port}/tcp 已在本机防火墙放行；请检查规则后再新建 SSH 会话。"
+    fi
     if ! restart_or_reload_ssh; then
         restore_action_ssh_files "$action_dir" || true
         restart_or_reload_ssh >/dev/null 2>&1 || true
-        firewall_remove_owned_rules "$new_port" tcp || true
+        firewall_remove_owned_rules port "$new_port" tcp || true
         rm -rf "$action_dir"
         echo -e "${RED}[错误]${PLAIN} SSH 服务重载/重启失败，已恢复原配置。"
         return 1
@@ -518,12 +483,13 @@ change_ssh_port() {
     if ! ssh_port_listening "$cur_port" || ! ssh_port_listening "$new_port"; then
         restore_action_ssh_files "$action_dir" || true
         restart_or_reload_ssh >/dev/null 2>&1 || true
-        firewall_remove_owned_rules "$new_port" tcp || true
+        firewall_remove_owned_rules port "$new_port" tcp || true
         rm -rf "$action_dir"
         echo -e "${RED}[错误]${PLAIN} 双端口监听状态不符合预期，已恢复原配置。"
         return 1
     fi
 
+    # [安全同步] 若已启用本工具的 F2，迁移期间应同时保护旧/新两个实际 SSH 端口。
     if command_exists fail2ban-client && [[ -f "$FAIL2BAN_CONFIG" ]] && is_owned "$FAIL2BAN_CONFIG"; then
         if ! fail2ban_sync_ssh_protection; then
             echo -e "${YELLOW}[提示]${PLAIN} SSH 双端口已建立，但 Fail2Ban 尚未完成新旧端口同步；后续进入模块 1 会自动重试。"
@@ -586,8 +552,9 @@ cancel_ssh_port_migration() {
         echo -e "${RED}[错误]${PLAIN} 回退后的 SSH 重载/重启失败，已恢复回退前配置。"
         return 1
     fi
-
-    if ! firewall_remove_owned_rules "$new_port" tcp; then
+    # [部分可撤销/安全保留] SSH 本机配置可以完整回退；防火墙只处理本次迁移的端口。
+    # [安全回退] 新端口必须关闭；旧端口需要重新获得本机防火墙放行，确保回退后仍能通过原端口连接。
+    if ! firewall_remove_owned_rules port "$new_port" tcp; then
         rm -rf "$action_dir"
         echo -e "${YELLOW}[警告]${PLAIN} SSH 配置已经恢复为原端口 ${old_port}，但新端口 ${new_port}/tcp 的工具防火墙规则未能清理。"
         echo -e "${YELLOW}[状态保留]${PLAIN} 本次迁移 state 将保留，方便后续重试；请确认防火墙状态后再处理。"
@@ -603,6 +570,7 @@ cancel_ssh_port_migration() {
         fi
     fi
 
+    # [安全同步] 回退完成后，F2 重新读取 sshd 实际端口，只保护恢复后的旧端口。
     if command_exists fail2ban-client && [[ -f "$FAIL2BAN_CONFIG" ]] && is_owned "$FAIL2BAN_CONFIG"; then
         if ! fail2ban_sync_ssh_protection; then
             echo -e "${YELLOW}[提示]${PLAIN} SSH 已恢复，但 Fail2Ban 尚未完成端口同步；后续进入模块 1 会自动重试。"
@@ -618,11 +586,15 @@ cancel_ssh_port_migration() {
 }
 
 ssh_success_login_entries() {
+    # [只读/可完全撤销] 只读取系统已有 SSH 成功登录记录，不修改 SSH、防火墙或 F2。
+    # 为避免读取整个 systemd journal 导致卡顿，仅扫描 SSH 服务最近 5000 条日志；
+    # journal 无有效 SSH 登录记录时，再回退到 auth.log/secure。
     local journal_line journal_entries file_line login_count=0
     if command_exists journalctl; then
         journal_line=$(journalctl --no-pager -o short-iso \
             -u ssh.service -u sshd.service -n 5000 2>/dev/null || true)
         if [[ -n "$journal_line" ]]; then
+            # 先估算最近记录中的 SSH 成功登录数量；数量较多时提前告知用户，避免看起来像程序卡死。
             login_count=$(awk '$0 ~ /sshd[^:]*:.*Accepted (password|publickey|keyboard-interactive)/ {count++} END {print count+0}' <<< "$journal_line")
             if (( login_count >= 500 )); then
                 echo -e "${YELLOW}[提示]${PLAIN} 最近 5000 条 SSH 日志中约有 ${login_count} 条成功登录记录，正在整理并合并重复 IP，可能需要一些时间..." >&2
@@ -639,22 +611,12 @@ ssh_success_login_entries() {
         fi
     fi
 
-    # [修复 Bug] 引入月份映射矩阵，把 Oct 3 转换为 YYYY-MM-DD 确保字符串正序排列，解决跨月排序乱套。
     for file_line in /var/log/auth.log /var/log/secure; do
         if [[ -f "$file_line" ]]; then
-            awk 'BEGIN {
-                m["Jan"]="01"; m["Feb"]="02"; m["Mar"]="03"; m["Apr"]="04"; m["May"]="05"; m["Jun"]="06";
-                m["Jul"]="07"; m["Aug"]="08"; m["Sep"]="09"; m["Oct"]="10"; m["Nov"]="11"; m["Dec"]="12";
-                "date +%Y" | getline year; close("date +%Y");
-            }
-            /sshd.*Accepted (password|publickey|keyboard-interactive)/ {
+            awk '/sshd.*Accepted (password|publickey|keyboard-interactive)/ {
                 ip="";
                 for (i=1; i<NF; i++) if ($i=="from") { ip=$(i+1); break }
-                if (ip!="") {
-                    mon=m[$1]; if(mon=="") mon=$1;
-                    day=$2; if(length(day)==1) day="0"day;
-                    print year "-" mon "-" day "T" $3 "|" ip
-                }
+                if (ip!="") print $1 " " $2 " " $3 "|" ip
             }' "$file_line"
         fi
     done
@@ -676,7 +638,7 @@ show_successful_ssh_login_ips() {
         if ((${#entries[@]} == 0)); then
             echo -e "${YELLOW}暂无可读取的 SSH 成功登录记录。${PLAIN}"
             echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-            read -rp "按回车返回..."
+            read -rp "按回车返回..." || return 0
             return 0
         fi
 
@@ -702,7 +664,7 @@ show_successful_ssh_login_ips() {
         echo -e "第 $((page + 1)) / ${total_pages} 页，共 ${#entries[@]} 个 IP"
         if (( total_pages > 1 )); then
             echo -e "${GREEN}n${PLAIN}. 下一页   ${GREEN}p${PLAIN}. 上一页   ${GREEN}q${PLAIN}. 返回"
-            read -rp "请选择：[n/p/q] " choice
+            read -rp "请选择：[n/p/q] " choice || return 0
             case "${choice,,}" in
                 n)
                     if (( page < total_pages - 1 )); then
@@ -718,7 +680,7 @@ show_successful_ssh_login_ips() {
                 *) ;;
             esac
         else
-            read -rp "按回车返回..."
+            read -rp "按回车返回..." || return 0
             return 0
         fi
     done
@@ -747,34 +709,16 @@ ssh_port_menu() {
         echo -e "     ${YELLOW}用于解除迁移状态卡住的问题；如果当前会话来自新端口，回退可能导致当前连接断开。${PLAIN}"
         echo -e "  ${GREEN}0.${PLAIN} 返回上一级"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请输入选项 [0-4]: " choice
+        read -rp "请输入选项 [0-4]: " choice || return 0
         case "$choice" in
-            1) change_ssh_port || true; read -rp "按回车继续..." ;;
-            2) remove_old_ssh_port || true; read -rp "按回车继续..." ;;
+            1) change_ssh_port || true; read -rp "按回车继续..." || return 0 ;;
+            2) remove_old_ssh_port || true; read -rp "按回车继续..." || return 0 ;;
             3) show_successful_ssh_login_ips ;;
-            4) cancel_ssh_port_migration || true; read -rp "按回车继续..." ;;
+            4) cancel_ssh_port_migration || true; read -rp "按回车继续..." || return 0 ;;
             0) return 0 ;;
             *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
     done
-}
-
-firewall_show_allowed() {
-    local backend="$1"
-    case "$backend" in
-        ufw)
-            echo -e "${CYAN}当前 UFW 放行规则：${PLAIN}"
-            ufw status | sed -n '/^Status:/,$p' || true
-            ;;
-        firewalld)
-            echo -e "${CYAN}当前 firewalld 放行端口/服务：${PLAIN}"
-            echo -e "  ports:   $(firewall-cmd --list-ports 2>/dev/null || echo '（无）')"
-            echo -e "  services: $(firewall-cmd --list-services 2>/dev/null || echo '（无）')"
-            ;;
-        none)
-            echo -e "${YELLOW}当前没有已启用的 UFW/firewalld。${PLAIN}"
-            ;;
-    esac
 }
 
 firewall_rule_exists() {
@@ -787,6 +731,8 @@ firewall_rule_exists() {
             if firewall-cmd --query-port="${port}/${proto}" --permanent >/dev/null 2>&1; then
                 return 0
             fi
+            # [安全保留] 80/443 若已经通过 firewalld 的 http/https service 放行，也视为已具备基线。
+            # 此时不创建重复的端口规则，原有 service 由管理员自行维护。
             if [[ "$proto" == "tcp" && "$port" == "80" ]]; then
                 firewall-cmd --query-service=http --permanent >/dev/null 2>&1
                 return $?
@@ -805,6 +751,60 @@ firewall_rule_exists() {
             return 1
             ;;
     esac
+}
+
+# 解析服务/应用档案中的端口或端口范围；不执行任何来自系统输出的内容。
+firewall_port_token_matches() {
+    local spec="${1:-}" port="${2:-}" proto="${3:-}" ports start end
+    [[ "$port" =~ ^[0-9]{1,5}$ && "$spec" =~ ^[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)$ ]] || return 1
+    [[ "$proto" == "tcp" || "$proto" == "udp" ]] || return 1
+    [[ "${spec##*/}" == "$proto" ]] || return 1
+    ports="${spec%/*}"
+    if [[ "$ports" == *-* ]]; then
+        start="${ports%-*}"
+        end="${ports#*-}"
+        (( 10#$start <= 65535 && 10#$end <= 65535 && 10#$start <= 10#$end )) || return 1
+        (( 10#$port >= 10#$start && 10#$port <= 10#$end ))
+    else
+        (( 10#$ports <= 65535 && 10#$port == 10#$ports ))
+    fi
+}
+
+# 仅检测端口是否由 UFW application profile / firewalld service 提供。
+# 调用方会据此避免删除管理员通过服务档案配置的规则；普通端口规则仍走
+# firewall_rule_exists()/firewall_remove_owned_rules() 的工具归属逻辑。
+firewall_port_has_service_rule() {
+    local backend="${1:-}" port="${2:-}" proto="${3:-}" service spec
+    validate_port_any "$port" || return 1
+    [[ "$proto" == "tcp" || "$proto" == "udp" ]] || return 1
+    case "$backend" in
+        ufw)
+            command_exists ufw || return 1
+            while IFS= read -r service; do
+                [[ -n "$service" ]] || continue
+                while IFS= read -r spec; do
+                    if firewall_port_token_matches "$spec" "$port" "$proto"; then
+                        return 0
+                    fi
+                done < <(ufw app info "$service" 2>/dev/null | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
+            done < <(ufw app list 2>/dev/null | sed -n '/Available applications:/,$p' | sed -n 's/^  //p')
+            ;;
+        firewalld)
+            command_exists firewall-cmd || return 1
+            while IFS= read -r service; do
+                [[ -n "$service" ]] || continue
+                while IFS= read -r spec; do
+                    if firewall_port_token_matches "$spec" "$port" "$proto"; then
+                        return 0
+                    fi
+                done < <(firewall-cmd --info-service="$service" --permanent 2>/dev/null | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
+            done < <(firewall-cmd --list-services --permanent 2>/dev/null | tr ' ' '\n' | sed '/^$/d')
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    return 1
 }
 
 firewall_port_purpose() {
@@ -834,54 +834,8 @@ firewall_port_purpose() {
     esac
 }
 
-firewall_open_port_entries() {
-    local backend="$1" file tmp profile token svc info
-    tmp=$(make_temp_dir firewall-list) || return 1
-    trap 'rm -rf -- "$tmp"' RETURN
-    file="${tmp}/entries"
-    : > "$file" || return 1
-
-    case "$backend" in
-        ufw)
-            while read -r token; do
-                [[ -n "$token" ]] || continue
-                echo "${token}|UFW 端口规则" >> "$file"
-            done < <(ufw status 2>/dev/null | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
-            while IFS= read -r profile; do
-                profile="${profile#  }"
-                [[ -n "$profile" ]] || continue
-                while read -r token; do
-                    [[ -n "$token" ]] || continue
-                    echo "${token}|UFW 服务:${profile}" >> "$file"
-                done < <(ufw app info "$profile" 2>/dev/null | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
-            done < <(ufw app list 2>/dev/null | sed -n '/Available applications:/,$p' | sed -n 's/^  //p')
-            ;;
-        firewalld)
-            while read -r token; do
-                [[ -n "$token" ]] || continue
-                echo "${token}|firewalld 端口规则" >> "$file"
-            done < <(firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)$' | sort -u)
-            while read -r svc; do
-                [[ -n "$svc" ]] || continue
-                info=$(firewall-cmd --info-service="$svc" --permanent 2>/dev/null || true)
-                while read -r token; do
-                    [[ -n "$token" ]] || continue
-                    echo "${token}|firewalld 服务:${svc}" >> "$file"
-                done < <(printf '%s\n' "$info" | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
-            done < <(firewall-cmd --list-services 2>/dev/null | tr ' ' '\n' | sort -u)
-            ;;
-        *)
-            rm -rf "$tmp"
-            return 1
-            ;;
-    esac
-
-    sort -t'|' -k1,1 -k2,2 -u "$file"
-    trap - RETURN
-    rm -rf -- "$tmp"
-}
-
 firewall_show_open_ports() {
+    # [只读/可完全撤销] 仅读取当前 UFW/firewalld 放行状态，不修改规则。
     local backend="$1" count=0 item rule source purpose
     local -a lines=()
     backend="${backend:-$(firewall_backend)}"
@@ -909,7 +863,7 @@ firewall_manage_disable() {
     mapfile -t entries < <(firewall_open_port_entries "$backend" 2>/dev/null || true)
     ((${#entries[@]} > 0)) || { echo -e "${YELLOW}[提示]${PLAIN} 当前没有可管理的数字端口规则。"; return 1; }
     echo -e "${YELLOW}[警告]${PLAIN} 关闭端口会立即影响对应服务；当前 SSH 端口禁止关闭。"
-    read -rp "输入要禁用的编号 [1-${#entries[@]}，其他取消]: " choice
+    read -rp "输入要禁用的编号 [1-${#entries[@]}，其他取消]: " choice || { echo -e "${YELLOW}[提示]${PLAIN} 未读取到选择，操作已取消。"; return 1; }
     [[ "$choice" =~ ^[0-9]+$ ]] || return 0
     (( choice >= 1 && choice <= ${#entries[@]} )) || return 1
     rule="${entries[$((choice-1))]%|*}"
@@ -944,6 +898,7 @@ firewall_manage_disable() {
         else
             mapfile -t service_port_list < <(firewall-cmd --info-service="$svc_name" --permanent 2>/dev/null | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
         fi
+        # 只有当服务本身只提供当前这一条端口时，才允许从这里删除整个 service。
         if ((${#service_port_list[@]} != 1)) || [[ "${service_port_list[0]:-}" != "${rule}" ]]; then
             echo -e "${YELLOW}[提示]${PLAIN} 该端口由服务规则 ${svc_name} 提供，关闭端口可能同时影响其它端口。为避免误删，请直接在对应防火墙服务中管理。"
             return 1
@@ -963,15 +918,17 @@ firewall_manage_disable() {
         echo -e "${YELLOW}[提示]${PLAIN} ${rule} 仍被其它规则或服务放行，未宣布为“已关闭”。请根据上方来源继续处理。"
         return 1
     fi
+    # [本机规则可撤销] 这里仅管理当前主机防火墙；不会修改云安全组或外部 ACL。
     echo -e "${GREEN}[完成]${PLAIN} ${rule} 已停止防火墙放行。"
     log_action "[防火墙] 手动关闭 ${rule}（${purpose}）"
 }
 
 firewall_manage_add() {
+    # [可完全撤销] 新增的端口规则由工具记录，卸载时可按状态清理。
     local port proto purpose
-    read -rp "输入要放行的端口 [1-65535]: " port
+    read -rp "输入要放行的端口 [1-65535]: " port || { echo -e "${YELLOW}[提示]${PLAIN} 未读取到端口，操作已取消。"; return 1; }
     validate_port_any "$port" || { echo -e "${RED}[错误]${PLAIN} 端口必须在 1-65535。"; return 1; }
-    read -rp "协议 [tcp/udp，默认 tcp]: " proto
+    read -rp "协议 [tcp/udp，默认 tcp]: " proto || { echo -e "${YELLOW}[提示]${PLAIN} 未读取到协议，操作已取消。"; return 1; }
     proto="${proto:-tcp}"
     [[ "$proto" == "tcp" || "$proto" == "udp" ]] || { echo -e "${RED}[错误]${PLAIN} 协议只能是 tcp/udp。"; return 1; }
     purpose=$(firewall_port_purpose "${port}/${proto}")
@@ -982,6 +939,7 @@ firewall_manage_add() {
 }
 
 firewall_port_manager_menu() {
+    # [本机规则可撤销] 允许查看/新增/禁用本机防火墙规则；云安全组不在管理范围。
     local backend
     while true; do
         clear
@@ -1000,11 +958,11 @@ firewall_port_manager_menu() {
         echo -e "  ${GREEN}3.${PLAIN} 禁用放行端口"
         echo -e "  ${RED}0.${PLAIN} 返回"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请输入选项 [0-3]: " choice
+        read -rp "请输入选项 [0-3]: " choice || return 0
         case "$choice" in
-            1) clear; firewall_show_open_ports "$backend" || true; read -rp "按回车继续..." ;;
-            2) if [[ "$backend" == "none" ]]; then echo -e "${YELLOW}[提示]${PLAIN} 请先启用防火墙。"; sleep 1; else firewall_manage_add || true; read -rp "按回车继续..."; fi ;;
-            3) if [[ "$backend" == "none" ]]; then echo -e "${YELLOW}[提示]${PLAIN} 当前没有已启用的防火墙。"; sleep 1; else firewall_manage_disable "$backend" || true; read -rp "按回车继续..."; fi ;;
+            1) clear; firewall_show_open_ports "$backend" || true; read -rp "按回车继续..." || return 0 ;;
+            2) if [[ "$backend" == "none" ]]; then echo -e "${YELLOW}[提示]${PLAIN} 请先启用防火墙。"; sleep 1; else firewall_manage_add || true; read -rp "按回车继续..." || return 0; fi ;;
+            3) if [[ "$backend" == "none" ]]; then echo -e "${YELLOW}[提示]${PLAIN} 当前没有已启用的防火墙。"; sleep 1; else firewall_manage_disable "$backend" || true; read -rp "按回车继续..." || return 0; fi ;;
             0) return 0 ;;
             *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
@@ -1012,6 +970,7 @@ firewall_port_manager_menu() {
 }
 
 setup_firewall() {
+    # [部分可撤销/安全保留] 防火墙基线只补充/维护本机规则；云安全组、网络 ACL 与外部防火墙不由本工具回滚。
     check_os || return 1
     local cur_port backend answer port proto session_port rule
     local -a ssh_ports=() required_rules=() missing_rules=()
@@ -1024,6 +983,7 @@ setup_firewall() {
     for cur_port in "${ssh_ports[@]}"; do
         required_rules+=("${cur_port}/tcp")
     done
+    # [安全保留] 当前 SSH 会话实际使用的端口也必须放行，避免会话本身与 sshd 配置短暂不一致时误锁。
     if session_port=$(current_ssh_session_port 2>/dev/null) && validate_ssh_port "$session_port"; then
         local found_session_port=0
         for cur_port in "${ssh_ports[@]}"; do
@@ -1053,7 +1013,7 @@ setup_firewall() {
             return 0
         fi
         echo -e "${YELLOW}[待补充]${PLAIN} 以下规则尚未放行：${missing_rules[*]}"
-        read -rp "是否现在补充这些规则？[y/N]: " answer
+        read -rp "是否现在补充这些规则？[y/N]: " answer || { echo -e "${YELLOW}[提示]${PLAIN} 未读取到确认，未修改防火墙。"; return 1; }
         [[ "$answer" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}[提示]${PLAIN} 未修改现有防火墙规则。"; return 1; }
         for rule in "${missing_rules[@]}"; do
             port="${rule%/*}"; proto="${rule#*/}"
@@ -1079,7 +1039,7 @@ setup_firewall() {
             return 0
         fi
         echo -e "${YELLOW}[待补充]${PLAIN} 以下规则尚未放行：${missing_rules[*]}"
-        read -rp "是否现在补充这些规则？[y/N]: " answer
+        read -rp "是否现在补充这些规则？[y/N]: " answer || { echo -e "${YELLOW}[提示]${PLAIN} 未读取到确认，未修改防火墙。"; return 1; }
         [[ "$answer" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}[提示]${PLAIN} 未修改现有防火墙规则。"; return 1; }
         for rule in "${missing_rules[@]}"; do
             port="${rule%/*}"; proto="${rule#*/}"
@@ -1098,10 +1058,10 @@ setup_firewall() {
     if [[ "$PKG_MANAGER" == "apt" ]]; then
         if command_exists ufw; then
             echo -e "${YELLOW}[状态]${PLAIN} 检测到 UFW 已安装但当前未启用。"
-            read -rp "是否配置并立即启用现有 UFW？[y/N]: " answer
+            read -rp "是否配置并立即启用现有 UFW？[y/N]: " answer || { echo -e "${YELLOW}[提示]${PLAIN} 未读取到确认，未启用 UFW。"; return 1; }
         else
             echo -e "${YELLOW}[计划]${PLAIN} 将安装、配置并立即启用 UFW，默认采用上述放行清单。"
-            read -rp "是否安装、配置并立即启用 UFW？[y/N]: " answer
+            read -rp "是否安装、配置并立即启用 UFW？[y/N]: " answer || { echo -e "${YELLOW}[提示]${PLAIN} 未读取到确认，未启用 UFW。"; return 1; }
         fi
         echo -e "${RED}[重要警告]${PLAIN} 执行后入站默认策略将变为 deny；请先确认云平台安全组已允许上述所有 SSH 端口。"
         [[ "$answer" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}[提示]${PLAIN} 未执行防火墙安装/启用。"; return 1; }
@@ -1122,7 +1082,7 @@ setup_firewall() {
         echo -e "${GREEN}[完成]${PLAIN} UFW 已启用，以上规则现在已经生效。"
     elif command_exists firewall-cmd; then
         echo -e "${YELLOW}[状态]${PLAIN} 检测到 firewalld 已安装，但当前未运行。"
-        read -rp "是否启动、配置并立即应用 firewalld？[y/N]: " answer
+        read -rp "是否启动、配置并立即应用 firewalld？[y/N]: " answer || { echo -e "${YELLOW}[提示]${PLAIN} 未读取到确认，未启动 firewalld。"; return 1; }
         echo -e "${RED}[重要警告]${PLAIN} 启动后入站访问将受 firewalld 管理；请先确认云平台安全组已允许上述所有 SSH 端口。"
         [[ "$answer" =~ ^[Yy]$ ]] || { echo -e "${YELLOW}[提示]${PLAIN} 未启动或修改 firewalld。"; return 1; }
         systemctl enable --now firewalld
@@ -1145,7 +1105,7 @@ setup_ssh_key_auth() {
     command_exists sshd || { echo -e "${RED}[错误]${PLAIN} 未找到 sshd。"; return 1; }
     command_exists ssh-keygen || { echo -e "${RED}[错误]${PLAIN} 未找到 ssh-keygen。"; return 1; }
 
-    read -rp "请粘贴一整行 SSH 公钥：" user_key
+    read -rp "请粘贴一整行 SSH 公钥：" user_key || { echo -e "${YELLOW}[提示]${PLAIN} 未读取到 SSH 公钥，操作已取消。"; return 1; }
     [[ "$user_key" != *$'\n'* && "$user_key" != *$'\r'* ]] || { echo -e "${RED}[错误]${PLAIN} 公钥必须是一整行。"; return 1; }
     local key_tmp
     key_tmp=$(mktemp)
@@ -1183,7 +1143,12 @@ setup_ssh_key_auth() {
         return 1
     fi
 
-    read -rp "是否关闭 root 密码登录？[y/N]: " disable_pwd
+    read -rp "是否关闭 root 密码登录？[y/N]: " disable_pwd || {
+        restore_action_ssh_files "$action_dir" || true
+        rm -rf "$action_dir"
+        echo -e "${YELLOW}[提示]${PLAIN} 未读取到确认，已恢复本次 SSH 配置更改。"
+        return 1
+    }
     if [[ "$disable_pwd" =~ ^[Yy]$ ]]; then
         if ! set_sshd_option_global PasswordAuthentication no || ! set_sshd_option_global KbdInteractiveAuthentication no || ! set_sshd_option_global ChallengeResponseAuthentication no; then
             restore_action_ssh_files "$action_dir" || true
@@ -1233,11 +1198,12 @@ retry_pending_ssh_firewall_cleanup() {
     local old_port backend
     old_port="$(state_get ssh_migration_firewall_cleanup_pending 2>/dev/null || true)"
     [[ -n "$old_port" ]] || return 0
+    # [状态自愈] 状态文件若被手工修改或损坏，不让无效 state 永久卡住菜单。
     validate_port_any "$old_port" || { state_unset ssh_migration_firewall_cleanup_pending; return 0; }
     backend=$(firewall_backend)
     [[ "$backend" != "none" ]] || return 0
     port_in_use "$old_port" tcp && return 0
-    if firewall_remove_owned_rules "$old_port" tcp >/dev/null 2>&1; then
+    if firewall_remove_owned_rules port "$old_port" tcp >/dev/null 2>&1; then
         state_unset ssh_migration_firewall_cleanup_pending
         echo -e "${GREEN}[清理完成]${PLAIN} 旧 SSH 端口 ${old_port}/tcp 的工具防火墙规则已关闭。"
     fi
@@ -1247,6 +1213,9 @@ retry_pending_ssh_firewall_cleanup() {
 # ========================================================
 # SSH 防爆破保护（Fail2Ban）
 # ========================================================
+# [部分可撤销/安全保留] 本功能仅安装/配置 Fail2Ban 的 SSH 防爆破 jail。
+# 停用时删除本工具自己创建的 jail 配置并停止该 jail；Fail2Ban 软件包本身不会强制卸载，
+# 以免影响用户机器上其它由 Fail2Ban 管理的防护规则。
 FAIL2BAN_JAIL_NAME="${FAIL2BAN_JAIL_NAME:-vps-tool-sshd}"
 FAIL2BAN_CONFIG="${FAIL2BAN_CONFIG:-/etc/fail2ban/jail.d/${FAIL2BAN_JAIL_NAME}.local}"
 
@@ -1288,6 +1257,7 @@ fail2ban_install_package() {
 }
 
 fail2ban_detect_log_config() {
+    # [兼容性] 优先使用发行版常见认证日志；如果日志只进入 systemd journal，则使用 journal backend。
     if [[ -f /var/log/auth.log ]]; then
         printf '%s\n' 'backend = auto' 'logpath = /var/log/auth.log'
         return 0
@@ -1316,6 +1286,8 @@ fail2ban_detect_banaction() {
             [[ -f "$action_file" ]] && { printf '%s\n' 'banaction = firewallcmd-ipset'; return 0; }
             ;;
     esac
+
+    # [兼容性] 已启用 UFW/firewalld 时优先使用对应 action；没有已知防火墙后端时交给 Fail2Ban 默认 action。
     return 0
 }
 
@@ -1330,6 +1302,8 @@ fail2ban_current_source_ignoreip() {
 }
 
 fail2ban_target_ssh_ports() {
+    # [安全真相源] F2 永远保护当前 sshd 实际生效的端口，而不是依赖旧的工具记录。
+    # 迁移期间如果 sshd 同时监听 22/2222，这里会返回 22,2222；旧端口删除后自然只剩新端口。
     local -a ports=() valid_ports=()
     local port csv
     mapfile -t ports < <(get_current_ssh_ports)
@@ -1399,6 +1373,8 @@ fail2ban_write_config() {
 }
 
 fail2ban_sync_ssh_protection() {
+    # [自动同步] 已启用且由本工具管理的 F2 jail 才允许自动同步；不会安装/接管用户自己的 Fail2Ban 配置。
+    # [迁移安全] 迁移期间实际 sshd 端口集合包含旧+新，因此 F2 同时保护两者；旧端口删除后自动收缩到新端口。
     local target_ports current_ports backup_tmp=""
     command_exists fail2ban-client || return 0
     [[ -f "$FAIL2BAN_CONFIG" ]] || return 0
@@ -1518,6 +1494,7 @@ fail2ban_current_banned_ips() {
 }
 
 fail2ban_ban_events() {
+    # [只读/可完全撤销] 读取 F2 的封禁日志，不修改任何防火墙规则。
     local since="$1" line entries
     if command_exists journalctl; then
         if [[ -n "$since" ]]; then
@@ -1584,7 +1561,7 @@ fail2ban_show_ssh_status() {
     echo -e "  ${GREEN}3.${PLAIN} 查看当前封禁 IP 详细"
     echo -e "  ${GREEN}0.${PLAIN} 返回 F2 菜单"
     echo -e "${CYAN}====================================================${PLAIN}"
-    read -rp "请输入选项 [0-3]: " choice
+    read -rp "请输入选项 [0-3]: " choice || return 0
     case "$choice" in
         1)
             clear
@@ -1635,13 +1612,14 @@ fail2ban_show_ssh_status() {
         *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; return 1 ;;
     esac
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    read -rp "按回车返回 F2 菜单..."
+    read -rp "按回车返回 F2 菜单..." || return 0
 }
+
 
 fail2ban_unban_ssh_ip() {
     local ip
     command_exists fail2ban-client || { echo -e "${YELLOW}[提示]${PLAIN} Fail2Ban 尚未安装。"; return 1; }
-    read -rp "输入要解除封禁的 IPv4/IPv6 地址：" ip
+    read -rp "输入要解除封禁的 IPv4/IPv6 地址：" ip || { echo -e "${YELLOW}[提示]${PLAIN} 未读取到 IP 地址，操作已取消。"; return 1; }
     [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || { echo -e "${RED}[错误]${PLAIN} IP 地址格式不正确。"; return 1; }
     fail2ban-client set "$FAIL2BAN_JAIL_NAME" unbanip "$ip" >/dev/null 2>&1 || {
         echo -e "${RED}[错误]${PLAIN} 未能解除 ${ip} 的封禁，请检查它是否在当前 jail 中。"
@@ -1672,6 +1650,7 @@ fail2ban_disable_ssh_protection() {
 }
 
 ssh_bruteforce_menu() {
+    # [部分可撤销/安全保留] 本菜单只管理本工具创建的 Fail2Ban SSH jail；不会强制接管用户已有的其它 jail。
     while true; do
         fail2ban_sync_ssh_protection || true
         clear
@@ -1688,12 +1667,12 @@ ssh_bruteforce_menu() {
         echo -e "  ${GREEN}4.${PLAIN} 停用本工具的 SSH 防爆破"
         echo -e "  ${RED}0.${PLAIN} 返回"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请输入选项 [0-4]: " choice
+        read -rp "请输入选项 [0-4]: " choice || return 0
         case "$choice" in
-            1) fail2ban_enable_ssh_protection || true; read -rp "按回车继续..." ;;
-            2) clear; fail2ban_show_ssh_status || true; read -rp "按回车继续..." ;;
-            3) fail2ban_unban_ssh_ip || true; read -rp "按回车继续..." ;;
-            4) fail2ban_disable_ssh_protection || true; read -rp "按回车继续..." ;;
+            1) fail2ban_enable_ssh_protection || true; read -rp "按回车继续..." || return 0 ;;
+            2) clear; fail2ban_show_ssh_status || true; read -rp "按回车继续..." || return 0 ;;
+            3) fail2ban_unban_ssh_ip || true; read -rp "按回车继续..." || return 0 ;;
+            4) fail2ban_disable_ssh_protection || true; read -rp "按回车继续..." || return 0 ;;
             0) return 0 ;;
             *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
@@ -1726,15 +1705,15 @@ security_menu() {
         echo -e "  ----------------------------------------------------"
         echo -e "  ${RED}0.${PLAIN} 返回主菜单"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请输入选项 [0-7]: " choice
+        read -rp "请输入选项 [0-7]: " choice || return 0
         case "$choice" in
-            1) sys_full_upgrade || true; read -rp "按回车继续..." ;;
-            2) sys_security_upgrade || true; read -rp "按回车继续..." ;;
+            1) sys_full_upgrade || true; read -rp "按回车继续..." || return 0 ;;
+            2) sys_security_upgrade || true; read -rp "按回车继续..." || return 0 ;;
             3) ssh_port_menu || true ;;
             4) ssh_bruteforce_menu || true ;;
-            5) setup_firewall || true; read -rp "按回车继续..." ;;
+            5) setup_firewall || true; read -rp "按回车继续..." || return 0 ;;
             6) firewall_port_manager_menu || true ;;
-            7) setup_ssh_key_auth || true; read -rp "按回车继续..." ;;
+            7) setup_ssh_key_auth || true; read -rp "按回车继续..." || return 0 ;;
             0) break ;;
             *) echo -e "${RED}[错误]${PLAIN} 请输入有效选项！"; sleep 1 ;;
         esac
