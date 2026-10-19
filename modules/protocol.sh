@@ -38,36 +38,27 @@ github_release_api_json() {
 }
 
 latest_singbox_version() {
-    local arch releases_json version
+    local arch releases_json
     case "$(uname -m)" in
         x86_64) arch=amd64 ;;
         aarch64) arch=arm64 ;;
         *) return 1 ;;
     esac
 
-    # [修复 Bug] 增加网页 Redirect 兜底方案，防止无授权的 Github API 触发 60次/小时 速率限制导致大面积部署崩溃
-    releases_json=$(github_release_api_json 'releases?per_page=10' 2>/dev/null || true)
-    if [[ -n "$releases_json" ]]; then
-        version=$(jq -er --arg arch "$arch" '
-            .[]
-            | select((.draft // false) == false and (.prerelease // false) == false)
-            | .tag_name as $tag
-            | select($tag != null and ($tag | startswith("v")))
-            | select(any(.assets[]?; .name == ("sing-box-" + ($tag | sub("^v"; "")) + "-linux-" + $arch + ".tar.gz")))
-            | ($tag | sub("^v"; ""))
-        ' <<<"$releases_json" 2>/dev/null | sed -n '1p' || true)
-        if [[ -n "$version" ]]; then echo "$version"; return 0; fi
-    fi
-    
-    version=$(curl -fsSLI -o /dev/null -w "%{url_effective}" https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+.*' | sed 's/^v//' || true)
-    if [[ -n "$version" ]]; then echo "$version"; return 0; fi
-    return 1
+    releases_json=$(github_release_api_json 'releases?per_page=10') || return 1
+    jq -er --arg arch "$arch" '
+        .[]
+        | select((.draft // false) == false and (.prerelease // false) == false)
+        | .tag_name as $tag
+        | select($tag != null and ($tag | startswith("v")))
+        | select(any(.assets[]?; .name == ("sing-box-" + ($tag | sub("^v"; "")) + "-linux-" + $arch + ".tar.gz")))
+        | ($tag | sub("^v"; ""))
+    ' <<<"$releases_json" | sed -n '1p'
 }
 
 fetch_release_asset_digest() {
     local version="$1" asset="$2" release_json checksum
-    release_json=$(github_release_api_json "releases/tags/v${version}" 2>/dev/null || true)
-    [[ -n "$release_json" ]] || return 1
+    release_json=$(github_release_api_json "releases/tags/v${version}") || return 1
     checksum=$(jq -r --arg name "$asset" '
         .assets[]?
         | select(.name == $name)
@@ -106,6 +97,7 @@ extract_singbox_checksum() {
             return length(s) == 64 && s !~ /[^0-9A-Fa-f]/
         }
         {
+            # GNU coreutils 风格：<hash>  <filename> 或 <hash> *<filename>
             hash=$1
             name=$2
             sub(/^\*/, "", name)
@@ -113,6 +105,8 @@ extract_singbox_checksum() {
                 print hash
                 exit
             }
+
+            # BSD 风格：SHA256 (filename) = <hash>
             prefix="SHA256 (" asset ") = "
             if (index($0, prefix) == 1) {
                 hash=substr($0, length(prefix) + 1)
@@ -220,10 +214,18 @@ install_singbox() {
     "$SINGBOX_BIN" version >/dev/null 2>&1 || { echo -e "${RED}[错误]${PLAIN} sing-box 二进制无法运行。"; return 1; }
     ensure_service_user
 
+    if [[ -L "$CONF_DIR" || -L "$SERVICE_FILE" ]]; then
+        echo -e "${RED}[错误]${PLAIN} 配置目录或 systemd 单元是符号链接，拒绝继续以 root 身份写入。"
+        return 1
+    fi
     mkdir -p "$CONF_DIR"
     chown root:vps-tool "$CONF_DIR"
     chmod 0750 "$CONF_DIR"
 
+    if [[ -e "$SERVICE_FILE" && ! -f "$SERVICE_FILE" ]]; then
+        echo -e "${RED}[错误]${PLAIN} ${SERVICE_FILE} 不是普通文件，拒绝覆盖。"
+        return 1
+    fi
     if [[ -e "$SERVICE_FILE" ]] && ! is_owned "$SERVICE_FILE"; then
         echo -e "${RED}[错误]${PLAIN} ${SERVICE_FILE} 已存在但不是本工具创建的，拒绝覆盖。"
         return 1
@@ -254,8 +256,6 @@ WantedBy=multi-user.target
 EOF2
             ;;
         *)
-            # [修复 Bug] 补齐 WorkingDirectory 和 ReadWritePaths，
-            # 解决由于 ProtectSystem=strict 导致的 cache.db 数据库创建失败与进程闪退。
             cat > "$SERVICE_FILE" <<EOF2
 [Unit]
 Description=VPS-Tool sing-box service
@@ -268,8 +268,6 @@ StartLimitBurst=5
 Type=simple
 User=vps-tool
 Group=vps-tool
-WorkingDirectory=/etc/vps-tool/sing-box
-ReadWritePaths=/etc/vps-tool/sing-box
 ExecStart=${SINGBOX_BIN} run -c ${CONF_FILE}
 Restart=on-failure
 RestartSec=3s
@@ -286,6 +284,7 @@ RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadOnlyPaths=/etc/vps-tool/sing-box
 
 [Install]
 WantedBy=multi-user.target
@@ -295,8 +294,8 @@ EOF2
     chmod 0644 "$SERVICE_FILE"
     mark_owned "$SERVICE_FILE"
 
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_UNIT" >/dev/null
+systemctl daemon-reload
+systemctl enable "$SERVICE_UNIT" >/dev/null
 }
 
 get_sys_ip() {
@@ -338,7 +337,7 @@ get_best_sni() {
     if [[ -n "$best" ]]; then
         echo "$best"
     else
-        echo -e "${YELLOW}[提示]${PLAIN} 所有候选 SNI 均探测失败，已回退默认值 addons.mozilla.org" >&2
+        echo -e "${YELLOW}[提示]${PLAIN} 所有候选 SNI 均探测失败，已回退默认值 addons.mozilla.org（不影响使用，但可能不是最优）" >&2
         log_action "[提示] 所有候选 SNI 均探测失败，已回退默认值 addons.mozilla.org"
         echo "addons.mozilla.org"
     fi
@@ -383,6 +382,14 @@ protocol_fragment_names() {
 write_protocol_fragment() {
     local name="$1" json="$2" file tmp
     file=$(protocol_fragment_file "$name") || return 1
+    if [[ -L "$file" || ( -e "$file" && ! -f "$file" ) ]]; then
+        echo -e "${RED}[错误]${PLAIN} 协议片段目标不是安全的普通文件，拒绝写入：${file}" >&2
+        return 1
+    fi
+    if [[ -e "$file" ]] && ! is_owned "$file"; then
+        echo -e "${RED}[错误]${PLAIN} 协议片段已存在但不属于本工具，拒绝覆盖：${file}" >&2
+        return 1
+    fi
     mkdir -p "$CONF_DIR"
     tmp=$(mktemp "${CONF_DIR}/.${name}.json.XXXXXX")
     if ! printf '%s\n' "$json" | jq -e 'type == "object" and (.type | type == "string") and (.tag | type == "string")' >/dev/null; then
@@ -486,6 +493,16 @@ validate_singbox_config() {
 }
 
 ensure_conf_permissions() {
+    local guarded_path
+    for guarded_path in "$CONF_DIR" "$CONF_FILE" "$NODE_INFO_FILE" \
+        "${CONF_DIR}/vless.json" "${CONF_DIR}/hy2.json" "${CONF_DIR}/tuic.json" \
+        "${CONF_DIR}/node_info_vless.txt" "${CONF_DIR}/node_info_hy2.txt" "${CONF_DIR}/node_info_tuic.txt" \
+        "${CONF_DIR}/hy2_cert.pem" "${CONF_DIR}/hy2_key.pem" "${CONF_DIR}/tuic_cert.pem" "${CONF_DIR}/tuic_key.pem"; do
+        if [[ -L "$guarded_path" ]]; then
+            echo -e "${RED}[错误]${PLAIN} 检测到符号链接配置路径，拒绝更改其目标权限：${guarded_path}" >&2
+            return 1
+        fi
+    done
     mkdir -p "$CONF_DIR"
     chown root:vps-tool "$CONF_DIR"
     chmod 0750 "$CONF_DIR"
@@ -498,6 +515,7 @@ ensure_conf_permissions() {
         path=$(protocol_node_info_file "$name") || continue
         [[ -f "$path" ]] && { chown root:root "$path"; chmod 0600 "$path"; }
     done
+    # Hysteria 2 / TUIC 证书和私钥由生成步骤单独设置权限；这里不覆盖其专用权限。
     return 0
 }
 
@@ -510,15 +528,31 @@ prepare_protocol_state() {
 write_protocol_node_info() {
     local name="$1" content="$2" file
     file=$(protocol_node_info_file "$name") || return 1
-    umask 077
-    printf '%s\n' "$content" > "$file"
-    chown root:root "$file"
-    chmod 0600 "$file"
-    mark_owned "$file"
+    if [[ -L "$file" || ( -e "$file" && ! -f "$file" ) ]]; then
+        echo -e "${RED}[错误]${PLAIN} 节点信息目标不是安全的普通文件，拒绝写入：${file}" >&2
+        return 1
+    fi
+    if [[ -e "$file" ]] && ! is_owned "$file"; then
+        echo -e "${RED}[错误]${PLAIN} 节点信息文件已存在但不属于本工具，拒绝覆盖：${file}" >&2
+        return 1
+    fi
+    local old_umask
+    old_umask=$(umask) || return 1
+    umask 077 || return 1
+    if ! printf '%s\n' "$content" > "$file"; then
+        umask "$old_umask" || true
+        return 1
+    fi
+    if ! chown root:root "$file" || ! chmod 0600 "$file" || ! mark_owned "$file"; then
+        umask "$old_umask" || true
+        return 1
+    fi
+    umask "$old_umask" || return 1
 }
 
 protocol_listener_is_up() {
     local name="$1" port transport
+    # 优先从 config.json 取权威端口；取不到再退回 state 记录
     if [[ -f "$CONF_FILE" ]]; then
         port=$(jq -r --arg tag "${name}-in" '.inbounds[] | select(.tag == $tag) | .listen_port' "$CONF_FILE" 2>/dev/null | head -n1)
     fi
@@ -563,7 +597,7 @@ remove_protocol_resources() {
     esac
 
     remove_port_hopping "$name" || true
-    if [[ -n "$port" ]] && ! firewall_remove_owned_rules "$port" "$transport"; then
+    if [[ -n "$port" ]] && ! firewall_remove_owned_rules port "$port" "$transport"; then
         echo -e "${YELLOW}[警告]${PLAIN} ${name} 的 ${port}/${transport} 防火墙规则未能删除，已保留记录以便后续重试。"
     fi
     if [[ -n "$cert_file" && -f "$cert_file" ]] && is_owned "$cert_file"; then
@@ -621,14 +655,6 @@ restart_service_and_verify() {
     return 1
 }
 
-write_node_info() {
-    local content="$1"
-    umask 077
-    printf '%s\n' "$content" > "$NODE_INFO_FILE"
-    chown root:root "$NODE_INFO_FILE"
-    chmod 0600 "$NODE_INFO_FILE"
-}
-
 firewall_note() {
     local port="$1" proto="$2"
     local backend
@@ -654,12 +680,13 @@ protocol_hop_listen_state_key() {
 }
 
 validate_hop_range() {
-    local range="$1" start end span
+    local range="$1" start end start_num end_num span
     [[ "$range" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || return 1
     start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"
-    (( start >= 1024 && end <= 65535 && start < end )) || return 1
-    span=$((end-start))
-    (( span <= 200 ))
+    start_num=$((10#$start)); end_num=$((10#$end))
+    (( start_num >= 1024 && end_num <= 65535 && start_num < end_num )) || return 1
+    span=$((end_num-start_num))
+    (( span < 200 ))
 }
 
 hop_range_conflicts() {
@@ -667,13 +694,14 @@ hop_range_conflicts() {
     for other_name in $(protocol_fragment_names); do
         [[ -f "$(protocol_fragment_file "$other_name")" ]] || continue
         other_port=$(state_get "$(protocol_port_state_key "$other_name")" 2>/dev/null || true)
-        if [[ "$other_port" =~ ^[0-9]+$ ]] && (( other_port >= start && other_port <= end )); then
-            return 0
+        if [[ "$other_port" =~ ^[0-9]+$ ]]; then
+            other_port=$((10#$other_port))
+            if (( other_port >= start && other_port <= end )); then return 0; fi
         fi
         other_range=$(state_get "$(protocol_hop_state_key "$other_name")" 2>/dev/null || true)
         if [[ "$other_range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            other_start="${BASH_REMATCH[1]}"
-            other_end="${BASH_REMATCH[2]}"
+            other_start=$((10#${BASH_REMATCH[1]}))
+            other_end=$((10#${BASH_REMATCH[2]}))
             if (( start <= other_end && end >= other_start )); then
                 return 0
             fi
@@ -710,11 +738,11 @@ prompt_port_hopping() {
     PORT_HOP_RANGE=""
     PORT_HOP_ENABLED=0
     [[ "${1:-0}" == "1" ]] || return 0
-    echo -e "${YELLOW}[说明]${PLAIN} 启用后，本机防火墙会为该范围每个 UDP 端口各加一条放行规则；关闭时会逐条收回。"
+    echo -e "${YELLOW}[说明]${PLAIN} 启用后，本机防火墙会为该范围每个 UDP 端口各加一条放行规则（最多 200 个端口）；关闭时会逐条收回。"
     read -rp "是否启用 UDP 端口跳跃（可缓解晚高峰 UDP 限速）？[Y/n]: " choice
     [[ "$choice" =~ ^[Nn]$ ]] && return 0
     while true; do
-        read -rp "输入端口范围（例如 20000-20100，跨度 ≤ 200）：" range
+        read -rp "输入端口范围（例如 20000-20100，最多 200 个端口）：" range
         if [[ -z "$range" ]]; then
             ((blank_attempts += 1))
             echo -e "${YELLOW}[提示]${PLAIN} 必须输入端口范围。"
@@ -725,10 +753,11 @@ prompt_port_hopping() {
             continue
         fi
         if ! validate_hop_range "$range"; then
-            echo -e "${RED}[错误]${PLAIN} 范围必须为 1024-65535、起 < 止、跨度 ≤ 200。"
+            echo -e "${RED}[错误]${PLAIN} 范围必须在 1024-65535 内、起 < 止，且最多 200 个端口。"
             continue
         fi
-        start="${range%-*}"; end="${range#*-}"
+        start=$((10#${range%-*})); end=$((10#${range#*-}))
+        range="${start}-${end}"
         echo -e "${YELLOW}[提醒]${PLAIN} 云平台安全组需放行整段 UDP ${start}-${end}，本工具只能管理本机防火墙。"
         if hop_range_conflicts "$start" "$end"; then
             echo -e "${RED}[错误]${PLAIN} 端口范围与现有监听/已部署协议存在冲突，请换一段范围。"
@@ -740,60 +769,313 @@ prompt_port_hopping() {
     done
 }
 
+write_hop_persistence_file() {
+    local name="$1" backend="$2" range="$3" listen_port="$4" dir file
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo -e "${RED}[错误]${PLAIN} 端口跳跃名称无效。" >&2; return 1; }
+    validate_hop_range "$range" || { echo -e "${RED}[错误]${PLAIN} 端口跳跃范围无效。" >&2; return 1; }
+    validate_port_any "$listen_port" || { echo -e "${RED}[错误]${PLAIN} 端口跳跃目标端口无效。" >&2; return 1; }
+    range="$((10#${range%-*}))-$((10#${range#*-}))"
+    dir="${VPS_TOOL_ETC}/port-hop"
+    mkdir -p "$dir"
+    case "$backend" in
+        nft)
+            file="${dir}/${name}.nft"
+            if [[ -L "$file" || ( -e "$file" && ! -f "$file" ) ]]; then
+                echo -e "${RED}[错误]${PLAIN} 端口跳跃持久化路径不是普通文件，拒绝写入：${file}" >&2
+                return 1
+            fi
+            if [[ -e "$file" ]] && ! is_owned "$file"; then
+                echo -e "${RED}[错误]${PLAIN} 端口跳跃文件已存在但不属于本工具，拒绝覆盖：${file}" >&2
+                return 1
+            fi
+            cat > "$file" <<EOF
+ table ip vps_tool_hop_${name} {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    udp dport ${range} dnat to :${listen_port}
+  }
+}
+table ip6 vps_tool_hop6_${name} {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    udp dport ${range} dnat to :${listen_port}
+  }
+}
+EOF
+            ;;
+        iptables)
+            file="${dir}/${name}.iptables"
+            if [[ -L "$file" || ( -e "$file" && ! -f "$file" ) ]]; then
+                echo -e "${RED}[错误]${PLAIN} 端口跳跃持久化路径不是普通文件，拒绝写入：${file}" >&2
+                return 1
+            fi
+            if [[ -e "$file" ]] && ! is_owned "$file"; then
+                echo -e "${RED}[错误]${PLAIN} 端口跳跃文件已存在但不属于本工具，拒绝覆盖：${file}" >&2
+                return 1
+            fi
+            printf '%s\n' \
+                '#!/usr/bin/env bash' \
+                'set -Eeuo pipefail' \
+                "iptables -t nat -N VPS_TOOL_HOP_${name^^} 2>/dev/null || true" \
+                "iptables -t nat -C PREROUTING -p udp --dport ${start:-${range%-*}}:${end:-${range#*-}} -j VPS_TOOL_HOP_${name^^} 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport ${range/-/:} -j VPS_TOOL_HOP_${name^^}" \
+                "iptables -t nat -C VPS_TOOL_HOP_${name^^} -p udp -j DNAT --to-destination :${listen_port} 2>/dev/null || iptables -t nat -A VPS_TOOL_HOP_${name^^} -p udp -j DNAT --to-destination :${listen_port}" > "$file"
+            ;;
+        *) return 1 ;;
+    esac
+    chmod 600 "$file"
+    mark_owned "$file"
+    printf '%s\n' "$file"
+}
+
+port_hop_restore_script() { printf '%s\n' "${VPS_TOOL_PORT_HOP_RESTORE_SCRIPT:-/usr/local/libexec/vps-tool-port-hop-restore}"; }
+port_hop_restore_unit() { printf '%s\n' "${VPS_TOOL_PORT_HOP_RESTORE_UNIT:-/etc/systemd/system/vps-tool-port-hop-restore.service}"; }
+
+ensure_nft_port_hop_restore_service() {
+    local script unit hop_dir
+    script=$(port_hop_restore_script)
+    unit=$(port_hop_restore_unit)
+    hop_dir="${VPS_TOOL_ETC}/port-hop"
+    command_exists systemctl || { echo -e "${RED}[错误]${PLAIN} systemctl 不可用，无法保证端口跳跃规则重启后恢复。"; return 1; }
+    if [[ -L "$script" || ( -e "$script" && ! -f "$script" ) ]]; then
+        echo -e "${RED}[错误]${PLAIN} ${script} 不是安全的普通文件路径，拒绝覆盖。"; return 1
+    fi
+    if [[ -e "$script" ]] && ! is_owned "$script"; then
+        echo -e "${RED}[错误]${PLAIN} ${script} 已存在且不属于本工具，拒绝覆盖。"; return 1
+    fi
+    if [[ -L "$unit" || ( -e "$unit" && ! -f "$unit" ) ]]; then
+        echo -e "${RED}[错误]${PLAIN} ${unit} 不是安全的普通文件路径，拒绝覆盖。"; return 1
+    fi
+    if [[ -e "$unit" ]] && ! is_owned "$unit"; then
+        echo -e "${RED}[错误]${PLAIN} ${unit} 已存在且不属于本工具，拒绝覆盖。"; return 1
+    fi
+    mkdir -p "$(dirname "$script")" "$(dirname "$unit")"
+    cat > "$script" <<EOF_HOP_SCRIPT
+#!/usr/bin/env bash
+set -Eeuo pipefail
+HOP_DIR='${hop_dir}'
+shopt -s nullglob
+nft_files=("\${HOP_DIR}"/*.nft)
+iptables_files=("\${HOP_DIR}"/*.iptables)
+(( \${#nft_files[@]} + \${#iptables_files[@]} > 0 )) || exit 0
+if (( \${#nft_files[@]} > 0 )) && ! command -v nft >/dev/null 2>&1; then
+    echo "nft is required to restore saved nftables port-hop rules" >&2
+    exit 1
+fi
+if (( \${#iptables_files[@]} > 0 )) && ! command -v iptables >/dev/null 2>&1; then
+    echo "iptables is required to restore saved iptables port-hop rules" >&2
+    exit 1
+fi
+if command -v nft >/dev/null 2>&1; then
+    for file in "\${nft_files[@]}"; do
+        name=\${file##*/}
+        name=\${name%.nft}
+        [[ "\${name}" =~ ^[a-zA-Z0-9_-]+$ ]] || continue
+        table="vps_tool_hop_\${name}"
+        table6="vps_tool_hop6_\${name}"
+        if nft list table ip "\${table}" >/dev/null 2>&1; then nft delete table ip "\${table}"; fi
+        if nft list table ip6 "\${table6}" >/dev/null 2>&1; then nft delete table ip6 "\${table6}"; fi
+        nft -f "\${file}"
+    done
+fi
+if command -v iptables >/dev/null 2>&1; then
+    for file in "\${iptables_files[@]}"; do
+        [[ -f "\${file}" ]] || continue
+        bash "\${file}"
+    done
+fi
+EOF_HOP_SCRIPT
+    chmod 755 "$script"
+    mark_owned "$script"
+    cat > "$unit" <<EOF_HOP_UNIT
+[Unit]
+Description=Restore VPS-Tool UDP port-hop firewall rules
+After=local-fs.target nftables.service netfilter-persistent.service
+
+[Service]
+Type=oneshot
+ExecStart=${script}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_HOP_UNIT
+    chmod 644 "$unit"
+    mark_owned "$unit"
+    systemctl daemon-reload || return 1
+    systemctl enable vps-tool-port-hop-restore.service >/dev/null || return 1
+}
+
+refresh_nft_port_hop_restore_service() {
+    local dir="${VPS_TOOL_ETC}/port-hop" script unit
+    script=$(port_hop_restore_script)
+    unit=$(port_hop_restore_unit)
+    shopt -s nullglob
+    local nft_files=("${dir}"/*.nft)
+    local iptables_files=("${dir}"/*.iptables)
+    if ((${#nft_files[@]} + ${#iptables_files[@]})); then
+        return 0
+    fi
+    if command_exists systemctl; then
+        systemctl disable --now vps-tool-port-hop-restore.service >/dev/null 2>&1 || true
+    fi
+    if is_owned "$unit"; then rm -f -- "$unit"; unmark_owned "$unit"; fi
+    if is_owned "$script"; then rm -f -- "$script"; unmark_owned "$script"; fi
+    command_exists systemctl && systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
 setup_port_hopping() {
-    # [修复 Bug] 重写底层的映射防火墙逻辑。彻底废弃原有的 iptables/nft 暴力写入循环（会导致 firewalld 覆盖冲突和 Reload 风暴）
-    # 改为采用防火墙原生指令，一句话直接挂载 Forward 并批量放行。
     local name="$1" range="$2" listen_port="$3" backend file start end p
     [[ -n "$range" ]] || return 0
-    start="${range%-*}"; end="${range#*-}"
+    validate_hop_range "$range" || return 1
+    start=$((10#${range%-*})); end=$((10#${range#*-}))
+    range="${start}-${end}"
+
+    if command_exists nft; then
+        backend=nft
+        file=$(write_hop_persistence_file "$name" "$backend" "$range" "$listen_port") || return 1
+        nft delete table ip "vps_tool_hop_${name}" >/dev/null 2>&1 || true
+        nft delete table ip6 "vps_tool_hop6_${name}" >/dev/null 2>&1 || true
+        if ! nft -f "$file" >/dev/null 2>&1; then
+            # Older/minimal kernels may lack IPv6 NAT support. Retain IPv4 hopping, but make the limitation explicit.
+            if sed -i '/^table ip6 /,$d' "$file" && nft -f "$file" >/dev/null 2>&1; then
+                echo -e "${YELLOW}[提示]${PLAIN} 当前内核不支持 nftables IPv6 NAT；端口跳跃仅对 IPv4 生效。"
+            else
+                rm -f -- "$file"; unmark_owned "$file"
+                return 1
+            fi
+        fi
+        if ! ensure_nft_port_hop_restore_service; then
+            nft delete table ip "vps_tool_hop_${name}" >/dev/null 2>&1 || true
+            rm -f -- "$file"; unmark_owned "$file"
+            refresh_nft_port_hop_restore_service || true
+            return 1
+        fi
+        state_set "$(protocol_hop_backend_state_key "$name")" nft
+    elif command_exists iptables; then
+        backend=iptables
+        file=$(write_hop_persistence_file "$name" "$backend" "$range" "$listen_port") || return 1
+        iptables -t nat -N "VPS_TOOL_HOP_${name^^}" 2>/dev/null || true
+        iptables -t nat -C PREROUTING -p udp --dport "${start}:${end}" -j "VPS_TOOL_HOP_${name^^}" 2>/dev/null || \
+            iptables -t nat -A PREROUTING -p udp --dport "${start}:${end}" -j "VPS_TOOL_HOP_${name^^}"
+        iptables -t nat -C "VPS_TOOL_HOP_${name^^}" -p udp -j DNAT --to-destination ":${listen_port}" 2>/dev/null || \
+            iptables -t nat -A "VPS_TOOL_HOP_${name^^}" -p udp -j DNAT --to-destination ":${listen_port}"
+        if ! ensure_nft_port_hop_restore_service; then
+            iptables -t nat -D PREROUTING -p udp --dport "${start}:${end}" -j "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1 || true
+            iptables -t nat -F "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1 || true
+            iptables -t nat -X "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1 || true
+            rm -f -- "$file"; unmark_owned "$file"
+            refresh_nft_port_hop_restore_service || true
+            return 1
+        fi
+        state_set "$(protocol_hop_backend_state_key "$name")" iptables
+        if command_exists netfilter-persistent; then
+            netfilter-persistent save >/dev/null 2>&1 || echo -e "${YELLOW}[提示]${PLAIN} iptables 规则已生效，但持久化保存失败。"
+        else
+            echo -e "${YELLOW}[提示]${PLAIN} 未检测到 netfilter-persistent；已由 vps-tool-port-hop-restore.service 在开机时恢复 iptables 规则（${file}）。"
+        fi
+    else
+        echo -e "${RED}[错误]${PLAIN} 未找到 nftables 或 iptables，无法启用端口跳跃。"
+        return 1
+    fi
 
     state_set "$(protocol_hop_state_key "$name")" "$range"
     state_set "$(protocol_hop_listen_state_key "$name")" "$listen_port"
-
-    if [[ "$(firewall_backend)" == "ufw" ]]; then
-        ufw allow "${start}:${end}/udp" >/dev/null 2>&1 || true
-        state_set "$(protocol_hop_backend_state_key "$name")" ufw
-        log_action "[可撤销] ${name} 启用端口跳跃 ${range} -> ${listen_port}/ufw"
-        return 0
-    elif [[ "$(firewall_backend)" == "firewalld" ]]; then
-        firewall-cmd --permanent --add-forward-port=port=${start}-${end}:proto=udp:toport=${listen_port} >/dev/null 2>&1 || true
-        firewall-cmd --permanent --add-port=${start}-${end}/udp >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-        state_set "$(protocol_hop_backend_state_key "$name")" firewalld
-        log_action "[可撤销] ${name} 启用端口跳跃 ${range} -> ${listen_port}/firewalld"
-        return 0
+    if [[ "$(firewall_backend)" == "none" ]]; then
+        echo -e "${YELLOW}[提示]${PLAIN} 当前未启用 UFW/firewalld，本机没有新增端口放行规则；请确认云安全组/外部防火墙已放行 UDP ${range}。"
     else
-        for ((p=start; p<=end; p++)); do firewall_allow "$p" udp >/dev/null 2>&1 || true; done
-        state_set "$(protocol_hop_backend_state_key "$name")" none
-        log_action "[可撤销] ${name} 启用端口跳跃 ${range} -> ${listen_port}/none"
-        return 0
+        for ((p=start; p<=end; p++)); do
+            if ! firewall_allow "$p" udp; then
+                echo -e "${YELLOW}[警告]${PLAIN} 无法为 UDP ${p} 添加主机防火墙规则，正在回滚本次端口跳跃。"
+                if ! remove_port_hopping "$name"; then
+                    echo -e "${RED}[错误]${PLAIN} 端口跳跃回滚未能完全完成，请立即使用“关闭端口跳跃并恢复单端口”重试。"
+                fi
+                return 1
+            fi
+        done
     fi
+    log_action "[可撤销] ${name} 启用端口跳跃 ${range} -> ${listen_port}/${backend}"
 }
 
 remove_port_hopping() {
-    # [修复 Bug] 配套上方重构逻辑的新版清理函数，极速卸载。
     local name="$1" range backend listen_port file start end p failed=0
     range=$(state_get "$(protocol_hop_state_key "$name")" 2>/dev/null || true)
     [[ -n "$range" ]] || return 0
     backend=$(state_get "$(protocol_hop_backend_state_key "$name")" 2>/dev/null || true)
     listen_port=$(state_get "$(protocol_hop_listen_state_key "$name")" 2>/dev/null || true)
-    if ! validate_hop_range "$range"; then return 1; fi
-    start="${range%-*}"; end="${range#*-}"
-
+    if ! validate_hop_range "$range"; then
+        echo -e "${RED}[错误]${PLAIN} ${name} 的端口跳跃状态记录无效：${range}；保留记录，未执行破坏性清理。"
+        return 1
+    fi
+    start=$((10#${range%-*})); end=$((10#${range#*-}))
+    range="${start}-${end}"
     case "$backend" in
-        ufw)
-            ufw delete allow "${start}:${end}/udp" >/dev/null 2>&1 || true
+        nft)
+            file="${VPS_TOOL_ETC}/port-hop/${name}.nft"
+            if command_exists nft; then
+                if nft delete table ip "vps_tool_hop_${name}" >/dev/null 2>&1; then :
+                elif nft list table ip "vps_tool_hop_${name}" >/dev/null 2>&1; then
+                    failed=1
+                    echo -e "${YELLOW}[警告]${PLAIN} 无法删除 nft 端口跳跃表 vps_tool_hop_${name}，已保留状态记录。"
+                fi
+                if nft delete table ip6 "vps_tool_hop6_${name}" >/dev/null 2>&1; then :
+                elif nft list table ip6 "vps_tool_hop6_${name}" >/dev/null 2>&1; then
+                    failed=1
+                    echo -e "${YELLOW}[警告]${PLAIN} 无法删除 nft IPv6 端口跳跃表 vps_tool_hop6_${name}，已保留状态记录。"
+                fi
+            elif [[ -f "$file" ]]; then
+                failed=1
+                echo -e "${YELLOW}[警告]${PLAIN} 当前系统没有 nft，无法确认 ${name} 的端口跳跃规则已删除；已保留状态记录。"
+            fi
             ;;
-        firewalld)
-            firewall-cmd --permanent --remove-forward-port=port=${start}-${end}:proto=udp:toport=${listen_port} >/dev/null 2>&1 || true
-            firewall-cmd --permanent --remove-port=${start}-${end}/udp >/dev/null 2>&1 || true
-            firewall-cmd --reload >/dev/null 2>&1 || true
+        iptables)
+            file="${VPS_TOOL_ETC}/port-hop/${name}.iptables"
+            if command_exists iptables; then
+                if iptables -t nat -D PREROUTING -p udp --dport "${start}:${end}" -j "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then :; fi
+                if iptables -t nat -F "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then :; elif iptables -t nat -L "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then
+                    failed=1
+                    echo -e "${YELLOW}[警告]${PLAIN} 无法清空 iptables 端口跳跃链 VPS_TOOL_HOP_${name^^}，已保留状态记录。"
+                fi
+                if iptables -t nat -X "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then :; elif iptables -t nat -L "VPS_TOOL_HOP_${name^^}" >/dev/null 2>&1; then
+                    failed=1
+                    echo -e "${YELLOW}[警告]${PLAIN} 无法删除 iptables 端口跳跃链 VPS_TOOL_HOP_${name^^}，已保留状态记录。"
+                fi
+                if command_exists netfilter-persistent && ! netfilter-persistent save >/dev/null 2>&1; then
+                    failed=1
+                    echo -e "${YELLOW}[警告]${PLAIN} iptables 持久化保存失败，已保留端口跳跃记录。"
+                fi
+            elif [[ -f "$file" ]]; then
+                failed=1
+                echo -e "${YELLOW}[警告]${PLAIN} 当前系统没有 iptables，无法确认 ${name} 的端口跳跃规则已删除；已保留状态记录。"
+            fi
             ;;
         *)
-            for ((p=start; p<=end; p++)); do firewall_remove_owned_rules "$p" udp >/dev/null 2>&1 || true; done
+            failed=1
+            echo -e "${YELLOW}[警告]${PLAIN} ${name} 的端口跳跃后端记录未知：${backend}；已保留状态记录。"
             ;;
     esac
 
+    for ((p=start; p<=end; p++)); do
+        if ! firewall_remove_owned_rules port "$p" udp; then
+            failed=1
+            echo -e "${YELLOW}[警告]${PLAIN} ${name} 的 UDP ${p} 防火墙规则未能精确删除，已保留端口跳跃记录。"
+        fi
+    done
+
+    if (( failed )); then
+        # 保留运行状态与持久化文件，确保重试前不会因恢复服务被无意禁用而进一步失去恢复能力。
+        if [[ -f "${VPS_TOOL_ETC}/port-hop/${name}.nft" || -f "${VPS_TOOL_ETC}/port-hop/${name}.iptables" ]]; then
+            ensure_nft_port_hop_restore_service || echo -e "${YELLOW}[警告]${PLAIN} 无法刷新端口跳跃恢复服务，请手动检查 systemd。"
+        else
+            refresh_nft_port_hop_restore_service || echo -e "${YELLOW}[警告]${PLAIN} 无法刷新端口跳跃恢复服务，请手动检查 systemd。"
+        fi
+        echo -e "${YELLOW}[重试路径]${PLAIN} 模块 2 → 7. 其他与诊断 → 4. 关闭端口跳跃并恢复单端口。"
+        echo -e "${YELLOW}[手工检查]${PLAIN} systemctl status vps-tool-port-hop-restore.service --no-pager；journalctl -u vps-tool-port-hop-restore.service -n 50 --no-pager"
+        log_action "[警告] ${name} 端口跳跃 ${range} 撤销未完全成功，保留状态记录等待重试"
+        return 1
+    fi
+
+    if is_owned "$file"; then rm -f "$file"; unmark_owned "$file"; fi
+    if [[ "$backend" == "nft" || "$backend" == "iptables" ]]; then refresh_nft_port_hop_restore_service || true; fi
     state_unset "$(protocol_hop_state_key "$name")"
     state_unset "$(protocol_hop_backend_state_key "$name")"
     state_unset "$(protocol_hop_listen_state_key "$name")"
@@ -933,13 +1215,16 @@ install_qrencode_dependency() {
         return 0
     fi
 
-    if [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || [[ ! -t 1 ]]; then
+    if [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || [[ ! -t 0 || ! -t 1 ]]; then
         echo -e "${YELLOW}[提示]${PLAIN} 当前为非交互环境，已跳过二维码依赖安装。"
-        return 0
+        return 2
     fi
 
     echo -e "${YELLOW}[提示]${PLAIN} 显示二维码需要 qrencode，当前未安装。"
-    read -rp "是否现在安装？（约几百 KB，仅安装这一个包）[Y/n]: " choice
+    if ! read -r -p "是否现在安装？（约几百 KB，仅安装这一个包）[Y/n]: " choice; then
+        echo -e "${YELLOW}[提示]${PLAIN} 未收到交互输入，已取消安装。"
+        return 2
+    fi
     if [[ "$choice" =~ ^[Nn]$ ]]; then
         echo -e "${YELLOW}[提示]${PLAIN} 已跳过安装。"
         return 0
@@ -968,9 +1253,10 @@ install_qrencode_dependency() {
         else
             echo "手动安装命令：请使用当前发行版的软件包管理器安装 qrencode。"
         fi
-        return 0
+        return 1
     fi
     echo -e "${GREEN}[成功]${PLAIN} qrencode 安装完成。"
+    return 0
 }
 
 display_protocol_qr() {
@@ -1007,16 +1293,19 @@ qr_menu() {
         echo -e "  ${CYAN}----------------------------------------------------${PLAIN}"
         echo -e "  ${RED}0. 返回${PLAIN}"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -rp "请选择 [0-2]: " choice
+        if ! read -r -p "请选择 [0-2]: " choice; then
+            echo -e "${YELLOW}[提示]${PLAIN} 已收到输入结束信号，返回上级菜单。"
+            return 0
+        fi
         case "$choice" in
-            1) install_qrencode_dependency; read -rp "按回车继续..." ;;
+            1) install_qrencode_dependency || true; if [[ -t 0 ]]; then read -r -p "按回车继续..." _ || true; fi ;;
             2)
                 if ! command_exists qrencode; then
                     echo -e "${YELLOW}[提示]${PLAIN} 当前未安装 qrencode，请先执行第 1 项安装依赖。"
                 else
                     show_protocol_qr_menu || true
                 fi
-                read -rp "按回车继续..."
+                if [[ -t 0 ]]; then read -r -p "按回车继续..." _ || true; fi
                 ;;
             0) return 0 ;;
             *) echo -e "${RED}[错误]${PLAIN} 无效选项。"; sleep 1 ;;
@@ -1033,7 +1322,7 @@ show_protocol_qr_menu() {
     echo "请选择要显示二维码的协议："
     for idx in "${!choices[@]}"; do echo "  $((idx+1)). ${choices[$idx]}"; done
     echo "  0. 返回"
-    read -rp "请选择: " choice
+    read -r -p "请选择: " choice || return 0
     [[ "$choice" =~ ^[0-9]+$ ]] || return 1
     (( choice == 0 )) && return 0
     (( choice >= 1 && choice <= ${#choices[@]} )) || return 1
@@ -1041,7 +1330,7 @@ show_protocol_qr_menu() {
 }
 
 generate_clash_yaml() {
-    local file tmp name node_file server port uuid password sni public_key short_id range
+    local file tmp name node_file server port uuid password sni public_key short_id range certificate_mode
     local count=0
     local -a proxies=()
     local -a names=()
@@ -1064,6 +1353,7 @@ generate_clash_yaml() {
         port=$(node_info_value "$node_file" '连接端口')
         [[ -n "$port" ]] || port=$(node_info_value "$node_file" 'UDP 端口')
         sni=$(node_info_value "$node_file" 'SNI')
+        certificate_mode=$(node_info_value "$node_file" '证书模式')
         case "$name" in
             vless)
                 uuid=$(node_info_value "$node_file" '用户 ID (UUID)')
@@ -1108,7 +1398,9 @@ generate_clash_yaml() {
                     echo "    password: $(yaml_quote "$password")"
                     echo "    sni: $(yaml_quote "$sni")"
                     echo "    alpn: [h3]"
-                    echo "    skip-cert-verify: true"
+                    if [[ -z "$certificate_mode" || "$certificate_mode" == 自签名* ]]; then
+                        echo "    skip-cert-verify: true"
+                    fi
                     range=$(state_get "$(protocol_hop_state_key hy2)" 2>/dev/null || true)
                     [[ -n "$range" ]] && echo "    ports: $(yaml_quote "$range")"
                 } >> "$tmp"
@@ -1133,7 +1425,9 @@ generate_clash_yaml() {
                     echo "    udp-relay-mode: native"
                     echo "    alpn: [h3]"
                     echo "    sni: $(yaml_quote "$sni")"
-                    echo "    skip-cert-verify: true"
+                    if [[ -z "$certificate_mode" || "$certificate_mode" == 自签名* ]]; then
+                        echo "    skip-cert-verify: true"
+                    fi
                     range=$(state_get "$(protocol_hop_state_key tuic)" 2>/dev/null || true)
                     [[ -n "$range" ]] && echo "    ports: $(yaml_quote "$range")"
                 } >> "$tmp"
@@ -1162,9 +1456,20 @@ generate_clash_yaml() {
         echo "  - MATCH,VPS-Tool-Auto"
     } >> "$tmp"
 
+    local clash_out="${CONF_DIR}/clash.yaml"
+    if [[ -L "$clash_out" || ( -e "$clash_out" && ! -f "$clash_out" ) ]]; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误]${PLAIN} Clash 配置目标不是安全的普通文件，拒绝写入。"
+        return 1
+    fi
+    if [[ -e "$clash_out" ]] && ! is_owned "$clash_out"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误]${PLAIN} Clash 配置文件不属于本工具，拒绝覆盖。"
+        return 1
+    fi
     chown root:root "$tmp"
     chmod 0600 "$tmp"
-    mv -f "$tmp" "${CONF_DIR}/clash.yaml"
+    mv -f "$tmp" "$clash_out"
     mark_owned "${CONF_DIR}/clash.yaml"
     echo -e "${GREEN}[完成]${PLAIN} Clash/Mihomo 配置已生成：${CONF_DIR}/clash.yaml"
     cat "${CONF_DIR}/clash.yaml"
@@ -1197,8 +1502,7 @@ protocol_diagnose() {
     if [[ -f "$CONF_FILE" ]] && command_exists jq; then
         while IFS=$'\t' read -r tag name port; do
             [[ -n "$tag" ]] || continue
-            # [修复 Bug] 修改了错误的匹配变量，让面板不再把正常监听的协议错误上报为“未监听”。
-            proto=$(case "$tag" in vless-in) echo vless;; hy2-in) echo hy2;; tuic-in) echo tuic;; *) echo unknown;; esac)
+            proto=$(case "$name" in vless-in) echo vless;; hy2-in) echo hy2;; tuic-in) echo tuic;; *) echo unknown;; esac)
             status="未监听"
             if [[ "$proto" != unknown ]] && protocol_listener_is_up "$proto"; then status="已监听"; fi
             echo "  tag=${tag} type=${name} port=${port} -> ${status}"
@@ -1316,7 +1620,7 @@ deploy_vless_reality() {
     [[ -n "$vision_flow" ]] && vless_link+="&flow=${vision_flow}"
     vless_link+="#VPS-Tool-Reality"
     if ! write_protocol_node_info vless "===================== 节点连接信息 =====================
-协议方案: VLESS + Vision + Reality
+协议方案: VLESS$( [[ -n "$vision_flow" ]] && printf ' + Vision' ) + Reality
 运行状态: $(protocol_status_text vless)
 服务器地址: ${server_ip}
 连接端口: ${port}
@@ -1338,17 +1642,119 @@ ${vless_link}
     echo -e "\n${GREEN}[成功]${PLAIN} VLESS + Reality 部署完成。"
 }
 
+# Hysteria 2 / TUIC v5：默认可选自签名证书；也支持导入现有公网 CA 证书。
+# 自签名模式必须明确告知证书验证被关闭；CA 模式会检查域名、有效期、私钥匹配和系统信任链。
+TLS_CERT_SNI=""
+TLS_CERT_MODE=""
+prepare_udp_tls_certificate() {
+    local protocol="$1" cert_file="$2" key_file="$3" mode="1" source_cert="" source_key="" domain="" tmp cert_pub key_pub leaf chain ca_bundle
+    if [[ -n "${VPS_TOOL_PIPELINE:-}" ]]; then
+        mode=1
+        echo -e "${YELLOW}[证书安全提示]${PLAIN} 自动流水线使用自签名证书；客户端需要跳过证书身份验证，安全性低于公网 CA 证书。"
+    else
+        echo "TLS 证书模式："
+        echo "  1. 生成自签名证书（无需域名；客户端无法验证服务器身份）"
+        echo "  2. 使用现有公网 CA 证书（推荐；需匹配域名的 fullchain.pem 和 privkey.pem）"
+        read -r -p "请选择 [1-2，默认 1]: " mode || return 1
+        mode="${mode:-1}"
+        [[ "$mode" == 1 || "$mode" == 2 ]] || { echo -e "${YELLOW}[取消]${PLAIN} 无效证书模式。"; return 1; }
+    fi
+
+    if [[ "$mode" == 2 ]]; then
+        read -r -p "证书域名/SNI（例如 node.example.com）: " domain || return 1
+        [[ "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$ ]] || {
+            echo -e "${RED}[错误]${PLAIN} 域名格式不合法。"; return 1;
+        }
+        read -r -p "证书 fullchain.pem 路径: " source_cert || return 1
+        read -r -p "私钥 privkey.pem 路径: " source_key || return 1
+        [[ -r "$source_cert" && -s "$source_cert" && -r "$source_key" && -s "$source_key" ]] || {
+            echo -e "${RED}[错误]${PLAIN} 证书或私钥文件不存在、不可读或为空。"; return 1;
+        }
+        [[ "$(readlink -f -- "$source_cert" 2>/dev/null || printf '%s' "$source_cert")" != "$(readlink -m -- "$cert_file" 2>/dev/null || printf '%s' "$cert_file")" &&
+           "$(readlink -f -- "$source_key" 2>/dev/null || printf '%s' "$source_key")" != "$(readlink -m -- "$key_file" 2>/dev/null || printf '%s' "$key_file")" ]] || {
+            echo -e "${RED}[错误]${PLAIN} 来源证书/私钥不能直接指向工具的目标文件。"; return 1;
+        }
+        command_exists openssl || { echo -e "${RED}[错误]${PLAIN} 缺少 openssl，无法验证证书。"; return 1; }
+        openssl x509 -in "$source_cert" -noout -checkhost "$domain" >/dev/null 2>&1 || {
+            echo -e "${RED}[错误]${PLAIN} 证书不匹配域名 ${domain}。"; return 1;
+        }
+        openssl x509 -in "$source_cert" -noout -checkend 0 >/dev/null 2>&1 || {
+            echo -e "${RED}[错误]${PLAIN} 证书已过期或即将失效。"; return 1;
+        }
+        tmp=$(mktemp -d "${VPS_TOOL_ETC}/.cert-verify.XXXXXX") || return 1
+        awk 'BEGIN{n=0;in_cert=0} /-----BEGIN CERTIFICATE-----/{n++;in_cert=1} {if(n==1) print > leaf; else if(n>1) print > chain} /-----END CERTIFICATE-----/{in_cert=0}' leaf="${tmp}/leaf.pem" chain="${tmp}/chain.pem" "$source_cert"
+        ca_bundle=""
+        for leaf in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+            [[ -s "$leaf" ]] && { ca_bundle="$leaf"; break; }
+        done
+        if [[ -z "$ca_bundle" ]]; then rm -rf "$tmp"; echo -e "${RED}[错误]${PLAIN} 找不到系统 CA 根证书包，无法验证证书链。"; return 1; fi
+        if [[ -s "${tmp}/chain.pem" ]]; then
+            openssl verify -purpose sslserver -CAfile "$ca_bundle" -untrusted "${tmp}/chain.pem" "${tmp}/leaf.pem" >/dev/null 2>&1 || {
+                rm -rf "$tmp"; echo -e "${RED}[错误]${PLAIN} 证书链未通过系统 CA 验证；请提供完整且受信任的 fullchain.pem。"; return 1;
+            }
+        else
+            openssl verify -purpose sslserver -CAfile "$ca_bundle" "${tmp}/leaf.pem" >/dev/null 2>&1 || {
+                rm -rf "$tmp"; echo -e "${RED}[错误]${PLAIN} 证书链验证失败；请提供 fullchain.pem，而非仅叶证书。"; return 1;
+            }
+        fi
+        cert_pub=$(openssl x509 -in "$source_cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}') || { rm -rf "$tmp"; return 1; }
+        key_pub=$(openssl pkey -in "$source_key" -passin pass: -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}') || {
+            rm -rf "$tmp"; echo -e "${RED}[错误]${PLAIN} 无法读取私钥；请提供未加密的 PEM 私钥（sing-box 服务不能交互输入密码）。"; return 1;
+        }
+        rm -rf "$tmp"
+        [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || { echo -e "${RED}[错误]${PLAIN} 证书与私钥不匹配。"; return 1; }
+        TLS_CERT_SNI="$domain"
+        TLS_CERT_MODE="公网 CA 证书（验证已启用）"
+    else
+        TLS_CERT_SNI=$(get_best_sni 2>/dev/null || true)
+        [[ -n "$TLS_CERT_SNI" ]] || TLS_CERT_SNI="bing.com"
+        TLS_CERT_MODE="自签名（客户端跳过证书验证）"
+        echo -e "${YELLOW}[警告]${PLAIN} 自签名证书无法证明服务器身份；分享链接将带 insecure/allow_insecure 参数，Clash/Mihomo 也会跳过证书验证。"
+    fi
+
+    if [[ -L "$cert_file" || -L "$key_file" || ( -e "$cert_file" && ! -f "$cert_file" ) || ( -e "$key_file" && ! -f "$key_file" ) ]]; then
+        echo -e "${RED}[错误]${PLAIN} 证书或私钥目标不是安全的普通文件，拒绝写入。"; return 1
+    fi
+    if [[ -e "$cert_file" || -e "$key_file" ]] && { ! is_owned "$cert_file" || ! is_owned "$key_file"; }; then
+        echo -e "${RED}[错误]${PLAIN} 检测到非本工具创建的证书/私钥，拒绝覆盖。"; return 1
+    fi
+    if is_owned "$cert_file"; then rm -f -- "$cert_file"; unmark_owned "$cert_file"; fi
+    if is_owned "$key_file"; then rm -f -- "$key_file"; unmark_owned "$key_file"; fi
+    if [[ "$mode" == 2 ]]; then
+        install -m 0644 "$source_cert" "$cert_file" || return 1
+        install -m 0640 "$source_key" "$key_file" || { rm -f "$cert_file"; return 1; }
+    else
+        if ! openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout "$key_file" -out "$cert_file" -days 3650 -subj "/CN=${TLS_CERT_SNI}" >/dev/null 2>&1; then
+            rm -f "$cert_file" "$key_file"
+            echo -e "${RED}[错误]${PLAIN} 自签名 TLS 证书生成失败。"; return 1
+        fi
+        chmod 0640 "$key_file"; chmod 0644 "$cert_file"
+    fi
+    chown root:vps-tool "$key_file" "$cert_file" || { rm -f "$cert_file" "$key_file"; return 1; }
+    mark_owned "$cert_file"
+    mark_owned "$key_file"
+}
+
 deploy_hysteria2() {
     [[ -n "${VPS_TOOL_PIPELINE:-}" ]] || clear
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${CYAN}                [Hysteria 2]                       ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
 
-    local default_port input_port port password cert_file key_file server_ip sni="bing.com" hop_range=""
+    local default_port input_port port password cert_file key_file server_ip sni="" hop_range="" cert_mode=""
     local fragment rollback_dir had_fragment=0 fragment_json
     default_port=$(get_random_protocol_port udp) || { echo -e "${RED}[错误]${PLAIN} 无法找到空闲 UDP 端口。"; return 1; }
-    read -rp "UDP 端口 [回车使用 ${default_port}，范围 1024-65535]: " input_port
-    port="${input_port:-$default_port}"
+    if [[ -n "${VPS_TOOL_PIPELINE:-}" ]]; then
+        port="$default_port"
+        echo -e "${BLUE}[流水线]${PLAIN} 自动选择空闲 UDP 端口：${port}（无需手动输入）"
+    else
+        if ! read -r -p "UDP 端口 [回车使用 ${default_port}，范围 1024-65535]: " input_port; then
+            echo -e "${YELLOW}[取消]${PLAIN} 未读取到 UDP 端口输入，已取消 Hysteria 2 部署。"
+            return 1
+        fi
+        port="${input_port:-$default_port}"
+    fi
     validate_user_port "$port" || { echo -e "${RED}[错误]${PLAIN} 端口无效。"; return 1; }
     port_in_use "$port" udp && { echo -e "${RED}[错误]${PLAIN} UDP 端口已被占用。"; return 1; }
     state_exists protocol_hy2 && { echo -e "${YELLOW}[提示]${PLAIN} Hysteria 2 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除协议 / 清理全部”移除它，再重新部署；移除过程中服务会短暂重启，完成后需要重新导入新的节点链接。"; return 1; }
@@ -1364,30 +1770,23 @@ deploy_hysteria2() {
     password=$(${SINGBOX_BIN} generate rand --hex 16)
     cert_file="${CONF_DIR}/hy2_cert.pem"
     key_file="${CONF_DIR}/hy2_key.pem"
-    if [[ -e "$cert_file" || -e "$key_file" ]] && { ! is_owned "$cert_file" || ! is_owned "$key_file"; }; then
+    if ! prepare_udp_tls_certificate hy2 "$cert_file" "$key_file"; then
         rm -rf "$rollback_dir"
-        echo -e "${RED}[错误]${PLAIN} 检测到非本工具创建的 Hysteria 2 证书/私钥，拒绝覆盖。"
         return 1
     fi
-    if is_owned "$cert_file" || is_owned "$key_file"; then
-        rm -f "$cert_file" "$key_file"
-        unmark_owned "$cert_file"
-        unmark_owned "$key_file"
-    fi
-    if ! openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -keyout "$key_file" -out "$cert_file" -days 3650 -subj "/CN=${sni}" >/dev/null 2>&1; then
-        rm -rf "$rollback_dir"
-        echo -e "${RED}[错误]${PLAIN} Hysteria 2 TLS 证书生成失败。"
-        return 1
-    fi
-    chmod 0640 "$key_file"
-    chmod 0644 "$cert_file"
-    chown root:vps-tool "$key_file" "$cert_file"
-    mark_owned "$cert_file"
-    mark_owned "$key_file"
+    sni="$TLS_CERT_SNI"
+    cert_mode="$TLS_CERT_MODE"
 
     server_ip=$(get_sys_ip || true)
-    if [[ -z "$server_ip" ]]; then read -rp "无法自动识别公网 IP，请手动输入服务器地址：" server_ip; fi
+    if [[ -z "$server_ip" && -z "${VPS_TOOL_PIPELINE:-}" ]]; then
+        if ! read -r -p "无法自动识别公网 IP，请手动输入服务器地址：" server_ip; then
+            rm -f -- "$cert_file" "$key_file"
+            unmark_owned "$cert_file"; unmark_owned "$key_file"
+            rm -rf -- "$rollback_dir"
+            echo -e "${YELLOW}[取消]${PLAIN} 未读取到服务器地址输入，已取消部署。"
+            return 1
+        fi
+    fi
     if [[ -z "$server_ip" ]]; then
         rm -f "$cert_file" "$key_file"
         unmark_owned "$cert_file"
@@ -1449,7 +1848,8 @@ deploy_hysteria2() {
     state_set protocol_hy2 1
     state_set protocol_hy2_port "$port"
     local hy2_link
-    hy2_link="hysteria2://${password}@${server_ip}:${port}/?insecure=1&sni=${sni}"
+    hy2_link="hysteria2://${password}@${server_ip}:${port}/?sni=${sni}"
+    [[ "$cert_mode" == 自签名* ]] && hy2_link+="&insecure=1"
     [[ -n "$hop_range" ]] && hy2_link+="&mport=${hop_range}"
     hy2_link+="#VPS-Tool-Hysteria2"
     if ! write_protocol_node_info hy2 "===================== 节点连接信息 =====================
@@ -1459,8 +1859,9 @@ deploy_hysteria2() {
 UDP 端口: ${port}
 连接密码: ${password}
 SNI: ${sni}
+证书模式: ${cert_mode}
 端口跳跃: ${hop_range:-未启用}
-说明: 使用本工具生成的自签名证书，因此客户端链接包含 insecure=1。
+说明: ${cert_mode}；自签名模式会关闭客户端服务器身份验证，公网 CA 模式保持证书验证。
 
 【一键导入分享链接】:
 ${hy2_link}
@@ -1481,11 +1882,19 @@ deploy_tuic_v5() {
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${BLUE}[说明]${PLAIN} 面向游戏/实时 UDP 场景，使用原生 UDP 中继；0-RTT 默认关闭以避免重放风险。"
 
-    local default_port input_port port password uuid cert_file key_file server_ip sni="bing.com" hop_range=""
+    local default_port input_port port password uuid cert_file key_file server_ip sni="" hop_range="" cert_mode=""
     local fragment rollback_dir had_fragment=0 fragment_json
     default_port=$(get_random_protocol_port udp) || { echo -e "${RED}[错误]${PLAIN} 无法找到空闲 UDP 端口。"; return 1; }
-    read -rp "UDP 端口 [回车使用 ${default_port}，范围 1024-65535]: " input_port
-    port="${input_port:-$default_port}"
+    if [[ -n "${VPS_TOOL_PIPELINE:-}" ]]; then
+        port="$default_port"
+        echo -e "${BLUE}[流水线]${PLAIN} 自动选择空闲 UDP 端口：${port}（无需手动输入）"
+    else
+        if ! read -r -p "UDP 端口 [回车使用 ${default_port}，范围 1024-65535]: " input_port; then
+            echo -e "${YELLOW}[取消]${PLAIN} 未读取到 UDP 端口输入，已取消 Hysteria 2 部署。"
+            return 1
+        fi
+        port="${input_port:-$default_port}"
+    fi
     validate_user_port "$port" || { echo -e "${RED}[错误]${PLAIN} 端口无效。"; return 1; }
     port_in_use "$port" udp && { echo -e "${RED}[错误]${PLAIN} UDP 端口已被占用。"; return 1; }
     state_exists protocol_tuic && { echo -e "${YELLOW}[提示]${PLAIN} TUIC v5 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除协议 / 清理全部”移除它，再重新部署；移除过程中服务会短暂重启，完成后需要重新导入新的节点链接。"; return 1; }
@@ -1502,27 +1911,12 @@ deploy_tuic_v5() {
     password=$(${SINGBOX_BIN} generate rand --hex 16)
     cert_file="${CONF_DIR}/tuic_cert.pem"
     key_file="${CONF_DIR}/tuic_key.pem"
-    if [[ -e "$cert_file" || -e "$key_file" ]] && { ! is_owned "$cert_file" || ! is_owned "$key_file"; }; then
+    if ! prepare_udp_tls_certificate tuic "$cert_file" "$key_file"; then
         rm -rf "$rollback_dir"
-        echo -e "${RED}[错误]${PLAIN} 检测到非本工具创建的 TUIC TLS 证书/私钥，拒绝覆盖。"
         return 1
     fi
-    if is_owned "$cert_file" || is_owned "$key_file"; then
-        rm -f "$cert_file" "$key_file"
-        unmark_owned "$cert_file"
-        unmark_owned "$key_file"
-    fi
-    if ! openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -keyout "$key_file" -out "$cert_file" -days 3650 -subj "/CN=${sni}" >/dev/null 2>&1; then
-        rm -rf "$rollback_dir"
-        echo -e "${RED}[错误]${PLAIN} TUIC TLS 证书生成失败。"
-        return 1
-    fi
-    chmod 0640 "$key_file"
-    chmod 0644 "$cert_file"
-    chown root:vps-tool "$key_file" "$cert_file"
-    mark_owned "$cert_file"
-    mark_owned "$key_file"
+    sni="$TLS_CERT_SNI"
+    cert_mode="$TLS_CERT_MODE"
 
     [[ -n "$uuid" && -n "$password" ]] || {
         rm -f "$cert_file" "$key_file"
@@ -1534,7 +1928,15 @@ deploy_tuic_v5() {
     }
 
     server_ip=$(get_sys_ip || true)
-    if [[ -z "$server_ip" ]]; then read -rp "无法自动识别公网 IP，请手动输入服务器地址：" server_ip; fi
+    if [[ -z "$server_ip" && -z "${VPS_TOOL_PIPELINE:-}" ]]; then
+        if ! read -r -p "无法自动识别公网 IP，请手动输入服务器地址：" server_ip; then
+            rm -f -- "$cert_file" "$key_file"
+            unmark_owned "$cert_file"; unmark_owned "$key_file"
+            rm -rf -- "$rollback_dir"
+            echo -e "${YELLOW}[取消]${PLAIN} 未读取到服务器地址输入，已取消部署。"
+            return 1
+        fi
+    fi
     if [[ -z "$server_ip" ]]; then
         rm -f "$cert_file" "$key_file"
         unmark_owned "$cert_file"
@@ -1593,7 +1995,8 @@ deploy_tuic_v5() {
     state_set protocol_tuic 1
     state_set protocol_tuic_port "$port"
     local tuic_link
-    tuic_link="tuic://${uuid}:${password}@${server_ip}:${port}/?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${sni}&allow_insecure=1"
+    tuic_link="tuic://${uuid}:${password}@${server_ip}:${port}/?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${sni}"
+    [[ "$cert_mode" == 自签名* ]] && tuic_link+="&allow_insecure=1"
     [[ -n "$hop_range" ]] && tuic_link+="&mport=${hop_range}"
     tuic_link+="#VPS-Tool-TUICv5"
     if ! write_protocol_node_info tuic "===================== 节点连接信息 =====================
@@ -1608,8 +2011,9 @@ UDP 中继: native（原生 UDP）
 0-RTT: 已关闭（避免重放风险）
 ALPN: h3
 SNI: ${sni}
+证书模式: ${cert_mode}
 端口跳跃: ${hop_range:-未启用}
-说明: 使用本工具生成的自签名证书，因此客户端链接包含 allow_insecure=1。
+说明: ${cert_mode}；自签名模式会关闭客户端服务器身份验证，公网 CA 模式保持证书验证。
 
 【一键导入分享链接】:
 ${tuic_link}
@@ -1747,8 +2151,8 @@ singbox_current_version() {
     fi
     local output version
     output=$("$SINGBOX_BIN" version 2>&1) || return 2
-    version=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?' <<<"$output" | head -n1 || true)
-    if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+    version=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?' <<<"$output" | head -n1 || true)
+    if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
         printf '%s\n' "$version"
         return 0
     fi
@@ -1756,21 +2160,36 @@ singbox_current_version() {
 }
 
 protocol_version_gt() {
-    # [修复 Bug] 补齐第 4 组预发版本（如 -rc.1）比对算法，解决模块 2 更新检查从预览版无法更新的假阳性拦截问题。
-    local a="$1" b="$2" a1 a2 a3 a4 b1 b2 b3 b4
-    [[ "$a" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([.-][0-9A-Za-z.-]+)?$ ]] || return 1
-    a1="${BASH_REMATCH[1]}"; a2="${BASH_REMATCH[2]}"; a3="${BASH_REMATCH[3]}"; a4="${BASH_REMATCH[4]}"
-    [[ "$b" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([.-][0-9A-Za-z.-]+)?$ ]] || return 1
-    b1="${BASH_REMATCH[1]}"; b2="${BASH_REMATCH[2]}"; b3="${BASH_REMATCH[3]}"; b4="${BASH_REMATCH[4]}"
-    ((10#$a1 > 10#$b1)) && return 0
-    ((10#$a1 < 10#$b1)) && return 1
-    ((10#$a2 > 10#$b2)) && return 0
-    ((10#$a2 < 10#$b2)) && return 1
-    ((10#$a3 > 10#$b3)) && return 0
-    ((10#$a3 < 10#$b3)) && return 1
-    [[ -z "$a4" && -n "$b4" ]] && return 0
-    [[ -n "$a4" && -z "$b4" ]] && return 1
-    [[ "$a4" > "$b4" ]] && return 0
+    local LC_ALL=C
+    local a="$1" b="$2" a1 a2 a3 b1 b2 b3 apre bpre
+    local -a aa=() bb=()
+    [[ "$a" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?(\+[0-9A-Za-z.-]+)?$ ]] || return 2
+    a1="${BASH_REMATCH[1]}"; a2="${BASH_REMATCH[2]}"; a3="${BASH_REMATCH[3]}"; apre="${BASH_REMATCH[5]:-}"
+    [[ "$b" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?(\+[0-9A-Za-z.-]+)?$ ]] || return 2
+    b1="${BASH_REMATCH[1]}"; b2="${BASH_REMATCH[2]}"; b3="${BASH_REMATCH[3]}"; bpre="${BASH_REMATCH[5]:-}"
+    local i max
+    ((10#$a1 > 10#$b1)) && return 0; ((10#$a1 < 10#$b1)) && return 1
+    ((10#$a2 > 10#$b2)) && return 0; ((10#$a2 < 10#$b2)) && return 1
+    ((10#$a3 > 10#$b3)) && return 0; ((10#$a3 < 10#$b3)) && return 1
+    [[ -z "$apre" && -n "$bpre" ]] && return 0
+    [[ -n "$apre" && -z "$bpre" ]] && return 1
+    [[ -z "$apre" && -z "$bpre" ]] && return 1
+    IFS='.' read -r -a aa <<< "$apre"
+    IFS='.' read -r -a bb <<< "$bpre"
+    max=${#aa[@]}; (( ${#bb[@]} > max )) && max=${#bb[@]}
+    for ((i=0; i<max; i++)); do
+        [[ -n "${aa[i]:-}" ]] || return 1
+        [[ -n "${bb[i]:-}" ]] || return 0
+        if [[ "${aa[i]}" =~ ^[0-9]+$ && "${bb[i]}" =~ ^[0-9]+$ ]]; then
+            ((10#${aa[i]} > 10#${bb[i]})) && return 0
+            ((10#${aa[i]} < 10#${bb[i]})) && return 1
+        elif [[ "${aa[i]}" =~ ^[0-9]+$ ]]; then return 1
+        elif [[ "${bb[i]}" =~ ^[0-9]+$ ]]; then return 0
+        else
+            [[ "${aa[i]}" > "${bb[i]}" ]] && return 0
+            [[ "${aa[i]}" < "${bb[i]}" ]] && return 1
+        fi
+    done
     return 1
 }
 
@@ -1885,7 +2304,11 @@ protocol_update_check() {
 
     echo
     echo -e "${CYAN}[说明]${PLAIN} 更新只会调用 VPS-Tool 自己的安全同步流程，不会执行远端清单中的任意代码或 URL。"
-    read -rp "是否立即更新 VPS-Tool 以获取最新协议适配？[y/N]: " confirm_update
+    if ! read -r -p "是否立即更新 VPS-Tool 以获取最新协议适配？[y/N]: " confirm_update; then
+        echo -e "${YELLOW}[取消]${PLAIN} 未读取到确认输入，本次不更新。"
+        rm -rf -- "$tmp"
+        return 1
+    fi
     if [[ ! "$confirm_update" =~ ^[Yy]$ ]]; then
         echo -e "${YELLOW}[取消]${PLAIN} 本次未更新。"
         rm -rf "$tmp"
@@ -1960,7 +2383,7 @@ uninstall_protocol_environment() {
     if systemctl is-enabled --quiet "$SERVICE_UNIT" 2>/dev/null; then systemctl disable "$SERVICE_UNIT" >/dev/null 2>&1 || true; fi
     systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
 
-    firewall_remove_owned_rules || true
+    firewall_remove_owned_rules all || true
 
     local name file remove_legacy_node_info
     if [[ -f "$NODE_INFO_FILE" ]]; then
