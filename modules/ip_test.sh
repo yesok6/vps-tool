@@ -27,35 +27,66 @@ check_hardware_safety() {
 
 run_remote_diagnostic() {
     local name="$1" url="$2"
-    local tmpdir script answer
+    local tmpdir script answer script_sha256 review_dir saved_script
     tmpdir=$(make_temp_dir vps-ip-test)
     script="${tmpdir}/${name}.sh"
     if ! download_shell_checked "$url" "$script"; then
         echo -e "${RED}[错误]${PLAIN} 第三方脚本下载或语法检查失败。"
-        rm -rf "$tmpdir"
+        rm -rf -- "$tmpdir"
         return 1
     fi
 
-    echo -e "${YELLOW}[第三方脚本]${PLAIN} 即将以 root 身份执行："
-    echo "  $url"
-    read -rp "确认执行？[y/N]: " answer
-    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-        rm -rf "$tmpdir"
-        echo -e "${YELLOW}[取消]${PLAIN} 未执行第三方脚本。"
+    script_sha256=$(sha256sum "$script" | awk '{print $1}') || { rm -rf -- "$tmpdir"; return 1; }
+    review_dir="${VPS_TOOL_ETC}/diagnostics"
+    if [[ -L "$review_dir" || ( -e "$review_dir" && ! -d "$review_dir" ) ]]; then
+        echo -e "${RED}[错误]${PLAIN} 诊断脚本审阅目录不是安全目录，拒绝保存：${review_dir}" >&2
+        rm -rf -- "$tmpdir"
+        return 1
+    fi
+    if ! install -d -o root -g root -m 0700 "$review_dir"; then
+        echo -e "${RED}[错误]${PLAIN} 无法创建安全的脚本审阅目录。"
+        rm -rf -- "$tmpdir"
+        return 1
+    fi
+    saved_script="${review_dir}/${name}_$(date +%Y%m%dT%H%M%S)_${script_sha256:0:12}.sh"
+    if ! install -o root -g root -m 0600 "$script" "$saved_script"; then
+        echo -e "${RED}[错误]${PLAIN} 无法保存已下载的诊断脚本。"
+        rm -rf -- "$tmpdir"
         return 1
     fi
 
-    log_action "[测试] 执行第三方诊断脚本：${url}"
+    echo -e "${YELLOW}[第三方脚本]${PLAIN} 已下载并通过 Bash 语法检查，但默认不会执行。"
+    echo "  来源：$url"
+    echo "  SHA-256：$script_sha256（记录值，不代表上游可信）"
+    echo "  审阅文件：$saved_script"
+    echo "  查看命令：less '$saved_script'"
+    echo -e "${YELLOW}[安全提示]${PLAIN} 该文件以 root:root、0600 保存；请先审阅内容。语法检查和哈希记录都不等于安全审计。"
+
+    if [[ "${VPS_TOOL_ALLOW_REMOTE_DIAGNOSTIC_EXEC:-0}" != "1" ]]; then
+        echo -e "${BLUE}[下载完成]${PLAIN} 如确认脚本可信，请先审阅后再手动执行；自动执行需显式设置 VPS_TOOL_ALLOW_REMOTE_DIAGNOSTIC_EXEC=1。"
+        log_action "[诊断脚本] 仅下载未执行：${url} sha256=${script_sha256} path=${saved_script}"
+        rm -rf -- "$tmpdir"
+        return 0
+    fi
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        echo -e "${RED}[安全阻止]${PLAIN} 远程诊断脚本执行要求交互终端；非交互环境只允许下载。"
+        rm -rf -- "$tmpdir"
+        return 1
+    fi
+    echo -e "${RED}[高风险确认]${PLAIN} 即将以 root 执行审阅目录中的第三方脚本。"
+    read -r -p "请输入 EXECUTE 才继续执行：" answer || answer=""
+    if [[ "$answer" != "EXECUTE" ]]; then
+        echo -e "${YELLOW}[取消]${PLAIN} 未执行第三方脚本；已下载文件保留供审阅。"
+        rm -rf -- "$tmpdir"
+        return 1
+    fi
+
+    log_action "[测试] 执行第三方诊断脚本：${url} sha256=${script_sha256} path=${saved_script}"
     local rc=0
-    if ( cd "$tmpdir" && bash "$script" ); then
-        rc=0
-    else
-        rc=$?
-    fi
-    rm -rf "$tmpdir"
+    if ( cd "$(dirname -- "$saved_script")" && bash "$saved_script" ); then rc=0; else rc=$?; fi
+    rm -rf -- "$tmpdir"
     return "$rc"
 }
-
 run_test_ipquality() {
     clear
     echo -e "${CYAN}====================================================${PLAIN}"
