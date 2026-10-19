@@ -58,7 +58,7 @@ grep -qF 'apt-get install -y "${tmp}"/*.deb' "$ROOT/modules/optimize.sh"
 
 # 9. 在线版本检查支持开关，并校验版本号格式。
 grep -q 'VPS_TOOL_VERSION_CHECK' "$ROOT/install.sh"
-grep -q 'remote.*=~' "$ROOT/install.sh"
+grep -q '^valid_tool_version()' "$ROOT/install.sh"
 
 # 10. 流水线协议部署必须跳过端口交互式输入。
 grep -q -- '--pipeline-reality) deploy_vless_reality pipeline' "$ROOT/modules/protocol.sh"
@@ -70,9 +70,9 @@ grep -q 'deploy_tuic_v5 || true' "$ROOT/modules/protocol.sh"
 # 11. 防火墙回滚统一走 firewall_remove_owned_rules，兼容单条与全部清理。
 grep -q '^firewall_remove_owned_rule()' "$ROOT/lib/common.sh"
 grep -q '^firewall_remove_owned_rules()' "$ROOT/lib/common.sh"
-grep -qF 'firewall_remove_owned_rules "$new_port" tcp' "$ROOT/modules/security.sh"
+grep -qF 'firewall_remove_owned_rules port "$new_port" tcp' "$ROOT/modules/security.sh"
 
-action_guard_count=$(grep -cF 'firewall_remove_owned_rules "$new_port" tcp || true' "$ROOT/modules/security.sh")
+action_guard_count=$(grep -cF 'firewall_remove_owned_rules port "$new_port" tcp || true' "$ROOT/modules/security.sh")
 [[ "$action_guard_count" -ge 2 ]]
 
 # 12. security.sh 的 SSH 失败路径必须清理临时 action_dir。
@@ -228,17 +228,18 @@ fi
 grep -qF '保留记录以便后续重试' "$ROOT/lib/common.sh"
 
 # 23. 第三方诊断取消不应伪装成成功。
-grep -qF '[取消]${PLAIN} 未执行第三方脚本。' "$ROOT/modules/ip_test.sh"
+grep -qF '已下载并通过 Bash 语法检查，但默认不会执行。' "$ROOT/modules/ip_test.sh"
 grep -qF 'return 1' "$ROOT/modules/ip_test.sh"
 
 
 # 24. round22 补丁：版本号提升到 2.4.0；协议监听优先取 config.json，且不依赖 ss 固定字段号。
-grep -q '^CURRENT_VERSION="2.9.3"$' "$ROOT/install.sh"
+grep -q '^CURRENT_VERSION="2.9.5"$' "$ROOT/install.sh"
 
 # Round26: v2rayN TUIC share-link compatibility.
-grep -q 'tuic_link="tuic://.*sni=\${sni}&allow_insecure=1' "$ROOT/modules/protocol.sh"
+grep -q 'tuic_link="tuic://.*sni=\${sni}"' "$ROOT/modules/protocol.sh"
+grep -q 'tuic_link+="&allow_insecure=1"' "$ROOT/modules/protocol.sh"
 grep -q 'tuic_link+="#VPS-Tool-TUICv5"' "$ROOT/modules/protocol.sh"
-grep -q 'congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=\${sni}&allow_insecure=1' "$ROOT/modules/protocol.sh"
+grep -q 'congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=\${sni}' "$ROOT/modules/protocol.sh"
 if grep -q 'tuic_link="tuic://.*&insecure=1&sni=' "$ROOT/modules/protocol.sh"; then
     echo "legacy TUIC insecure=1 link format must not be generated" >&2
     exit 1
@@ -285,7 +286,7 @@ EOF
 # 25. 已安装的本地 install.sh 启动时不得静默 sync_bundle；更新应通过选项 8。
 grep -qF 'current_script_path=$(readlink -f -- "${BASH_SOURCE[0]}")' "$ROOT/install.sh"
 grep -qF 'local_install_path=$(readlink -f -- "${LOCAL_ROOT}/install.sh")' "$ROOT/install.sh"
-grep -qF '    # 首次通过网络脚本启动时同步完整本地工具包；已安装版本启动时不再静默更新。' "$ROOT/install.sh"
+grep -qF '# ZIP 完整包启动时优先安装包内同一版本；只有 curl 一键启动或缺少完整文件集时才下载 GitHub 固定提交。' "$ROOT/install.sh"
 
 # 26. 顶层防火墙单条删除 helper 应按后端参数校验并返回失败，而不是异常成功。
 if firewall_remove_owned_rule invalid_backend 65535 tcp; then
@@ -341,8 +342,9 @@ grep -q '放弃本次迁移并恢复原 SSH 端口' "$ROOT/modules/security.sh"
 grep -q '^cancel_ssh_port_migration()' "$ROOT/modules/security.sh"
 ! grep -qF 'cancel_ssh_port_migration 1' "$ROOT/modules/security.sh"
 
-# 35. 防火墙重复进入时应先展示当前状态；已启用后不应再次询问“立即启用”。
-grep -q '^firewall_show_allowed()' "$ROOT/modules/security.sh"
+# 35. 防火墙状态展示检查必须针对当前实际调用的函数，不接受已废弃的旧 helper。
+grep -q '^firewall_show_open_ports()' "$ROOT/modules/security.sh"
+! grep -q '^firewall_show_allowed()' "$ROOT/modules/security.sh"
 grep -q 'UFW 已启用。' "$ROOT/modules/security.sh"
 grep -q 'firewalld 已运行。' "$ROOT/modules/security.sh"
 grep -q '基线规则已补充并立即生效' "$ROOT/modules/security.sh"
@@ -352,10 +354,13 @@ grep -q '基线规则已补充并立即生效' "$ROOT/modules/security.sh"
 grep -q '模块 1 → 3 → 4 放弃迁移并恢复原端口' "$ROOT/README.md"
 grep -q '只展示当前已放行的端口' "$ROOT/README.md"
 
-# 37. SSH endpoint 解析需覆盖 IPv4、标准方括号 IPv6 与极端未加方括号 IPv6。
+# 37. SSH endpoint 解析支持 IPv4/标准方括号 IPv6，并拒绝有歧义的未加方括号 IPv6。
 [[ "$(bash -c 'source "$1"; ssh_endpoint_host "198.51.100.20:34567"' _ "$ROOT/modules/security.sh")" == "198.51.100.20" ]]
 [[ "$(bash -c 'source "$1"; ssh_endpoint_host "[2001:db8::20]:34567"' _ "$ROOT/modules/security.sh")" == "2001:db8::20" ]]
-[[ "$(bash -c 'source "$1"; ssh_endpoint_host "2001:db8::20:34567"' _ "$ROOT/modules/security.sh")" == "2001:db8::20" ]]
+if bash -c 'source "$1"; ssh_endpoint_host "2001:db8::20:34567"' _ "$ROOT/modules/security.sh" >/dev/null 2>&1; then
+    echo 'unbracketed IPv6 endpoint must be rejected as ambiguous' >&2
+    exit 1
+fi
 
 # 38. firewalld 已通过 http service 放行时，80/tcp 应被视为已具备基线。
 firewall_stub_dir="$TEST_STATE_ROOT/firewall-stub"
@@ -419,7 +424,15 @@ grep -q 'VPS_TOOL_VERSION_CACHE_TTL' "$ROOT/install.sh"
 grep -q '^firewall_port_manager_menu()' "$ROOT/modules/security.sh"
 grep -q 'firewall_manage_add' "$ROOT/modules/security.sh"
 grep -q 'firewall_manage_disable' "$ROOT/modules/security.sh"
-grep -q 'firewall_show_open_ports' "$ROOT/modules/security.sh"
+grep -q '^firewall_show_open_ports()' "$ROOT/modules/security.sh"
+! grep -q '^fifirewall_show_open_ports()' "$ROOT/modules/security.sh"
+
+# R1-R3 regression: declared firewall display function must exist and run, not merely appear as a substring.
+firewall_display_test=$(bash -c 'source "$1/modules/security.sh"; firewall_show_open_ports none' _ "$ROOT" 2>&1) || { echo "$firewall_display_test" >&2; exit 1; }
+grep -q '当前没有启用 UFW/firewalld' <<< "$firewall_display_test"
+
+# N1 regression: the unused legacy writer is removed; active writer restores umask (tested below).
+! grep -q '^write_node_info()' "$ROOT/modules/protocol.sh"
 
 # 45. SSH 旧端口删除后必须进入防火墙清理闭环；失败时保留待清理状态。
 grep -q 'ssh_migration_firewall_cleanup_pending' "$ROOT/modules/security.sh"
@@ -452,7 +465,7 @@ SERVICE_DELETE_LOG="$TEST_STATE_ROOT/service-delete.log" PATH="$service_test_dir
 ' _ "$ROOT/modules/security.sh"
 grep -qF 'delete allow websvc' "$TEST_STATE_ROOT/service-delete.log"
 # firewall_open_port_entries 的临时目录必须有自动清理兜底。
-grep -Fq "trap 'rm -rf -- \"\$tmp\"' RETURN" "$ROOT/modules/security.sh"
+grep -Fq "trap 'rm -rf -- \"\$tmp\"' RETURN" "$ROOT/lib/common.sh"
 
 # 47. Swap 推荐大小按磁盘余量动态计算：1.25/1.5/1.75/2.0 GiB 分别最多推荐 256/512/768/1024 MiB。
 for spec in "1280 256" "1536 512" "1792 768" "2048 1024" "1100 0"; do
@@ -803,6 +816,7 @@ version_fn="$TEST_STATE_ROOT/version_gt.sh"
 awk '''/^version_gt\(\) \{/{found=1} found{print; if ($0 == "}") exit}''' "$ROOT/install.sh" > "$version_fn"
 bash -c 'source "$1"; version_gt 2.1.0 2.0.0' _ "$version_fn"
 ! bash -c 'source "$1"; version_gt 2.0.0 2.1.0' _ "$version_fn"
+! bash -c 'source "$1"; version_gt 2.0.1-beta.1 2.0.1' _ "$version_fn"
 
 # 55. apt 安全升级文案必须明确说明 Debian/Ubuntu 实际执行全量 upgrade。
 grep -q 'Debian/Ubuntu 为全量升级' "$ROOT/lib/common.sh"
@@ -927,6 +941,8 @@ grep -q '^chmod 711 "$LOG_DIR" || true$' "$ROOT/install.sh"
 
 # 59. Round25：同步包不得重新安装明显过旧的 security.sh。
 grep -q 'firewall_port_has_service_rule' "$ROOT/modules/security.sh"
+grep -q '\[P0 安全闸门\]' "$ROOT/modules/security.sh"
+grep -q '下载到的 modules/security.sh 缺少关键防火墙归属函数' "$ROOT/install.sh"
 
 # 60. Round25：真实启动失败必须输出 journalctl 排障命令。
 grep -q 'journalctl -u "\$SERVICE_UNIT" -n 20 --no-pager -l' "$ROOT/modules/protocol.sh"
@@ -952,7 +968,7 @@ grep -q 'download_one "protocol_catalog.json"' "$ROOT/install.sh"
 grep -q 'install -m 644 "${temp}/protocol_catalog.json"' "$ROOT/install.sh"
 
 jq -e '(.schema_version | type == "number") and (.tool_version | type == "string") and (.protocols | type == "array") and all(.protocols[]; (.id | type == "string") and (.name | type == "string") and (.adapter_version | type == "number") and (.status | type == "string") and (.implemented | type == "boolean"))' "$ROOT/protocol_catalog.json" >/dev/null
-[[ "$(jq -r '.tool_version' "$ROOT/protocol_catalog.json")" == "2.9.3" ]]
+[[ "$(jq -r '.tool_version' "$ROOT/protocol_catalog.json")" == "2.9.5" ]]
 [[ "$(jq -r '.protocols | length' "$ROOT/protocol_catalog.json")" -eq 3 ]]
 [[ "$(jq -r '.protocols[] | select(.id == "tuic-v5") | .adapter_version' "$ROOT/protocol_catalog.json")" == "2" ]]
 
@@ -971,7 +987,7 @@ VPS_TOOL_ROOT="$TEST_STATE_ROOT/protocol-root" bash -c '
       esac
     done
     cat > "$out" <<"JSON"
-{"schema_version":1,"tool_version":"2.9.3","updated_at":"2026-10-03","protocols":[{"id":"vless-reality","name":"VLESS + Reality","status":"stable","implemented":true,"adapter_version":1},{"id":"hysteria2","name":"Hysteria 2","status":"stable","implemented":true,"adapter_version":1},{"id":"tuic-v5","name":"TUIC v5","status":"stable","implemented":true,"adapter_version":2},{"id":"new-protocol","name":"New Protocol","status":"stable","implemented":true,"adapter_version":1}]}
+{"schema_version":1,"tool_version":"2.9.3","updated_at":"2026-10-09","protocols":[{"id":"vless-reality","name":"VLESS + Reality","status":"stable","implemented":true,"adapter_version":1},{"id":"hysteria2","name":"Hysteria 2","status":"stable","implemented":true,"adapter_version":1},{"id":"tuic-v5","name":"TUIC v5","status":"stable","implemented":true,"adapter_version":2},{"id":"new-protocol","name":"New Protocol","status":"stable","implemented":true,"adapter_version":1}]}
 JSON
   }
   protocol_update_check
@@ -1028,7 +1044,7 @@ EOF
       esac
     done
     cat > "$out" <<"JSON"
-{"schema_version":1,"tool_version":"2.9.3","updated_at":"2026-10-03","protocols":[{"id":"vless-reality","name":"VLESS + Reality","status":"stable","implemented":true,"adapter_version":1},{"id":"hysteria2","name":"Hysteria 2","status":"stable","implemented":true,"adapter_version":1},{"id":"tuic-v5","name":"TUIC v5","status":"stable","implemented":true,"adapter_version":2}]}
+{"schema_version":1,"tool_version":"2.9.3","updated_at":"2026-10-09","protocols":[{"id":"vless-reality","name":"VLESS + Reality","status":"stable","implemented":true,"adapter_version":1},{"id":"hysteria2","name":"Hysteria 2","status":"stable","implemented":true,"adapter_version":1},{"id":"tuic-v5","name":"TUIC v5","status":"stable","implemented":true,"adapter_version":2}]}
 JSON
   }
   protocol_update_check
@@ -1079,17 +1095,23 @@ cat > "$hop_rollback_dir/nft" <<'EOF_NFT'
 #!/usr/bin/env bash
 exit 0
 EOF_NFT
-chmod +x "$hop_rollback_dir/nft"
-PATH="$hop_rollback_dir:$PATH" VPS_TOOL_ROOT="$TEST_STATE_ROOT/hop-rollback-root" bash -c '
+cat > "$hop_rollback_dir/systemctl" <<'EOF_SYSTEMCTL'
+#!/usr/bin/env bash
+exit 0
+EOF_SYSTEMCTL
+chmod +x "$hop_rollback_dir/nft" "$hop_rollback_dir/systemctl"
+PATH="$hop_rollback_dir:$PATH" VPS_TOOL_ROOT="$TEST_STATE_ROOT/hop-rollback-root" VPS_TOOL_PORT_HOP_RESTORE_SCRIPT="$TEST_STATE_ROOT/hop-rollback-root/systemd/restore" VPS_TOOL_PORT_HOP_RESTORE_UNIT="$TEST_STATE_ROOT/hop-rollback-root/systemd/restore.service" bash -c '
   source "$1/modules/protocol.sh"
   mkdir -p "$VPS_TOOL_ROOT" "$VPS_TOOL_ETC" "$VPS_TOOL_STATE" "$VPS_TOOL_BACKUPS"
   firewall_calls="$VPS_TOOL_ROOT/firewall-calls"
+  firewall_backend(){ echo ufw; }
   firewall_allow(){
     printf "allow %s/%s\n" "$1" "$2" >> "$firewall_calls"
     [[ "$1" != "20001" ]]
   }
   firewall_remove_owned_rules(){
-    printf "remove %s/%s\n" "$1" "$2" >> "$firewall_calls"
+    [[ "$1" == port && $# -eq 3 ]] || return 2
+    printf "remove %s/%s\n" "$2" "$3" >> "$firewall_calls"
     return 0
   }
   if setup_port_hopping hy2 20000-20002 20000; then
@@ -1111,8 +1133,9 @@ VPS_TOOL_ROOT="$TEST_STATE_ROOT/node-key-root" bash -c '
 echo 'round30 targeted defect checks: OK'
 
 # 64. Round29：当前缺陷修复与新增功能的静态/单元验收。
-grep -q '因此客户端链接包含 allow_insecure=1' "$ROOT/modules/protocol.sh"
-grep -q '因此客户端链接包含 insecure=1' "$ROOT/modules/protocol.sh"
+grep -q '客户端服务器身份验证' "$ROOT/modules/protocol.sh"
+grep -q 'allow_insecure=1' "$ROOT/modules/protocol.sh"
+grep -q 'insecure=1' "$ROOT/modules/protocol.sh"
 grep -q "releases?per_page=10" "$ROOT/modules/protocol.sh"
 grep -q '本次跳过了 sing-box SHA-256 校验' "$ROOT/modules/protocol.sh"
 grep -q '下载到的 protocol_catalog.json 格式无效，已拒绝更新' "$ROOT/install.sh"
@@ -1127,6 +1150,7 @@ grep -q '3. 协议诊断（只读）' "$ROOT/modules/protocol.sh"
 grep -q '2. 生成 / 查看 Clash / Mihomo 配置' "$ROOT/modules/protocol.sh"
 grep -q '2. 显示节点二维码' "$ROOT/modules/protocol.sh"
 grep -q '4. 关闭端口跳跃并恢复单端口' "$ROOT/modules/protocol.sh"
+! grep -q '^SECURITY_MODULE_REV=' "$ROOT/install.sh" || true
 
 # 64a. 资源预检阈值、流水线和强制继续行为。
 resource_capture="$TEST_STATE_ROOT/resource-check.txt"
@@ -1234,6 +1258,10 @@ grep -q 'remove_port_hopping "$name"' "$ROOT/modules/protocol.sh"
 grep -q 'VPS_TOOL_HOP_' "$ROOT/modules/protocol.sh"
 ! grep -q 'nft flush table' "$ROOT/modules/protocol.sh"
 
+# 64g. security.sh 兼容守卫不再依赖中文注释文本。
+grep -q 'firewall_port_has_service_rule' "$ROOT/install.sh"
+! grep -q '\\[P0 安全闸门\\]' "$ROOT/install.sh" || true
+
 echo 'round29 defects-and-features: OK'
 
 
@@ -1261,3 +1289,144 @@ grep -qF '启用 Vision 流控？[Y/n]' "$ROOT/modules/protocol.sh"
 cat_ver=$(grep -m1 '^CURRENT_VERSION=' "$ROOT/install.sh" | cut -d'"' -f2)
 cat_tool=$(jq -r '.tool_version' "$ROOT/protocol_catalog.json")
 [[ "$cat_ver" == "$cat_tool" ]]
+
+
+# Round32 fix pack: nft range syntax must use hyphen, updates must order stable/prerelease, and TLS mode must be selectable.
+grep -q 'udp dport ${range} dnat to :${listen_port}' "$ROOT/modules/protocol.sh"
+# iptables 的 --dport 使用 start:end 语法，允许单独转换；nftables 规则必须保留 start-end。
+grep -q '^recover_bundle_update()' "$ROOT/install.sh"
+grep -q '\.update-in-progress' "$ROOT/install.sh"
+grep -q 'TLS_CERT_MODE="公网 CA 证书（验证已启用）"' "$ROOT/modules/protocol.sh"
+grep -qE 'openssl verify .* -CAfile' "$ROOT/modules/protocol.sh"
+version_fn=$(sed -n '/^version_gt() {/,/^}/p' "$ROOT/install.sh")
+bash -c "$version_fn; version_gt 1.2.3 1.2.3-rc.1; ! version_gt 1.2.3-rc.1 1.2.3; version_gt 1.2.3-rc.10 1.2.3-rc.2"
+proto_version_fn=$(sed -n '/^protocol_version_gt() {/,/^}/p' "$ROOT/modules/protocol.sh")
+bash -c "$proto_version_fn; protocol_version_gt 1.2.3 1.2.3-rc.1; ! protocol_version_gt 1.2.3-rc.1 1.2.3; protocol_version_gt 1.2.3-rc.10 1.2.3-rc.2"
+
+echo 'round32 fix-pack regressions: OK'
+
+
+# Uninstall must not recursively wipe user data stored below the tool root; bundle updates pin one immutable commit.
+grep -q '^resolve_bundle_base()' "$ROOT/install.sh"
+grep -q '^local_bundle_available()' "$ROOT/install.sh"
+grep -q 'sync_bundle "$SOURCE_DIR"' "$ROOT/install.sh"
+grep -q 'exec "${LOCAL_ROOT}/install.sh" "$@"' "$ROOT/install.sh"
+grep -q 'commits/\${BRANCH}' "$ROOT/install.sh"
+! grep -q 'rm -rf "$LOCAL_ROOT"' "$ROOT/install.sh"
+grep -q '仍有非本工具文件或非空目录' "$ROOT/install.sh"
+echo 'round32 security regression checks: OK'
+
+# Round32.3: service-profile ownership, safe port-range normalization, and root-script transparency.
+hop_validation_fn=$(sed -n '/^validate_hop_range() {/,/^}/p' "$ROOT/modules/protocol.sh")
+bash -c "$hop_validation_fn; validate_hop_range '02000-02199'; ! validate_hop_range '02000-02200'; ! validate_hop_range '01000-01010'"
+grep -q "'set -Eeuo pipefail'" "$ROOT/modules/protocol.sh"
+grep -q 'script_sha256=\$(sha256sum' "$ROOT/modules/ip_test.sh"
+grep -q '不等于安全审计' "$ROOT/modules/ip_test.sh"
+grep -q 'install -m 755 .*||.*正在回滚' "$ROOT/install.sh"
+(
+    fw_test_root=$(mktemp -d /tmp/vps-tool-firewall-profile.XXXXXX)
+    trap 'rm -rf "$fw_test_root"' EXIT
+    mkdir -p "$fw_test_root/bin" "$fw_test_root/root" "$fw_test_root/etc" "$fw_test_root/state" "$fw_test_root/backups"
+    cat > "$fw_test_root/bin/ufw" <<'EOF_UFW'
+#!/usr/bin/env bash
+case "$*" in
+  'app list') printf 'Available applications:\n  FakeWeb\n' ;;
+  'app info FakeWeb') printf 'Profile: FakeWeb\nPorts: 8080/tcp 20000-20100/udp\n' ;;
+  *) exit 1 ;;
+esac
+EOF_UFW
+    cat > "$fw_test_root/bin/firewall-cmd" <<'EOF_FW'
+#!/usr/bin/env bash
+case "$*" in
+  *'--list-services --permanent'*) printf 'fake-web\n' ;;
+  *'--info-service=fake-web --permanent'*) printf 'ports: 8443/tcp 31000-31100/udp\n' ;;
+  *) exit 1 ;;
+esac
+EOF_FW
+    chmod +x "$fw_test_root/bin/ufw" "$fw_test_root/bin/firewall-cmd"
+    export PATH="$fw_test_root/bin:$PATH"
+    export VPS_TOOL_ROOT="$fw_test_root/root" VPS_TOOL_ETC="$fw_test_root/etc" VPS_TOOL_STATE="$fw_test_root/state" VPS_TOOL_BACKUPS="$fw_test_root/backups" VPS_TOOL_LOG="$fw_test_root/tool.log"
+    source "$ROOT/modules/security.sh"
+    firewall_port_has_service_rule ufw 8080 tcp
+    firewall_port_has_service_rule ufw 20050 udp
+    ! firewall_port_has_service_rule ufw 20050 tcp
+    firewall_port_has_service_rule firewalld 8443 tcp
+    firewall_port_has_service_rule firewalld 31050 udp
+    ! firewall_port_has_service_rule firewalld 31200 udp
+)
+echo 'round32.3 additional security-boundary checks: OK'
+
+
+# Round32.4: hardening selected for v2.9.4.
+# 1) common.sh must be independently sourceable with its firewall entry parser available.
+grep -q '^firewall_open_port_entries()' "$ROOT/lib/common.sh"
+! grep -q '^firewall_open_port_entries()' "$ROOT/modules/security.sh"
+# 2) umask must be restored by the node-info writer.
+node_umask_root="$TEST_STATE_ROOT/node-umask"
+mkdir -p "$node_umask_root"
+node_umask_test=$(bash -c '
+  set -Eeuo pipefail
+  source "$1/modules/protocol.sh"
+  test_dir="$2"
+  protocol_node_info_file() { printf "%s/node.txt\\n" "$test_dir"; }
+  mark_owned() { return 0; }
+  umask 0022
+  before=$(umask)
+  write_protocol_node_info vless "test node"
+  after=$(umask)
+  [[ "$before" == "$after" ]]
+  [[ "$(stat -c %a "$test_dir/node.txt")" == 600 ]]
+' _ "$ROOT" "$node_umask_root" 2>&1) || { echo "$node_umask_test" >&2; exit 1; }
+# 5/8) EOF-protected update confirmation and pipeline auto-port selection for Hy2/TUIC.
+grep -q 'if ! read -r -p "是否立即更新 VPS-Tool' "$ROOT/modules/protocol.sh"
+[[ $(grep -c '自动选择空闲 UDP 端口' "$ROOT/modules/protocol.sh") -ge 1 ]]
+[[ $(grep -c 'if ! read -r -p "UDP 端口' "$ROOT/modules/protocol.sh") -ge 1 ]]
+# 6) failed port-hop cleanup must restore/refresh persistence and show retry/help commands.
+grep -q 'ensure_nft_port_hop_restore_service ||' "$ROOT/modules/protocol.sh"
+grep -q '模块 2 → 7. 其他与诊断 → 4' "$ROOT/modules/protocol.sh"
+grep -q 'journalctl -u vps-tool-port-hop-restore.service' "$ROOT/modules/protocol.sh"
+# 7) malformed firewall-removal calls are rejected before the destructive path.
+invalid_fw_rc=0
+bash -c '
+  set -Eeuo pipefail
+  source "$1/lib/common.sh"
+  firewall_remove_owned_rule() { touch "$2"; }
+  if firewall_remove_owned_rules port 443 tcp extra; then exit 1; else rc=$?; fi
+  [[ "$rc" -eq 2 ]]
+  if firewall_remove_owned_rules 443 tcp extra; then exit 1; else rc=$?; fi
+  [[ "$rc" -eq 2 ]]
+' _ "$ROOT" >/dev/null 2>&1 || invalid_fw_rc=$?
+[[ "$invalid_fw_rc" -eq 0 ]]
+# 11) remote diagnostics download by default without running the downloaded body.
+remote_diag_marker="$TEST_STATE_ROOT/remote-diag-ran"
+remote_diag_dir="$TEST_STATE_ROOT/remote-diag-etc"
+mkdir -p "$remote_diag_dir"
+VPS_TOOL_ETC="$remote_diag_dir" VPS_TOOL_ROOT="$TEST_STATE_ROOT/remote-diag-root" VPS_TOOL_STATE="$TEST_STATE_ROOT/remote-diag-state" VPS_TOOL_BACKUPS="$TEST_STATE_ROOT/remote-diag-backups" REMOTE_DIAG_MARKER="$remote_diag_marker" bash -c '
+  set -Eeuo pipefail
+  source "$1/modules/ip_test.sh"
+  download_shell_checked() { printf "#!/usr/bin/env bash\\ntouch %q\\n" "$REMOTE_DIAG_MARKER" > "$2"; chmod 700 "$2"; }
+  run_remote_diagnostic fake https://example.invalid/diagnostic.sh
+  [[ ! -e "$REMOTE_DIAG_MARKER" ]]
+  find "$VPS_TOOL_ETC/diagnostics" -maxdepth 1 -type f -name "fake_*.sh" -perm 600 | grep -q .
+' _ "$ROOT" >/dev/null
+# 12) remote bundles require a GitHub-verified signature; test both accepted and rejected API responses.
+resolve_fn=$(sed -n '/^resolve_bundle_base() {/,/^}/p' "$ROOT/install.sh")
+signed_api='{"sha":"0123456789012345678901234567890123456789","commit":{"verification":{"verified":true,"reason":"valid"}}}'
+unsigned_api='{"sha":"0123456789012345678901234567890123456789","commit":{"verification":{"verified":false,"reason":"unsigned"}}}'
+bash -c "$resolve_fn; curl() { printf '%s\\n' '$signed_api'; }; result=\$(resolve_bundle_base); [[ \"\$result\" == *0123456789012345678901234567890123456789 ]]" _ >/dev/null 2>&1
+bash -c "$resolve_fn; curl() { printf '%s\\n' '$unsigned_api'; }; if resolve_bundle_base; then exit 1; else rc=\$?; [[ \"\$rc\" -eq 1 ]]; fi" _ >/dev/null 2>&1
+# 14) stale root-owned /tmp update dirs older than one day can be removed safely.
+stale_cleanup_fn=$(sed -n '/^cleanup_stale_bundle_temps() {/,/^}/p' "$ROOT/install.sh")
+stale_test_dir="/tmp/vps-tool-sync.smoke-$RANDOM-$$"
+mkdir -m 700 "$stale_test_dir"
+touch -d '2 days ago' "$stale_test_dir"
+bash -c "$stale_cleanup_fn; cleanup_stale_bundle_temps" _
+[[ ! -e "$stale_test_dir" ]]
+
+# O2/O3 regression: ambiguous IPv6 is rejected and EOF exits interactive menus without ERR-trap failure.
+TERM=xterm bash -c 'set -Eeuo pipefail; source "$1/modules/security.sh"; ssh_port_menu </dev/null; firewall_port_manager_menu </dev/null' _ "$ROOT" >/dev/null 2>&1
+awk '/read[[:space:]]+-rp/ { pos=index($0, "read -rp"); tail=substr($0, pos); if (tail !~ /\|\|/) { print FNR ": interactive read lacks explicit EOF handling: " $0 > "/dev/stderr"; failed=1 } } END { exit failed ? 1 : 0 }' "$ROOT/modules/security.sh"
+
+echo 'R1-R3/O2/O3/N1 regression checks: OK'
+
+echo 'round32.4 selected hardening checks: OK'
