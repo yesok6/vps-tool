@@ -116,6 +116,8 @@ current_swap_mb() {
 }
 
 recommend_managed_swap_mb() {
+    # [资源策略] 尽量增加可用 Swap，但始终至少保留 1 GiB 根分区空间。
+    # [安全保留] 仅按 256 MiB 递增、单次最多补到 1 GiB；不覆盖用户已有 Swap。
     local disk_mb swap_mb room_mb target_mb
     disk_mb=$(get_root_free_mb)
     swap_mb=$(current_swap_mb)
@@ -131,6 +133,9 @@ recommend_managed_swap_mb() {
 }
 
 ensure_managed_swap() {
+    # [可完全撤销] 仅创建 VPS-Tool 自己管理的 Swap，不覆盖用户现有 Swap。
+    # [说明] Swap 使用磁盘空间模拟额外内存，可缓解内存峰值时的 OOM 风险，但速度明显低于真实 RAM，不能替代内存。
+    # [安全保留] 创建后必须至少保留 1 GiB 根分区空间；单次最多创建 1 GiB。
     local requested_mb="${1:-1024}" disk_mb swap_mb create_mb fstab_line
     (( requested_mb >= 256 )) || requested_mb=256
     (( requested_mb > 1024 )) && requested_mb=1024
@@ -161,8 +166,7 @@ ensure_managed_swap() {
     fi
     mkdir -p "$(dirname "$VPS_TOOL_SWAP_PATH")"
     if [[ ! -e "$VPS_TOOL_SWAP_PATH" ]]; then
-        # [修复 Bug] 丢弃 fallocate 避免 XFS/BTRFS 产生有空洞的稀疏文件导致 swapon 失败，无条件使用 dd
-        if ! dd if=/dev/zero of="$VPS_TOOL_SWAP_PATH" bs=1M count="$create_mb" status=none; then
+        if ! (fallocate -l "${create_mb}M" "$VPS_TOOL_SWAP_PATH" 2>/dev/null || dd if=/dev/zero of="$VPS_TOOL_SWAP_PATH" bs=1M count="$create_mb" status=none); then
             rm -f "$VPS_TOOL_SWAP_PATH"
             echo -e "${RED}[错误]${PLAIN} ${create_mb} MiB Swap 文件创建失败。"
             return 1
@@ -203,6 +207,7 @@ ensure_managed_swap() {
 }
 
 ensure_managed_swap_1g() {
+    # [兼容入口] 保留原函数名；新逻辑会根据磁盘余量和现有 Swap 动态决定实际创建大小。
     local recommended_mb
     recommended_mb=$(recommend_managed_swap_mb)
     (( recommended_mb > 0 )) || return 2
@@ -210,18 +215,22 @@ ensure_managed_swap_1g() {
 }
 
 check_upgrade_resources() {
+    # [安全提示] 这是运行前风险检查，不是发行版硬性最低配置；主要依据可用内存、现有 Swap 与根分区剩余空间判断。
+    # [不可恢复] 系统升级本身仍属于不可逆软件包变更。
     local mem_mb disk_mb swap_mb recommended_mb
     mem_mb=$(get_mem_available_mb)
     disk_mb=$(get_root_free_mb)
     swap_mb=$(current_swap_mb)
     show_system_resource_summary
 
+    # [安全底线] 根分区必须至少保留 1GiB；低于此值直接停止。
     if (( disk_mb < 1024 )); then
         echo -e "${RED}[资源过低]${PLAIN} 根分区可用空间仅 ${disk_mb} MiB，必须至少保留 1 GiB 才允许升级。"
         echo -e "${YELLOW}[建议]${PLAIN} 先清理磁盘或扩容，不会为了升级自动牺牲最后 1 GiB 空间。"
         return 1
     fi
 
+    # [推荐] 可用内存达到 256 MiB 以上时，通常不需要额外准备 Swap。
     if (( mem_mb >= 256 )); then
         if (( disk_mb < 2048 )); then
             echo -e "${YELLOW}[资源提示]${PLAIN} 可用内存 ${mem_mb} MiB 尚可，但根分区仅剩 ${disk_mb} MiB。"
@@ -230,6 +239,7 @@ check_upgrade_resources() {
         return 0
     fi
 
+    # [建议] 128–255 MiB 可用内存属于低内存区；优先根据磁盘余量推荐 256/512/768/1024 MiB Swap。
     if (( mem_mb >= 128 )); then
         echo -e "${YELLOW}[资源提示]${PLAIN} 当前可用内存 ${mem_mb} MiB，低于推荐的 256 MiB。"
         if (( swap_mb < 1024 )); then
@@ -251,6 +261,7 @@ check_upgrade_resources() {
         return 0
     fi
 
+    # [谨慎阻止] 低于 128 MiB 可用内存时，优先建议根据磁盘余量增加 Swap；只有资源改善后才继续。
     echo -e "${RED}[资源过低]${PLAIN} 当前可用内存仅 ${mem_mb} MiB。"
     if (( swap_mb >= 1024 )); then
         echo -e "${GREEN}[状态]${PLAIN} 检测到 ${swap_mb} MiB Swap，但仍建议先释放内存。"
@@ -294,8 +305,7 @@ sys_full_upgrade() {
         apt)
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            # [修复 Bug] 强制覆盖保留原配置解决流水线卡死，使用 dist-upgrade 解决高危内核跳过不升级的敞口
-            apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" dist-upgrade
+            apt-get -y upgrade
             ;;
         dnf|yum)
             "${PKG_MANAGER}" -y upgrade
@@ -312,11 +322,11 @@ sys_security_upgrade() {
     check_upgrade_resources || return 1
     case "${PKG_MANAGER}" in
         apt)
+            # [不可逆更新] Debian/Ubuntu 当前不保证存在独立安全源；本分支实际执行 apt-get upgrade，可能同时升级 openssh-server/内核。
             confirm_safety_prompt "修补安全漏洞（Debian/Ubuntu 为全量升级）" "作用：更新系统软件与安全补丁。风险：可能包含 openssh-server/内核，属于不可逆变更；资源检查已通过。" || { echo -e "${YELLOW}[提示]${PLAIN} 已取消安全补丁升级。"; return 1; }
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            # [修复 Bug] 同上，彻底解决 apt 安全组件在非交互模式下的依赖冻结死锁
-            apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" dist-upgrade
+            apt-get -y upgrade
             ;;
         dnf)
             confirm_safety_prompt "修补安全漏洞" "作用：更新安全补丁。风险：属于不可逆软件包变更，资源不足时可能失败。" || { echo -e "${YELLOW}[提示]${PLAIN} 已取消安全补丁升级。"; return 1; }
@@ -625,9 +635,16 @@ firewall_allow() {
             if firewall-cmd --query-port="${port}/${proto}" --permanent >/dev/null 2>&1; then
                 return 0
             fi
-            if [[ "$proto" == "tcp" && "$port" == "80" ]] && firewall-cmd --query-service=http --permanent >/dev/null 2>&1; then return 0; fi
-            if [[ "$proto" == "tcp" && "$port" == "443" ]] && firewall-cmd --query-service=https --permanent >/dev/null 2>&1; then return 0; fi
-            if [[ "$proto" == "tcp" && "$port" == "22" ]] && firewall-cmd --query-service=ssh --permanent >/dev/null 2>&1; then return 0; fi
+            # [安全保留] 常见 HTTP/HTTPS/SSH service 已经放行时，不重复创建同端口规则；这些现有 service 不属于本工具所有。
+            if [[ "$proto" == "tcp" && "$port" == "80" ]] && firewall-cmd --query-service=http --permanent >/dev/null 2>&1; then
+                return 0
+            fi
+            if [[ "$proto" == "tcp" && "$port" == "443" ]] && firewall-cmd --query-service=https --permanent >/dev/null 2>&1; then
+                return 0
+            fi
+            if [[ "$proto" == "tcp" && "$port" == "22" ]] && firewall-cmd --query-service=ssh --permanent >/dev/null 2>&1; then
+                return 0
+            fi
             firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null || return 1
             firewall-cmd --reload >/dev/null || return 1
             mkdir -p "${VPS_TOOL_STATE}/firewall"
@@ -638,6 +655,56 @@ firewall_allow() {
             return 0
             ;;
     esac
+}
+
+firewall_open_port_entries() {
+    # [维护备注] 本函数是叶子函数，当前仅由上层显示/管理函数调用。
+    # RETURN trap 会在函数返回时清理临时目录；若未来在本函数内部增加嵌套 RETURN trap，
+    # 必须同步处理 trap 保存/恢复，避免覆盖上层 RETURN trap。
+    local backend="$1" file tmp profile token svc info
+    tmp=$(make_temp_dir firewall-list) || return 1
+    trap 'rm -rf -- "$tmp"' RETURN
+    file="${tmp}/entries"
+    : > "$file" || return 1
+
+    case "$backend" in
+        ufw)
+            while read -r token; do
+                [[ -n "$token" ]] || continue
+                echo "${token}|UFW 端口规则" >> "$file"
+            done < <(ufw status 2>/dev/null | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
+            while IFS= read -r profile; do
+                profile="${profile#  }"
+                [[ -n "$profile" ]] || continue
+                while read -r token; do
+                    [[ -n "$token" ]] || continue
+                    echo "${token}|UFW 服务:${profile}" >> "$file"
+                done < <(ufw app info "$profile" 2>/dev/null | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
+            done < <(ufw app list 2>/dev/null | sed -n '/Available applications:/,$p' | sed -n 's/^  //p')
+            ;;
+        firewalld)
+            while read -r token; do
+                [[ -n "$token" ]] || continue
+                echo "${token}|firewalld 端口规则" >> "$file"
+            done < <(firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)$' | sort -u)
+            while read -r svc; do
+                [[ -n "$svc" ]] || continue
+                info=$(firewall-cmd --info-service="$svc" --permanent 2>/dev/null || true)
+                while read -r token; do
+                    [[ -n "$token" ]] || continue
+                    echo "${token}|firewalld 服务:${svc}" >> "$file"
+                done < <(printf '%s\n' "$info" | grep -oE '[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)' | sort -u)
+            done < <(firewall-cmd --list-services 2>/dev/null | tr ' ' '\n' | sort -u)
+            ;;
+        *)
+            rm -rf "$tmp"
+            return 1
+            ;;
+    esac
+
+    sort -t'|' -k1,1 -k2,2 -u "$file"
+    trap - RETURN
+    rm -rf -- "$tmp"
 }
 
 firewall_port_has_service_rule() {
@@ -667,13 +734,12 @@ firewall_remove_owned_rule() {
             rule_count=$(ufw status numbered 2>/dev/null | \
                 sed -E 's/^[[:space:]]*\[[[:space:]]*[0-9]+[[:space:]]*\][[:space:]]*//' | \
                 sed -E 's/[[:space:]]+\(v6\)$//' | \
-                grep -Ec "^${port}/${proto}([[:space:]]|$)") || true
+                grep -Ec "^${port}/${proto}([[:space:]]|$)" || true)
             if (( rule_count == 0 )); then
                 return 0
             fi
-            # [修复 Bug] 彻底解决 IPv4+IPv6 双栈开启时 rule_count 等于 2 导致的规则无法自动清理漏洞
-            if (( rule_count > 2 )); then
-                echo -e "${YELLOW}[安全保留]${PLAIN} 检测到 ${port}/${proto} 存在超过 2 条防火墙规则，拒绝按端口强删，请手动处理。"
+            if (( rule_count != 1 )); then
+                echo -e "${YELLOW}[安全保留]${PLAIN} 检测到 ${port}/${proto} 存在多条防火墙规则，拒绝按端口强删，请手动处理。"
                 return 1
             fi
             ufw delete allow "${port}/${proto}" >/dev/null 2>&1
@@ -696,33 +762,43 @@ firewall_remove_owned_rule() {
 }
 
 firewall_remove_owned_rules() {
-    local backend port proto file failed dir="${VPS_TOOL_STATE}/firewall"
+    local action="${1:-}" backend port proto file failed dir="${VPS_TOOL_STATE}/firewall"
 
-    if [[ $# -eq 2 ]]; then
-        port="$1"
-        proto="$2"
-        validate_port_any "$port" || return 1
-        case "$proto" in tcp|udp) ;; *) return 1 ;; esac
-        file="${dir}/${proto}_${port}.rule"
-        [[ -f "$file" ]] || return 1
-        backend=$(sed -n '1p' "$file")
-        if firewall_remove_owned_rule "$backend" "$port" "$proto"; then
-            rm -f "$file"
-            return 0
-        fi
-        echo -e "${YELLOW}[警告]${PLAIN} 防火墙规则 ${port}/${proto} 未能删除，保留记录以便后续重试。"
-        return 1
-    fi
+    case "$action" in
+        port)
+            [[ $# -eq 3 ]] || { echo "用法：firewall_remove_owned_rules port <端口> <tcp|udp>" >&2; return 2; }
+            port="$2"
+            proto="$3"
+            validate_port_any "$port" || { echo "无效端口：${port}" >&2; return 2; }
+            case "$proto" in tcp|udp) ;; *) echo "无效协议：${proto}" >&2; return 2 ;; esac
+            file="${dir}/${proto}_${port}.rule"
+            [[ -f "$file" && ! -L "$file" ]] || { echo "未找到本工具记录的规则：${port}/${proto}" >&2; return 1; }
+            backend=$(sed -n '1p' "$file")
+            if firewall_remove_owned_rule "$backend" "$port" "$proto"; then
+                rm -f -- "$file"
+                return 0
+            fi
+            echo -e "${YELLOW}[警告]${PLAIN} 防火墙规则 ${port}/${proto} 未能删除，保留记录以便后续重试。"
+            return 1
+            ;;
+        all)
+            [[ $# -eq 1 ]] || { echo "用法：firewall_remove_owned_rules all" >&2; return 2; }
+            ;;
+        *)
+            echo "用法：firewall_remove_owned_rules all | port <端口> <tcp|udp>" >&2
+            return 2
+            ;;
+    esac
 
-    [[ -d "$dir" ]] || return 1
+    [[ -d "$dir" && ! -L "$dir" ]] || return 0
     failed=0
     for file in "$dir"/*.rule; do
-        [[ -f "$file" ]] || continue
+        [[ -f "$file" && ! -L "$file" ]] || continue
         backend=$(sed -n '1p' "$file")
         port=$(sed -n '2p' "$file")
         proto=$(sed -n '3p' "$file")
         if firewall_remove_owned_rule "$backend" "$port" "$proto"; then
-            rm -f "$file"
+            rm -f -- "$file"
         else
             failed=1
             echo -e "${YELLOW}[警告]${PLAIN} 防火墙规则 ${port}/${proto} 未能删除，保留记录以便后续重试。"
@@ -730,7 +806,6 @@ firewall_remove_owned_rules() {
     done
     return "$failed"
 }
-
 firewall_close_port_rule() {
     local port="$1" proto="$2" backend
     validate_port_any "$port" || return 1
@@ -756,3 +831,4 @@ validate_port_any() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] && ((10#$port >= 1 && 10#$port <= 65535))
 }
+
